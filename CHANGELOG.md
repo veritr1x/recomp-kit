@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Switching from a collapsed keyboard to the pad no longer hides its sticks
+  and buttons. Saved hidden bits apply only to groups with a reveal tab.
+
 - Keep tablet keyboard halves and their KEYS tabs inside the system safe area,
   including the combined pad-and-keys layout. Controls tracing now records
   touch routing and keyboard press/release events for device diagnostics.
