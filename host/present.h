@@ -345,9 +345,12 @@ bool host_present_gpu_ready();
 // host/gpu2d.cpp: finish and drop the Direct3D 11 path's GPU work; the
 // presenter calls it before it stops.
 void host_gpu2d_release_device();
-// Stage the frame's pixels as a copy of `src` (RGBA8, w x h), encoded into
-// `cb`, which the caller commits before sealing. False when nothing was staged.
-bool host_present_stage_texture(gpu::Texture src, int w, int h, gpu::CommandBuffer cb);
+// Stage the frame's pixels as a format-preserving copy of `src` (w x h),
+// encoded into `cb`, which the caller commits before sealing. The guest size
+// describes input coordinates and aspect, independently of GPU render scale.
+// False when nothing was staged.
+bool host_present_stage_texture(gpu::Texture src, int w, int h, int guest_w, int guest_h,
+                                gpu::CommandBuffer cb);
 // Register BEFORE committing each prefix buffer on the renderer's queue. Its
 // completion fences all earlier prefixes; dropped frames retire behind it.
 void host_present_track_command(gpu::CommandBuffer command);

@@ -935,7 +935,7 @@ class WebGpuRenderer final : public D9Backend {
         end_pass();
     }
 
-    void present(uint32_t backbuffer, uint32_t, uint32_t) override {
+    void present(uint32_t backbuffer, uint32_t w, uint32_t h) override {
         end_pass();
         Tex *t = tex_ptr(backbuffer);
         if (!t || !t->texture) {
@@ -959,7 +959,8 @@ class WebGpuRenderer final : public D9Backend {
                 t->imported = dev_->import_texture(t->texture, v, gd);
             }
             gpu::CommandBuffer cb = dev_->begin();
-            if (host_present_stage_texture(t->imported, (int)t->width, (int)t->height, cb))
+            if (host_present_stage_texture(t->imported, (int)t->width, (int)t->height, (int)w,
+                                           (int)h, cb))
                 host_present_track_command(cb);
             dev_->commit(cb);
         }

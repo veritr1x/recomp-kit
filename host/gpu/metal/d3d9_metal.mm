@@ -1213,6 +1213,7 @@ class Renderer final : public D9Backend {
     }
 
     void present(uint32_t backbuffer, uint32_t w, uint32_t h) override {
+        const uint32_t guest_w = w, guest_h = h;
         end_pass();
         auto it = textures_.find(backbuffer);
         if (it == textures_.end() || !it->second.texture) {
@@ -1234,7 +1235,8 @@ class Renderer final : public D9Backend {
             t.imported = device_->import_texture(t.texture);
         if (t.info.pixel == MTLPixelFormatBGRA8Unorm) {
             gpu::CommandBuffer cb = device_->begin();
-            if (host_present_stage_texture(t.imported, (int)w, (int)h, cb))
+            if (host_present_stage_texture(t.imported, (int)w, (int)h, (int)guest_w, (int)guest_h,
+                                           cb))
                 host_present_track_command(cb);
             device_->commit(cb);
         }

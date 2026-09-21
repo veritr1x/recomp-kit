@@ -908,10 +908,12 @@ void start_touch(const HostScriptStep &step) {
         host_present_copy_layout(&layout) && layout.scene.scale_x > 0 && layout.scene.scale_y > 0;
     const double scale = std::min(double(g_touch_drawable_w) / std::max(1, g_mode_w),
                                   double(g_touch_drawable_h) / std::max(1, g_mode_h));
-    const double x = published
+    const double x = step.op == HOST_SCRIPT_TAP_DRAWABLE ? step.x
+                     : published
                          ? (step.x + .5) * layout.scene.scale_x + layout.scene.offset_x
                          : (step.x + .5) * scale + (g_touch_drawable_w - g_mode_w * scale) / 2;
-    const double y = published
+    const double y = step.op == HOST_SCRIPT_TAP_DRAWABLE ? step.y
+                     : published
                          ? (step.y + .5) * layout.scene.scale_y + layout.scene.offset_y
                          : (step.y + .5) * scale + (g_touch_drawable_h - g_mode_h * scale) / 2;
     std::vector<TouchAction> actions;
@@ -1392,6 +1394,7 @@ void run_step(const HostScriptStep &step) {
         g_press_at_ms = boot_guest_millis();
         break;
     case HOST_SCRIPT_TAP:
+    case HOST_SCRIPT_TAP_DRAWABLE:
         start_touch(step);
         break;
     case HOST_SCRIPT_BUTTON:

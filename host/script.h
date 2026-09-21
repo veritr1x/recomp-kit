@@ -16,6 +16,8 @@
 //                             is the only position a script can be sure of
 //   click left 320 140        move there, press, release
 //   tap 320 140               a finger tap through TouchMapper, in guest pixels
+//   tap_drawable 1210 834      a finger tap in game-image drawable pixels;
+//                             tests screen targets without inverting the layout
 //   button right down         press (or up: release) where the pointer is, and
 //                             leave it: the moves until `button right up` are a drag
 //   move entity 1815         move to the entity's attributed body centre
@@ -191,6 +193,7 @@ enum HostScriptOp {
     HOST_SCRIPT_MOVEBY,
     HOST_SCRIPT_CLICK,
     HOST_SCRIPT_TAP,
+    HOST_SCRIPT_TAP_DRAWABLE,
     HOST_SCRIPT_BUTTON, // press or release a mouse button where the pointer is
     HOST_SCRIPT_KEY,
     HOST_SCRIPT_DUMP,

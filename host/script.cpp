@@ -258,13 +258,14 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             step.op = HOST_SCRIPT_MOVEBY;
             step.x = (int32_t)vx;
             step.y = (int32_t)vy;
-        } else if (equal_nocase(verb, "tap")) {
+        } else if (equal_nocase(verb, "tap") || equal_nocase(verb, "tap_drawable")) {
             char *x = word(&cursor), *y = word(&cursor);
             long vx = 0, vy = 0;
             if (!x || !y || !whole(x, &vx) || !whole(y, &vy) || vx < 0 || vy < 0 || vx > 32767 ||
                 vy > 32767)
-                return fail(line_number, "tap needs x and y in guest pixels (0..32767)", nullptr);
-            step.op = HOST_SCRIPT_TAP;
+                return fail(line_number, "tap needs x and y in pixels (0..32767)", nullptr);
+            step.op =
+                equal_nocase(verb, "tap_drawable") ? HOST_SCRIPT_TAP_DRAWABLE : HOST_SCRIPT_TAP;
             step.x = (int32_t)vx;
             step.y = (int32_t)vy;
         } else if (equal_nocase(verb, "click") || equal_nocase(verb, "move")) {

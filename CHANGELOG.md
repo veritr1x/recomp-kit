@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep touch and mouse coordinates in the game's logical resolution when
+  Direct3D 9 renders at a higher resolution. Supersampling no longer moves
+  clicks and cursors beyond the game's window.
+
 - Mapped pads support horizontal-only arrow sticks for steering without
   accidental throttle or braking. Smoke pad scripts exercise the production
   mapped binding as well as the native controller adapters.

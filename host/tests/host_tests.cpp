@@ -541,7 +541,12 @@ static void test_script_parsing() {
     CHECK_EQ(steps[0].y, 8);
     CHECK_EQ(steps[1].at_ms, 2000);
     CHECK_EQ(steps[1].x, 510);
-    for (const char *bad : {"tap 1\n", "tap x 2\n", "tap -1 2\n", "tap 1 2 extra\n"})
+    CHECK_EQ(host_script_parse("tap_drawable 1210 834\n", steps, 64, err, sizeof err), 1);
+    CHECK_EQ(steps[0].op, HOST_SCRIPT_TAP_DRAWABLE);
+    CHECK_EQ(steps[0].x, 1210);
+    CHECK_EQ(steps[0].y, 834);
+    for (const char *bad : {"tap 1\n", "tap x 2\n", "tap -1 2\n", "tap 1 2 extra\n",
+                            "tap_drawable -1 2\n", "tap_drawable 1210\n"})
         CHECK_EQ(host_script_parse(bad, steps, 64, err, sizeof err), -1);
 
     CHECK_EQ(host_script_parse("pad cross down\nwait 200\npad cross up\npad left_x -32767\n"
@@ -5663,7 +5668,7 @@ static void test_presenter_gpu_color_order(D3DRenderer *) {
             CHECK(bool(source));
             CHECK(g_gpu->upload(source, {0, 0, 2, 2}, path == 1 ? rgba : bgra, 8));
             auto cb = g_gpu->begin();
-            CHECK(host_present_stage_texture(source, 2, 2, cb));
+            CHECK(host_present_stage_texture(source, 2, 2, 2, 2, cb));
             g_gpu->commit(cb);
             g_gpu->wait(cb);
         }
@@ -5682,6 +5687,47 @@ static void test_presenter_gpu_color_order(D3DRenderer *) {
             g_gpu->destroy(source);
     }
     host_present_stop();
+}
+
+// Supersampling changes texture storage, not mouse coordinates. Use the
+// tablet's drawable and fractional render scale that previously put its
+// centre at guest (1520,855), outside a 1280x720 client area.
+static void test_presenter_gpu_logical_coordinates(D3DRenderer *) {
+    host_gate_reset();
+    host_present_start_offscreen(2420, 1668);
+    for (uint64_t id = 1; id <= 2; ++id) {
+        const int w = id == 1 ? 3040 : 1280, h = id == 1 ? 1710 : 720;
+        auto source =
+            g_gpu->create_texture({w, h, gpu::Format::BGRA8, gpu::UsageSampled | gpu::UsageCpu});
+        CHECK(bool(source));
+        std::vector<uint8_t> pixels(size_t(w) * h * 4, 0xff);
+        CHECK(g_gpu->upload(source, {0, 0, w, h}, pixels.data(), w * 4));
+        auto cb = g_gpu->begin();
+        CHECK(host_present_stage_texture(source, w, h, 1280, 720, cb));
+        g_gpu->commit(cb);
+        g_gpu->wait(cb);
+        const auto before = host_present_unique_completed();
+        host_present_test_seal(id, HOST_SCREEN_MENU, false);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (host_present_unique_completed() == before &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK_EQ(host_present_unique_completed(), before + 1);
+        LayoutSnapshot layout;
+        CHECK(host_present_copy_layout(&layout));
+        CHECK_EQ(layout.guest_w, 1280);
+        CHECK_EQ(layout.guest_h, 720);
+        // Input follows the published frame, including the letterbox offset.
+        auto centre = host_gate_hit_test(nullptr, 1210, 834);
+        CHECK_EQ(centre.gx, 640);
+        CHECK_EQ(centre.gy, 360);
+        auto corner = host_gate_hit_test(nullptr, 2419, 1513);
+        CHECK(corner.gx >= 1278 && corner.gx < 1280);
+        CHECK(corner.gy >= 718 && corner.gy < 720);
+        g_gpu->destroy(source);
+    }
+    host_present_stop();
+    host_gate_reset();
 }
 
 // The Direct3D 11 hardware path's host side on the real device: a texture
@@ -9699,6 +9745,7 @@ int main(int argc, char **argv) {
         } gpu[] = {
             {"offscreen presenter", test_presenter_real_offscreen},
             {"presenter GPU color order", test_presenter_gpu_color_order},
+            {"presenter GPU logical coordinates", test_presenter_gpu_logical_coordinates},
             {"Direct3D 11 hardware path", test_gpu2d_pixels},
             {"presenter world and overlay", test_presenter_incremental_world_and_overlay},
             {"wide scene clipping", test_wide_scene_pixels},

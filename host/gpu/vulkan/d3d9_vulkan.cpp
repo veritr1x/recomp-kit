@@ -1133,8 +1133,6 @@ class VkRenderer final : public D9Backend {
 
     // ---- present -----------------------------------------------------------
     void present(uint32_t backbuffer, uint32_t w, uint32_t h) override {
-        (void)w;
-        (void)h;
         end_pass();
         Tex *t = tex_ptr(backbuffer);
         if (!t || !t->image) {
@@ -1165,7 +1163,7 @@ class VkRenderer final : public D9Backend {
                 t->imported = dev_->import_image(t->image, v, gd);
             }
             gpu::CommandBuffer cb = dev_->begin();
-            if (host_present_stage_texture(t->imported, (int)pw, (int)ph, cb))
+            if (host_present_stage_texture(t->imported, (int)pw, (int)ph, (int)w, (int)h, cb))
                 host_present_track_command(cb);
             dev_->commit(cb);
         }

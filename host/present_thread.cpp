@@ -1270,14 +1270,15 @@ bool host_present_gpu_ready() {
 // The GPU counterpart of host_present_stage_rgba: the frame's pixels are a copy
 // of `src`, encoded into `cb`. The caller commits `cb` before it seals, and the
 // one queue runs that copy before anything composes the frame.
-bool host_present_stage_texture(gpu::Texture src, int w, int h, gpu::CommandBuffer cb) {
+bool host_present_stage_texture(gpu::Texture src, int w, int h, int guest_w, int guest_h,
+                                gpu::CommandBuffer cb) {
     auto s = active.load();
-    if (!s || s->fake || !src || !cb || w <= 0 || h <= 0)
+    if (!s || s->fake || !src || !cb || w <= 0 || h <= 0 || guest_w <= 0 || guest_h <= 0)
         return false;
     // A GPU blit copies bytes, not colors. Keep the source format so BGRA
     // backbuffers are not sampled as RGBA, including when a frame slot is reused.
     const auto format = s->device->describe(src).format;
-    s->acquire(w, h, 0, 0);
+    s->acquire(guest_w, guest_h, 0, 0);
     std::lock_guard lock(s->mutex);
     if (s->stop || !s->writing || !s->writing->target)
         return false;
@@ -1293,8 +1294,10 @@ bool host_present_stage_texture(gpu::Texture src, int w, int h, gpu::CommandBuff
     }
     if (!t.pixels)
         return false;
-    s->guest_w = w;
-    s->guest_h = h;
+    // Supersampled pixels do not enlarge the guest's client area. Publishing
+    // their dimensions here sends touches beyond that area and hides cursors.
+    s->guest_w = guest_w;
+    s->guest_h = guest_h;
     s->writing->staged_pixels = true;
     s->device->blit(cb, src, {0, 0, w, h}, t.pixels, 0, 0);
     return true;

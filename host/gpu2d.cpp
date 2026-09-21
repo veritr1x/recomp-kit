@@ -270,7 +270,7 @@ bool host_gpu2d_stage(uint32_t id, int w, int h) {
     if (!d || it == state().surfaces.end() || it->second.w != w || it->second.h != h)
         return false;
     end_pass(d);
-    const bool staged = host_present_stage_texture(it->second.texture, w, h, command(d));
+    const bool staged = host_present_stage_texture(it->second.texture, w, h, w, h, command(d));
     commit(d);
     return staged;
 }
