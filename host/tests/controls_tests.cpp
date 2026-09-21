@@ -1682,6 +1682,120 @@ static void test_binding_horizontal_arrows() {
     CHECK(out.size() == 1 && out[0].scancode == kScanDown && !out[0].down);
 }
 
+// Two fingers must survive the complete router -> mapped binding path, not
+// just work when a test constructs an already-combined PadState. Exercise
+// both press orders and both release orders on the shipped tablet layouts.
+static void test_tablet_simultaneous_controls() {
+    struct HeldKeys : ControlsSink {
+        bool keys[512]{};
+        void key(int scancode, bool down) override {
+            CHECK(scancode > 0 && scancode < 512);
+            if (scancode > 0 && scancode < 512)
+                keys[scancode] = down;
+        }
+        void action(const std::string &) override {}
+        void switch_layout(const std::string &) override {}
+        void group_visibility_changed() override {}
+        void tap() override {}
+    };
+    struct Input {
+        Kind kind;
+        int id;
+        int key;
+        int direction = 0; // stick x, in full travel radii
+    };
+    struct Pair {
+        const char *layout;
+        Input inputs[2];
+    };
+    const Pair pairs[] = {
+        {"keys", {{Kind::Key, kScanUp, kScanUp}, {Kind::Key, kScanLeft, kScanLeft}}},
+        {"keys", {{Kind::Key, kScanW, kScanW}, {Kind::Key, kScanA, kScanA}}},
+        {"keys", {{Kind::Key, kScanLShift, kScanLShift}, {Kind::Key, kScanA, kScanA}}},
+        {"pad",
+         {{Kind::Button, int(PadButton::Cross), kScanUp},
+          {Kind::Button, int(PadButton::Square), kScanDown}}},
+        {"pad",
+         {{Kind::Button, int(PadButton::Cross), kScanUp},
+          {Kind::Button, int(PadButton::Circle), kScanSpace}}},
+        {"pad", {{Kind::Button, int(PadButton::Cross), kScanUp}, {Kind::Stick, 0, kScanLeft, -1}}},
+        {"pad", {{Kind::Button, int(PadButton::Cross), kScanUp}, {Kind::Stick, 0, kScanRight, 1}}},
+        {"pad",
+         {{Kind::Button, int(PadButton::Square), kScanDown}, {Kind::Stick, 0, kScanLeft, -1}}},
+    };
+    const Screen s = screen(2420, 1668, 2.0);
+    for (const Pair &pair : pairs)
+        for (int first_down : {0, 1})
+            for (int first_up : {0, 1}) {
+                Layout layout;
+                std::string error;
+                CHECK(parse_layout(builtin_layout(pair.layout, Form::Tablet), &layout, &error));
+                Router router;
+                HeldKeys sink;
+                router.set_layout(&layout, sink);
+                router.set_screen(s);
+                MappedTable table;
+                CHECK(parse_mapped("left_stick=horizontal_arrows;cross=key:Up;"
+                                   "square=key:Down;circle=key:Space",
+                                   &table, &error));
+                Binding binding;
+                binding.set_table(table);
+                uint64_t now = 0;
+                auto pump = [&] {
+                    std::vector<TouchAction> output;
+                    std::vector<std::string> actions;
+                    binding.tick(router.pad(), now, &output, &actions);
+                    for (const auto &a : output)
+                        if (a.kind == TouchAction::Key)
+                            sink.key(a.scancode, a.down);
+                    now += 10000000;
+                };
+                auto press = [&](int index) {
+                    const Input &input = pair.inputs[index];
+                    for (int g = 0; g < int(layout.groups.size()); ++g)
+                        for (int c = 0; c < int(layout.groups[g].controls.size()); ++c) {
+                            const Control &ctl = layout.groups[g].controls[c];
+                            if (ctl.kind != input.kind)
+                                continue;
+                            const int id = ctl.kind == Kind::Key      ? ctl.scancode
+                                           : ctl.kind == Kind::Button ? int(ctl.button)
+                                                                      : ctl.stick;
+                            if (id != input.id)
+                                continue;
+                            double x, y;
+                            center(layout, g, c, s, &x, &y);
+                            CHECK(router.finger_down(index + 1, x, y, now, sink));
+                            if (input.direction)
+                                CHECK(router.finger_motion(index + 1,
+                                                           x + input.direction * ctl.radius *
+                                                                   layout.scale * s.scale,
+                                                           y, now, sink));
+                            pump();
+                            return;
+                        }
+                    CHECK(false); // every requested control must exist in the built-in
+                };
+                press(first_down);
+                CHECK(sink.keys[pair.inputs[first_down].key]);
+                CHECK(!sink.keys[pair.inputs[1 - first_down].key]);
+                press(1 - first_down);
+                // Hold through many host pumps; neither input may cancel the other.
+                for (int i = 0; i < 60; ++i) {
+                    pump();
+                    CHECK(sink.keys[pair.inputs[0].key] && sink.keys[pair.inputs[1].key]);
+                }
+                CHECK(router.finger_up(first_up + 1, now, sink));
+                pump();
+                CHECK(!sink.keys[pair.inputs[first_up].key]);
+                CHECK(sink.keys[pair.inputs[1 - first_up].key]);
+                CHECK(router.finger_up(2 - first_up, now, sink));
+                pump();
+                for (bool held : sink.keys)
+                    CHECK(!held);
+                CHECK(router.pad() == PadState());
+            }
+}
+
 // l1 = wheel_up: one Wheel(+1) per press, nothing on release.
 static void test_binding_wheel_button() {
     MappedTable t;
@@ -4113,6 +4227,7 @@ int main(int argc, char **argv) {
     test_binding_cursor_stick();
     test_binding_arrows_stick();
     test_binding_horizontal_arrows();
+    test_tablet_simultaneous_controls();
     test_binding_wheel_button();
     test_binding_action_button();
     test_binding_scroll_stick();
