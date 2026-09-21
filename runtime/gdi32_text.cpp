@@ -3,6 +3,7 @@
 // fixed 8x16 bitmap cells. No host font services or guest
 // pointers escape this file; callbacks receive temporary guest-heap records.
 #include "gdi32_internal.h"
+#include <cstdlib>
 #include "../platform/os.h"
 #include "gdi32_font8x16.h"
 #include "gdi32_truetype.h"

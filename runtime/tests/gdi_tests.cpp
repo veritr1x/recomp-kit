@@ -6,6 +6,7 @@
 #include "../gdi32_internal.h"
 #include "test_font_ttf.h"
 #include "../../platform/os.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>

@@ -80,11 +80,12 @@ enum {
     RS_FOGENABLE = 28,
     RS_SPECULARENABLE = 29,
     RS_FOGCOLOR = 34,
+    RS_COLORKEYENABLE = 41,
     RS_FOGTABLEMODE = 35,
     RS_FOGSTART = 36,
     RS_FOGEND = 37,
     RS_FOGDENSITY = 38,
-    RS_TEXTUREADDRESS = 41,
+    RS_TEXTUREADDRESS = 3,
     RS_TEXTUREADDRESSU = 44,
     RS_TEXTUREADDRESSV = 45,
 };
@@ -778,6 +779,7 @@ struct D3DRenderer::Impl {
         std::shared_ptr<OwnedTexture> texture;
         std::shared_ptr<HDTexture> enhanced;
         bool alpha = false;
+        bool colorkey = false;
         bool smallOpaqueTile = false;
         uint32_t leases = 0;
     };
@@ -791,7 +793,9 @@ struct D3DRenderer::Impl {
     int guest_width_ = 0, guest_height_ = 0, scene_width_ = 0, scene_height_ = 0;
     bool incremental_ = false;
     bool replaying_ = false;
-    SceneSlot slots_[4];
+    // Seven presenter targets plus a spare while copying retained surface state.
+    static constexpr int kSceneSlots = 8;
+    SceneSlot slots_[kSceneSlots];
     HostSceneTarget acquiringTarget_;
     bool frame_dropped_ = false;
     bool overlay_rendering_ = false;
@@ -865,7 +869,7 @@ struct D3DRenderer::Impl {
             return false;
         if (t == acquiringTarget_.world || t == acquiringTarget_.overlay)
             return false;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kSceneSlots; ++i) {
             const SceneSlot &s = slots_[i];
             if (t == s.presentTarget.world || t == s.presentTarget.overlay)
                 return false;
@@ -1060,7 +1064,7 @@ D3DRenderer::Impl::~Impl() {
         device_->commit(command_);
         command_ = {};
     }
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < kSceneSlots; ++i)
         releaseSlot(i);
     releaseMirror();
     if (white_)
@@ -1188,7 +1192,7 @@ void D3DRenderer::Impl::discard() {
         command_ = {};
     }
     acquiringTarget_ = {};
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < kSceneSlots; ++i)
         releaseSlot(i);
     releaseMirror();
     for (auto &slot : slots_)
@@ -1633,7 +1637,7 @@ void D3DRenderer::Impl::loadSlot(int i) {
     gpu_dirty_ = true;
 }
 int D3DRenderer::Impl::slotFor(uint32_t s, uint32_t g) const {
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < kSceneSlots; ++i)
         if (slots_[i].surface.id == s && slots_[i].generation == g)
             return i;
     return -1;
@@ -1713,7 +1717,7 @@ void D3DRenderer::Impl::bindSurface(const HostD3DSurface *s, uint32_t g, uint64_
         return;
     }
     int dest = -1;
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < kSceneSlots; ++i)
         if (!slots_[i].frame && i != source &&
             !host_d3d_dirty_rect(slots_[i].surface.id, slots_[i].generation, nullptr)) {
             dest = i;
@@ -1722,7 +1726,7 @@ void D3DRenderer::Impl::bindSurface(const HostD3DSurface *s, uint32_t g, uint64_
     if (dest < 0) {
         // The only backpressure point: first write after seal, with no free
         // target. Unclaimed frames can be retired here after their GPU work.
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kSceneSlots; ++i)
             if (i != source && slots_[i].unclaimed &&
                 !host_d3d_dirty_rect(slots_[i].surface.id, slots_[i].generation, nullptr)) {
                 uint64_t old = slots_[i].frame;
@@ -1738,7 +1742,7 @@ void D3DRenderer::Impl::bindSurface(const HostD3DSurface *s, uint32_t g, uint64_
             frame_dropped_ = true;
             return;
         }
-        fprintf(stderr, "[host] no free scene target; all four targets are held\n");
+        fprintf(stderr, "[host] no free scene target; all scene slots are held\n");
         abort();
     }
     // Only metadata is new. The free slot's same-sized attachments survive
@@ -2690,6 +2694,15 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
             texture_levels = it->second.texture->levels;
             texture_width = it->second.texture->width;
             u.texture_has_alpha = it->second.alpha ? 1 : 0;
+            // Legacy RGB colour keys supply alpha at texture upload. With
+            // COLORKEYENABLE and no explicit alpha test, DX5/6 drivers reject
+            // zero alpha even when blending is disabled. Otherwise an opaque
+            // menu overlay paints its transparent background over the scene.
+            if (it->second.colorkey && rs_raw(cmd, RS_COLORKEYENABLE) && !u.alphatest) {
+                u.alphatest = 1;
+                u.alphafunc = 5; // GREATER
+                u.alpharef = 0.0f;
+            }
             // Classic and legacy replay always sample the original image.
             // A replacement must never contaminate the CPU compatibility path.
             if (it->second.enhanced && it->second.enhanced->texture && active_slot_ >= 0 &&
@@ -2953,6 +2966,7 @@ void D3DRenderer::Impl::uploadTexture(const HostD3DTexture *t) {
         (t->original ? t->original : t)->amask || (t->original ? t->original : t)->has_colorkey;
     e.enhanced.reset();
     const auto &source = t->original ? *t->original : *t;
+    e.colorkey = source.has_colorkey && !source.amask;
     // Original landscape cache entries are complete opaque 16/32-square
     // RGB565 tiles. The draw gate additionally requires depth-writing world
     // triangles with full 0..1 UVs: skies, atlases and sprites are excluded.
@@ -3126,7 +3140,7 @@ bool D3DRenderer::Impl::replayLegacyFrame(uint64_t frame) {
     int previous = active_slot_;
     bool found = false;
     uint32_t draws = g_total_draws, since = g_draws_since_present;
-    for (int index = 0; index < 4; ++index) {
+    for (int index = 0; index < kSceneSlots; ++index) {
         SceneSlot &slot = slots_[index];
         if (slot.frame != frame)
             continue;

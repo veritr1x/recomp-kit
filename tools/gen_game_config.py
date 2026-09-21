@@ -62,6 +62,9 @@ def render_header(cfg):
     lines.append("#define RECOMP_CONTROLS_NATIVE_AXES %s" % c_string(",".join(native["axes"])))
     lines.append("#define RECOMP_CONTROLS_NATIVE_BUTTONS %s" % c_string(",".join(native["buttons"])))
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
+    lines.append("#define RECOMP_RESUMABLE_STACKS %d" %
+                 int(cfg["translate"].get("resumable_stacks", False)))
+    lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))
     # Auxiliary modules the loader maps beside the image: {name, developer path, sha256, base, size}.
     lines.append("#define RECOMP_AUX_MODULE_COUNT %d" % len(cfg["aux_modules"]))
     lines.append("#define RECOMP_AUX_MODULES {%s}" % ", ".join(

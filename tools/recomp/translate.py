@@ -43,6 +43,7 @@ LISTINGS = FUNCS_TSV = BINARY = CURATED = None
 ANIMATION_COUNTER = 0
 VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
+RESUMABLE_STACKS = False
 FUNCTION_ALIGNMENT = 16
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
@@ -80,6 +81,8 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
+    global RESUMABLE_STACKS
+    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -91,7 +94,7 @@ def configure_module(cfg, key):
     CURATED = None
     ANIMATION_COUNTER = 0
     VISUAL_ANIMATION_READS = frozenset()
-    EXTRA_ENTRY_POINTS = frozenset()
+    EXTRA_ENTRY_POINTS = frozenset(mod.get("entry_points", ()))
     FUNCTION_ALIGNMENT = mod["function_alignment"]
     SYMBOL_PREFIX = "recomp_%s_" % key
     AUX_MODULE = mod
@@ -125,6 +128,8 @@ def configure(cfg):
     ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
+    global RESUMABLE_STACKS
+    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
@@ -2166,8 +2171,18 @@ class Translator(object):
         # An out-of-image displacement is an offset in a computed address,
         # not static table storage. Tables also live in executable sections,
         # so data_ranges alone would reject valid switches in .text.
-        return (op.kind == "mem" and op.index is not None and op.scale == 4
-                and bool(op.disp) and self.image.base <= op.disp < self.image.end)
+        if not (op.kind == "mem" and op.disp
+                and self.image.base <= op.disp < self.image.end):
+            return False
+        if op.index is not None and op.scale == 4:
+            return True
+        # Hand-written dispatchers can store byte offsets (0,4,8,...) in
+        # their work records and JMP [reg + table]. Require consecutive code
+        # pointers to distinguish this from a static object's field access.
+        if op.base is not None and op.index is None:
+            return all((target := self.image.rd32(op.disp + offset)) is not None
+                       and self.image.is_exec(target) for offset in (0, 4))
+        return False
 
     def decode_jumptable(self, fn, i):
         """Decode the switch behind `JMP dword ptr [reg*4 + base]`.
@@ -2190,13 +2205,14 @@ class Translator(object):
         # decodes nothing at all is the worst kind of gap and would otherwise
         # be invisible to the coverage check.
         self.table_sites[(fn.addr, ins.addr)] = op.disp
-        if op.base is not None:
+        byte_offset = op.base is not None and op.index is None
+        if op.base is not None and not byte_offset:
             self.table_bases.add(op.disp)
             return self.two_index_table(fn, i, ins, op)
         dword_base = op.disp
 
         self.jmp_index = i
-        kind, info = self.index_source(fn, i, op.index)
+        kind, info = (None, None) if byte_offset else self.index_source(fn, i, op.index)
         if kind == "byte_table":
             byte_base, count = info
             targets = []
@@ -2223,7 +2239,7 @@ class Translator(object):
             self.stats["_jmp_table_bounded"] += 1
             return targets
 
-        ranged = self.index_range(fn, i, op.index)
+        ranged = None if byte_offset else self.index_range(fn, i, op.index)
         if ranged is not None:
             lo, hi, holes = ranged
             targets = []
@@ -3179,6 +3195,8 @@ class Translator(object):
                     self.reject_offimage_call(t)
                     self.stats["_call_unknown"] += 1
                     L.append("recomp_call(c, %s);" % hexlit(t))
+                if RESUMABLE_STACKS:
+                    L.append("if (c->eip != %s) return;" % hexlit(nxt))
                 if t in self.seh_helpers:
                     L.append("c->eip = %s;" % hexlit(ins.addr))
                     L.append("{ jmp_buf *b_ = recomp_seh_frame_adopt(c); "
@@ -3193,6 +3211,8 @@ class Translator(object):
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
             L.append("recomp_call(c, t_);")
+            if RESUMABLE_STACKS:
+                L.append("if (c->eip != %s) return;" % hexlit(nxt))
             self.stats["_call_indirect"] += 1
             return L
 
@@ -3731,10 +3751,17 @@ class Translator(object):
                 lhs, rhs = (st(s), st(d)) if rev else (st(d), st(s))
                 L.append(setst(d, "fx87(c, %s)" % combine(lhs, o, rhs)))
             elif ops[0].kind == "st":
-                # D8 /n form: ST(0) op= ST(i)
-                s = st(ops[0].sti)
-                lhs, rhs = (s, st(0)) if rev else (st(0), s)
-                L.append(setst(0, "fx87(c, %s)" % combine(lhs, o, rhs)))
+                # Ghidra can print both D8 (ST0 destination) and DC (STi
+                # destination) as a single STi operand. Recover the direction
+                # from the pinned instruction bytes; the short text alone is
+                # ambiguous. Legacy prefixes do not change that direction.
+                at = ins.addr
+                while self.image.rd8(at) in (0x26, 0x2e, 0x36, 0x3e, 0x64,
+                                              0x65, 0x66, 0x67, 0x9b):
+                    at += 1
+                d, s = (ops[0].sti, 0) if self.image.rd8(at) == 0xdc else (0, ops[0].sti)
+                lhs, rhs = (st(s), st(d)) if rev else (st(d), st(s))
+                L.append(setst(d, "fx87(c, %s)" % combine(lhs, o, rhs)))
             else:
                 v = (self.x87_mem_value(ops[0]))
                 L.append("double v_ = %s;" % v)
@@ -4017,14 +4044,21 @@ def main():
         SYMBOL_PREFIX = "recomp_%s_" % re.sub(r"[^A-Za-z0-9_]", "_", args.as_module)
         AUX_MODULE = {"name": args.as_module, "base": cfg["game"]["image_base"],
                       "size": 0}  # the image's extent, filled in once it is read
+    image = Image(BINARY)
     discovered = []
     if args.discovered:
         global EXTRA_ENTRY_POINTS
-        discovered = [a for a in read_discovered(args.discovered) if a not in EXTRA_ENTRY_POINTS]
+        all_discovered = read_discovered(args.discovered)
+        # One run can discover missing code in both the EXE and auxiliary DLLs.
+        # Each translation adopts only its own image's addresses; in-image data
+        # still reaches the executable-section validation below and is rejected.
+        selected = [a for a in all_discovered if image.base <= a < image.end]
+        discovered = [a for a in selected if a not in EXTRA_ENTRY_POINTS]
         EXTRA_ENTRY_POINTS = EXTRA_ENTRY_POINTS | frozenset(discovered)
-        print("  --discovered %s: %d address%s from a run, %d already in game.toml"
+        print("  --discovered %s: %d address%s from a run, %d already in game.toml, "
+              "%d outside this image"
               % (args.discovered, len(discovered), "" if len(discovered) == 1 else "es",
-                 len(read_discovered(args.discovered)) - len(discovered)),
+                 len(selected) - len(discovered), len(all_discovered) - len(selected)),
               file=sys.stderr)
 
     # An address named as an entry point is not forgotten: that is what makes
@@ -4048,7 +4082,6 @@ def main():
             if os.path.exists(p) and os.path.getsize(p) > 0:
                 all_addrs.add(a)
 
-    image = Image(BINARY)
     if AUX_MODULE is not None and args.as_module:
         # A module of the image's own code covers the image's addresses; the
         # image's table is consulted first, so this one answers only for what
@@ -5237,6 +5270,18 @@ def main():
         print("  dropped %d alternate entr%s a pointer named and nothing else: %s"
               % (len(literals), "y" if len(literals) == 1 else "ies",
                  ", ".join("%08x (in %08x, %s)" % row for row in literals[:12])))
+
+    # A guest task may save ESP and RET into another task's suspended CALL.
+    # Export each real continuation so the outer execution loop can resume it
+    # after mismatched returns have unwound the native call stack.
+    if RESUMABLE_STACKS:
+        starts = {f.addr for f in parsed}
+        for fn in parsed:
+            for i, ins in enumerate(fn.insns):
+                if ins.mnem == "CALL" and not tr.never_returns(ins):
+                    nxt = fn.fallthrough[i]
+                    if nxt in owner and nxt not in starts:
+                        extra[nxt] = owner[nxt]
 
     entries_by_fn = defaultdict(set)
     for t, fn in extra.items():

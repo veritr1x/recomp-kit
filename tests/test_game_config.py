@@ -20,6 +20,21 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
+    def test_cd_tracks_preserve_disc_order_and_reject_non_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text("")
+            (game / "game.toml").write_text(stub + '\n[media]\ncd_tracks = ["", "music/02.ogg"]\n')
+            cfg = game_config.load(game)
+            self.assertEqual(cfg["media"]["cd_tracks"], ["", "music/02.ogg"])
+            self.assertIn('#define RECOMP_CD_AUDIO_TRACKS {"", "music/02.ogg", 0}',
+                          gen_game_config.render_header(cfg))
+            for bad in ('[2]', '"music"'):
+                (game / "game.toml").write_text(stub + '\n[media]\ncd_tracks = ' + bad + '\n')
+                with self.assertRaisesRegex(ValueError, "cd_tracks"):
+                    game_config.load(game)
+
     def test_windows_version_defaults_and_optional_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)
@@ -171,6 +186,7 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(mod["path"], (game / "original/Blit_p6.dll").resolve())
             self.assertEqual(mod["listings_path"], (game / "analysis/Blit_p6.dll").resolve())
             self.assertEqual(mod["function_alignment"], 1)
+            self.assertEqual(mod["entry_points"], [])
             self.assertEqual((mod["base"], mod["size"]), (0x10000000, 0x28000))
             header = gen_game_config.render_header(cfg)
             self.assertIn("#define RECOMP_GUEST_SIZE 0x10100000u", header)
@@ -180,6 +196,13 @@ class LoadTests(unittest.TestCase):
             cmake = gen_game_config.render_cmake(cfg)
             self.assertIn("set(RECOMP_GUEST_SIZE 0x10100000u)", cmake)
             self.assertIn("set(RECOMP_AUX_MODULES blit)", cmake)
+            (game / "game.toml").write_text(text + 'entry_points = [0x10001234]\n')
+            self.assertEqual(game_config.load(game)["aux_modules"][0]["entry_points"],
+                             [0x10001234])
+            for entries in ('[0x0fffffff]', '[0x10028000]', '["0x10001234"]', '7'):
+                (game / "game.toml").write_text(text + 'entry_points = ' + entries + '\n')
+                with self.assertRaises(ValueError):
+                    game_config.load(game)
             bad = text.replace('guest_size = 0x10100000', 'guest_size = 0x10000000')
             (game / "game.toml").write_text(bad)
             with self.assertRaises(ValueError):

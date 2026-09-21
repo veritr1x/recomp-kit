@@ -78,8 +78,9 @@ upstream notices. See [NOTICE](NOTICE) for licenses.
 
 On macOS, iOS, Android and Linux, `RECOMP_VIDEO` defaults to `ON`: the first build fetches the
 SHA-256-pinned FFmpeg 7.1.1 release and builds shared `avformat`, `avcodec`
-and `avutil` libraries with only Bink/Smacker video and audio decoders,
-Bink/Smacker demuxers and file input. The macOS app carries the three dylibs in
+and `avutil` libraries with a limited decoder/demuxer set, including Bink,
+WMV, Indeo 5 AVI and Ogg/Vorbis. The exact enabled components are recorded in
+the FFmpeg notice. The macOS app carries the three dylibs in
 `Contents/Frameworks`, using `@rpath` install names and an executable rpath
 of `@executable_path/../Frameworks`; each dylib is signed ad hoc before the
 app. Apple system libraries/frameworks are allowed; no Homebrew libraries
@@ -101,7 +102,7 @@ the executable, whose rpath includes `$ORIGIN`. The package also carries
 `resources/ffmpeg-NOTICE.md`. FFmpeg builds from source using the existing
 compiler and make; no distribution FFmpeg package is needed.
 
-On Windows, CMake looks for MSYS2's `make` on `PATH` (or takes
+On a native Windows host, CMake looks for MSYS2's `make` on `PATH` (or takes
 `-DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe`) and the `bash` beside it;
 video defaults to ON when both are there. With the presets' clang, which
 targets the MSVC ABI, FFmpeg is built by its own MSVC toolchain
@@ -237,7 +238,12 @@ through MoltenVK with `RECOMP_GPU_BACKEND=vulkan`) and WebGPU (the
 web), all from one shader generator. Windows builds cross-compile on macOS or
 Linux with llvm-mingw: set `LLVM_MINGW_ROOT` and pass
 `--preset windows-cross` (or `windows-cross-stub`) to `tools/build.py`; the
-executable lands in `build/windows/recomp/`.
+executable lands in `build/windows/recomp/` (`build/windows-stub/recomp/` for
+the stub). These presets enable FFmpeg movies
+and file-backed music, building the three shared media DLLs with llvm-mingw and
+copying them beside the executable. The build host needs a POSIX shell and GNU
+make; MSYS2 is only required when building on Windows itself. Translated app
+packages, including the DLLs and their notice, land in `build/windows/package/`.
 
 ## Check a change
 

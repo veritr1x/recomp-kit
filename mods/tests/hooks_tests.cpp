@@ -107,6 +107,46 @@ void enter(uint32_t addr) {
 
 } // namespace
 
+MOD_TEST_SUITE(hook_guest_call_import_preserves_registers) {
+    reset_world();
+    MOD_CHECK(mods_symbols_load(nullptr));
+    const uint32_t trampoline = imports_alloc_trampoline(
+        "test", "hook_import",
+        [](X86 *c) {
+            MOD_CHECK_EQ(arg(c, 0), 17u);
+            MOD_CHECK_EQ(arg(c, 1), 25u);
+            MOD_CHECK_EQ(c->r[R_ECX], 123u);
+            c->r[R_EBX] = 456;
+            c->r[R_EDX] = 789;
+            set_eax(c, arg(c, 0) + arg(c, 1));
+        },
+        2);
+    uint32_t result = 0, id = 0;
+    MOD_CHECK_EQ(g_api[0].guest_call(&g_api[0], trampoline, 0, nullptr, 0, &result), POP_E_STATE);
+    auto callback = [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *user) {
+        X86 *c = loader_context();
+        const X86 saved = *c;
+        uint32_t args[] = {17, 25}, value = 0;
+        MOD_CHECK_EQ(api->guest_call(api, *(uint32_t *)user, 123, args, 2, &value), POP_OK);
+        MOD_CHECK_EQ(value, 42u);
+        MOD_CHECK(memcmp(c, &saved, sizeof saved) == 0);
+        MOD_CHECK_EQ(api->guest_call(api, TRAMP_LIMIT - TRAMP_STRIDE, 0, nullptr, 0, &value),
+                     POP_E_NOSYMBOL);
+        MOD_CHECK_EQ(api->guest_call(api, *(uint32_t *)user + 1, 0, nullptr, 0, &value),
+                     POP_E_NOSYMBOL);
+        MOD_CHECK_EQ(api->hook_return(api, cpu, value, 0), POP_OK);
+    };
+    const uint32_t entry = loader_entry_point();
+    MOD_CHECK_EQ(g_api[0].hook_install_ex(&g_api[0], entry, 0, callback, POP_HOOK_REPLACE,
+                                          POP_HOOK_NO_GAME_VIEW, (void *)&trampoline, &id),
+                 POP_OK);
+    if (id) {
+        enter(entry);
+        MOD_CHECK_EQ(loader_context()->r[R_EAX], 42u);
+        MOD_CHECK_EQ(g_api[0].hook_remove(&g_api[0], id), POP_OK);
+    }
+}
+
 extern "C" uint64_t mods_view_test_push_count();
 MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
     reset_world();

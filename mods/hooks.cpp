@@ -22,6 +22,7 @@
 #include "mods_internal.h"
 #include "options_menu.h"
 #include "../runtime/mods_seam.h"
+#include "../runtime/imports.h"
 #include "../runtime/win32.h"
 
 #include <deque>
@@ -1067,7 +1068,9 @@ PopModStatus mods_guest_call(const PopModApi *api, uint32_t addr, uint32_t ecx,
     (void)api;
     if (!t_stack.depth)
         return POP_E_STATE;
-    if (recomp_index_of(addr) < 0)
+    // IAT entries point at allocated runtime trampolines, not translated
+    // functions. Permit those entries while rejecting arbitrary addresses.
+    if (recomp_index_of(addr) < 0 && !imports_describe(addr))
         return POP_E_NOSYMBOL;
     if (nargs > 16 || (nargs && !args))
         return POP_E_INVAL;

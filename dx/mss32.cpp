@@ -1,4 +1,4 @@
-// mss32.cpp - Miles Sound System 6 (mss32.dll) as a game imports it: 41
+// mss32.cpp - Miles Sound System 6 (mss32.dll) as a game imports it:
 // stdcall exports whose decorated names carry their arity (_AIL_name@bytes).
 // Samples play PCM WAVE images and streams decode MP3 through shared host
 // audio channels. The 3D provider API reports "no providers" so a game can
@@ -17,6 +17,7 @@
 #include <cmath>
 #include <vector>
 #include <iterator>
+#include <map>
 
 namespace {
 
@@ -33,8 +34,17 @@ int32_t miles_pan_mb(int32_t p) {
     return std::clamp((p - 64) * 10000 / 63, -10000, 10000);
 }
 
+struct Driver {
+    uint32_t rate = 22050, bits = 16, channels = 2;
+    int master = 127;
+};
+std::map<uint32_t, Driver> g_drivers;
+uint32_t g_next_driver = 0x10000;
+int32_t g_preferences[64]{};
+
 struct Sample {
-    uint32_t handle = 0;
+    uint32_t handle = 0, driver = 0;
+    std::vector<int16_t> decoded;
     bool alive = false;
     int32_t channel = -1;
     RiffWave wave{};
@@ -63,22 +73,29 @@ void sample_stop(Sample &s) {
 void sample_reset(Sample &s) {
     sample_stop(s);
     dx_free_audio_channel(s.channel);
-    uint32_t handle = s.handle;
+    uint32_t handle = s.handle, driver = s.driver;
     s = Sample{};
     s.handle = handle;
+    s.driver = driver;
     s.alive = true;
+}
+
+int sample_volume(const Sample &s) {
+    auto it = g_drivers.find(s.driver);
+    return miles_volume_mb(s.volume) +
+           miles_volume_mb(it == g_drivers.end() ? 127 : it->second.master);
 }
 
 void sample_play(Sample &s) {
     HostAudioPlay p{};
     p.channel = s.channel;
-    p.pcm = g_mem + s.wave.pcm;
+    p.pcm = s.decoded.empty() ? (const void *)(g_mem + s.wave.pcm) : s.decoded.data();
     p.bytes = s.wave.pcm_bytes;
     p.sample_rate = (int32_t)s.wave.rate;
     p.channels = s.wave.channels;
     p.bits = s.wave.bits;
     p.loop = s.loops == 0 ? 1 : 0;
-    p.volume = miles_volume_mb(s.volume);
+    p.volume = std::max(-10000, sample_volume(s));
     p.pan = miles_pan_mb(s.pan);
     host_audio_play(&p);
     s.playing = true;
@@ -153,6 +170,7 @@ void ail_allocate_sample_handle(X86 *c) {
             continue;
         s = Sample{};
         s.handle = i + 1;
+        s.driver = arg(c, 0);
         s.alive = true;
         set_eax(c, s.handle);
         return;
@@ -180,6 +198,7 @@ void ail_set_sample_file(X86 *c) {
         return;
     sample_stop(*s);
     s->wave = RiffWave{};
+    s->decoded.clear();
     uint32_t image = arg(c, 1);
     if (!image || !gm_valid(image, 12))
         return;
@@ -191,6 +210,98 @@ void ail_set_sample_file(X86 *c) {
         return;
     if (riff_parse_wave(image, (uint32_t)bytes, &s->wave))
         set_eax(c, 1);
+}
+
+// Named samples carry a byte length, allowing packed MP3 effects as well as RIFF.
+void ail_set_named_sample_file(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    set_eax(c, 0);
+    if (!s)
+        return;
+    sample_stop(*s);
+    s->wave = {};
+    s->decoded.clear();
+    uint32_t data = arg(c, 2), bytes = arg(c, 3);
+    if (!data || !bytes || !gm_valid(data, bytes))
+        return;
+    if (riff_parse_wave(data, bytes, &s->wave)) {
+        set_eax(c, 1);
+        return;
+    }
+    Mp3Source source;
+    if (!source.open(std::vector<uint8_t>(g_mem + data, g_mem + data + bytes)))
+        return;
+    std::vector<int16_t> frame;
+    while (source.decode_next(frame)) {
+        if (s->decoded.size() + frame.size() > 64 * 1024 * 1024) {
+            s->decoded.clear();
+            return;
+        }
+        s->decoded.insert(s->decoded.end(), frame.begin(), frame.end());
+    }
+    s->wave.pcm_bytes = uint32_t(s->decoded.size() * 2);
+    s->wave.rate = source.rate();
+    s->wave.channels = source.channels();
+    s->wave.bits = 16;
+    set_eax(c, s->wave.pcm_bytes != 0);
+}
+
+// A successful waveOutOpen must populate HDIGDRIVER, not just return zero.
+void ail_wave_open(X86 *c) {
+    uint32_t out = arg(c, 0), fmt = arg(c, 3);
+    set_eax(c, 1);
+    if (!out || !gm_valid(out, 4))
+        return;
+    wr32(out, 0);
+    if (!fmt || !gm_valid(fmt, 16) || rd16(fmt) != 1 || !rd32(fmt + 4) ||
+        (rd16(fmt + 2) != 1 && rd16(fmt + 2) != 2) || (rd16(fmt + 14) != 8 && rd16(fmt + 14) != 16))
+        return;
+    uint32_t id = g_next_driver++;
+    g_drivers[id] = {rd32(fmt + 4), rd16(fmt + 14), rd16(fmt + 2), 127};
+    wr32(out, id);
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), id);
+    LOGV("mss32: opened digital driver %08x (%u Hz)", id, rd32(fmt + 4));
+    set_eax(c, 0);
+}
+void ail_wave_close(X86 *c) {
+    for (auto &s : g_samples)
+        if (s.alive && s.driver == arg(c, 0)) {
+            sample_reset(s);
+            s.alive = false;
+        }
+    g_drivers.erase(arg(c, 0));
+    set_eax(c, 0);
+}
+void ail_configuration(X86 *c) {
+    auto it = g_drivers.find(arg(c, 0));
+    if (it != g_drivers.end()) {
+        if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+            wr32(arg(c, 1), it->second.rate);
+        if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+            wr32(arg(c, 2), (it->second.channels == 2 ? 2 : 0) | (it->second.bits == 16 ? 1 : 0));
+        if (arg(c, 3) && gm_valid(arg(c, 3), 128))
+            gm_put_str(arg(c, 3), "Native digital audio", 128);
+    }
+    set_eax(c, 0);
+}
+void ail_master_volume(X86 *c) {
+    auto it = g_drivers.find(arg(c, 0));
+    if (it != g_drivers.end())
+        it->second.master = std::clamp((int32_t)arg(c, 1), 0, 127);
+    for (auto &s : g_samples)
+        if (s.alive && s.channel >= 0 && s.driver == arg(c, 0))
+            host_audio_set_volume(s.channel, std::max(-10000, sample_volume(s)));
+    set_eax(c, 0);
+}
+void ail_preference(X86 *c) {
+    uint32_t index = arg(c, 0);
+    set_eax(c, index < 64 ? g_preferences[index] : 0);
+    if (index < 64)
+        g_preferences[index] = (int32_t)arg(c, 1);
+}
+void ail_get_preference(X86 *c) {
+    set_eax(c, arg(c, 0) < 64 ? g_preferences[arg(c, 0)] : 0);
 }
 
 void ail_start_sample(X86 *c) {
@@ -222,7 +333,7 @@ void ail_set_sample_volume(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0))) {
         s->volume = std::clamp((int32_t)arg(c, 1), 0, 127);
         if (s->channel >= 0)
-            host_audio_set_volume(s->channel, miles_volume_mb(s->volume));
+            host_audio_set_volume(s->channel, std::max(-10000, sample_volume(*s)));
     }
     set_eax(c, 0);
 }
@@ -434,8 +545,13 @@ void ret_done(X86 *c) {
 const ImportShim g_mss32_shims[] = {
     AIL(startup, 0, ret1),
     AIL(shutdown, 0, ret0),
-    AIL(set_preference, 8, ret0),
-    AIL(waveOutOpen, 16, ret0),
+    AIL(set_preference, 8, ail_preference),
+    AIL(get_preference, 4, ail_get_preference),
+    AIL(waveOutOpen, 16, ail_wave_open),
+    AIL(waveOutClose, 4, ail_wave_close),
+    AIL(digital_configuration, 16, ail_configuration),
+    AIL(set_digital_master_volume, 8, ail_master_volume),
+    AIL(set_named_sample_file, 20, ail_set_named_sample_file),
     AIL(mem_free_lock, 4, ail_mem_free_lock),
     AIL(file_read, 8, ail_file_read),
     AIL(allocate_sample_handle, 4, ail_allocate_sample_handle),

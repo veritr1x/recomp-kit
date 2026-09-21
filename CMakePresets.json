@@ -100,7 +100,7 @@
       "inherits": "base",
       "toolchainFile": "${sourceDir}/cmake/toolchains/llvm-mingw.cmake",
       "cacheVariables": {
-        "RECOMP_VIDEO": "OFF"
+        "RECOMP_VIDEO": "ON"
       }
     },
     {

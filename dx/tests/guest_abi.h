@@ -54,7 +54,8 @@ static uint32_t call_shim(uint32_t target, std::initializer_list<uint32_t> args)
         return 0;
     }
     ++g_checks;
-    uint32_t expected = before + 4 + 4 * (uint32_t)a.size();
+    const bool cdecl = imports_argc(target) == ARGC_CDECL;
+    uint32_t expected = before + 4 + (cdecl ? 0 : 4 * (uint32_t)a.size());
     if (g_cpu.r[R_ESP] != expected) {
         ++g_failures;
         fprintf(stderr,
@@ -69,6 +70,8 @@ static uint32_t call_shim(uint32_t target, std::initializer_list<uint32_t> args)
         ++g_failures;
         fprintf(stderr, "FAIL: shim did not return to the pushed address\n");
     }
+    if (cdecl)
+        g_cpu.r[R_ESP] += 4 * (uint32_t)a.size(); // caller cleanup
     return g_cpu.r[R_EAX];
 }
 

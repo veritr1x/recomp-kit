@@ -90,8 +90,11 @@ extern uint8_t *g_mem;
  *
  * -DRECOMP_NULL_CHECKS=1 builds it; RECOMP_NULL_FAULTS=1 then arms it. */
 #if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS
-#define RECOMP_NULL_GUARD(a, write) \
-    do { if (RECOMP_UNLIKELY((a) < GUEST_NULL_LIMIT)) recomp_null_access((a), (write)); } while (0)
+#define RECOMP_NULL_GUARD(a, write)                                                                \
+    do {                                                                                           \
+        if (RECOMP_UNLIKELY((a) < GUEST_NULL_LIMIT))                                               \
+            recomp_null_access((a), (write));                                                      \
+    } while (0)
 #else
 #define RECOMP_NULL_GUARD(a, write) ((void)0)
 #endif
@@ -395,6 +398,9 @@ static inline void recomp_comis(X86 *c, double a, double b) {
 /* Indirect CALL: dispatch `target` to a translated function, an import shim,
  * or recomp_unknown_call.  Generated into build/recomp/gen/table.c. */
 void recomp_call(X86 *c, uint32_t target);
+/* Entry/callback driver for images that switch cooperative guest stacks. */
+void recomp_run(X86 *c, uint32_t target);
+extern const int recomp_resumable_stacks;
 
 /* RECOMP_WATCH_FRAME=1 reports a guest call that returns with EBP changed.
  * A routine that loses the frame pointer corrupts nothing and crashes nowhere:
@@ -524,6 +530,8 @@ static inline void recomp_return(X86 *c) {
         recomp_callback_return(c);
         return;
     }
+    if (recomp_resumable_stacks)
+        return;
     if (recomp_is_call_return(c->eip) || recomp_module_is_call_return(c->eip))
         return;
     if ((c->eip >= GUEST_SHIM_BASE && c->eip < GUEST_SHIM_END) || recomp_index_of(c->eip) >= 0 ||

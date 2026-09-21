@@ -570,6 +570,14 @@ void a_RegOpenKeyEx(X86 *c, uint32_t hkey, const std::string &sub, uint32_t pres
         set_eax(c, 6);
         return;
     } // ERROR_INVALID_HANDLE
+    // Predefined roots exist independently of serialized subkeys. Opening
+    // one with a null/empty subkey returns that same predefined handle.
+    if (sub.empty() && hive_name(hkey)) {
+        if (presult)
+            wr32(presult, hkey);
+        set_eax(c, 0);
+        return;
+    }
     if (regstore().find(path) == regstore().end()) {
         LOGV("RegOpenKeyExA(%s): not found", path.c_str());
         set_eax(c, 2); // ERROR_FILE_NOT_FOUND
@@ -1117,6 +1125,17 @@ void m_timeSetEvent(X86 *c) {
 void m_timeKillEvent(X86 *c) {
     timers().erase(arg(c, 0));
     set_eax(c, 0); // TIMERR_NOERROR
+}
+
+void m_timeGetDevCaps(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (!out || arg(c, 1) < 8 || !gm_valid(out, 8)) {
+        set_eax(c, 97);
+        return;
+    }
+    wr32(out, 1);
+    wr32(out + 4, 1000);
+    set_eax(c, 0);
 }
 
 void m_timeBeginPeriod(X86 *c) {
@@ -1936,8 +1955,52 @@ void host_pump_timers(X86 *c) {
     }
 }
 
+// A stable name for the virtual Windows account, independent of host identity.
+// The size includes NUL on both success and the insufficient-buffer path.
+static void a_GetUserNameA(X86 *c) {
+    constexpr char name[] = "Player";
+    uint32_t out = arg(c, 0), size = arg(c, 1);
+    set_eax(c, 0);
+    if (!size || !gm_valid(size, 4)) {
+        set_last_error(87);
+        return;
+    }
+    uint32_t capacity = rd32(size);
+    wr32(size, sizeof name);
+    if (capacity < sizeof name) {
+        set_last_error(122);
+        return;
+    }
+    if (!out || !gm_valid(out, sizeof name)) {
+        set_last_error(87);
+        return;
+    }
+    memcpy(g_mem + out, name, sizeof name);
+    set_eax(c, 1);
+}
+
+// No AVIFile codec adapter is installed yet. Report missing codec support at
+// open instead of inventing a successful file interface and corrupting the
+// caller's stack. The game can follow its normal missing-video path.
+static void avi_noop(X86 *c) {
+    set_eax(c, 0);
+}
+static void avi_open_unsupported(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    set_eax(c, 0x80040154u); // REGDB_E_CLASSNOTREG
+}
+static void avi_bad_handle(X86 *c) {
+    set_eax(c, 0x8004406cu);
+}
+static void avi_no_sample(X86 *c) {
+    set_eax(c, 0xffffffffu);
+}
+
 const ImportShim g_misc_shims[] = {
     // ADVAPI32
+    {"ADVAPI32.dll", "GetUserNameA", 2, a_GetUserNameA},
     {"ADVAPI32.dll", "RegOpenKeyA", 3, a_RegOpenKeyA},
     {"ADVAPI32.dll", "RegOpenKeyExA", 5, a_RegOpenKeyExA},
     {"ADVAPI32.dll", "RegCreateKeyExA", 9, a_RegCreateKeyExA},
@@ -2002,6 +2065,11 @@ const ImportShim g_misc_shims[] = {
     {"WSOCK32.dll", "ord11", 1, w_inet_ntoa},
     // WINMM: implemented
     {"WINMM.dll", "timeGetTime", 0, m_timeGetTime},
+    {"WINMM.dll", "timeGetDevCaps", 2, m_timeGetDevCaps},
+    {"_INMM.dll", "timeGetTime", 0, m_timeGetTime},
+    {"_INMM.dll", "timeGetDevCaps", 2, m_timeGetDevCaps},
+    {"_INMM.dll", "timeBeginPeriod", 1, m_timeBeginPeriod},
+    {"_INMM.dll", "timeEndPeriod", 1, m_timeEndPeriod},
     {"WINMM.dll", "timeSetEvent", 5, m_timeSetEvent},
     {"WINMM.dll", "timeKillEvent", 1, m_timeKillEvent},
     {"WINMM.dll", "timeBeginPeriod", 1, m_timeBeginPeriod},
@@ -2025,6 +2093,9 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "midiOutPrepareHeader", 3, m_midiOutPrepareHeader},
     {"WINMM.dll", "midiOutUnprepareHeader", 3, m_midiOutUnprepareHeader},
     {"WINMM.dll", "mciSendCommandA", 4, m_mciSendCommandA},
+    // _inmm exposes the same WinMM ABI. Until CD-file playback is modeled,
+    // report the actual unavailable MCI device with its proper stack cleanup.
+    {"_INMM.dll", "mciSendCommandA", 4, m_mciSendCommandA},
     {"WINMM.dll", "mciGetErrorStringA", 3, m_mciGetErrorStringA},
     {"WINMM.dll", "mixerGetNumDevs", 0, m_mixerGetNumDevs},
     {"WINMM.dll", "mixerOpen", 6, m_mixerNoDriver},
@@ -2159,6 +2230,20 @@ const ImportShim g_misc_shims[] = {
     {"QMIXER.dll", "QSWaveMixOpenWaveEx", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixFreeWave", 2, nullptr},
     {"QMIXER.dll", "QSWaveMixPlayEx", 6, nullptr},
+    {"AVIFIL32.dll", "AVIFileInit", 0, avi_noop},
+    {"AVIFIL32.dll", "AVIFileExit", 0, avi_noop},
+    {"AVIFIL32.dll", "AVIFileOpenA", 4, avi_open_unsupported},
+    {"AVIFIL32.dll", "AVIFileGetStream", 4, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIFileRelease", 1, avi_noop},
+    {"AVIFIL32.dll", "AVIStreamRelease", 1, avi_noop},
+    {"AVIFIL32.dll", "AVIStreamInfoA", 3, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIStreamReadFormat", 4, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIStreamRead", 7, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIStreamBeginStreaming", 4, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIStreamEndStreaming", 1, avi_bad_handle},
+    {"AVIFIL32.dll", "AVIStreamFindSample", 3, avi_no_sample},
+    {"AVIFIL32.dll", "AVIStreamSampleToTime", 2, avi_no_sample},
+    {"AVIFIL32.dll", "AVIStreamTimeToSample", 2, avi_no_sample},
     {"QMIXER.dll", "QSWaveMixCloseSession", 1, nullptr},
     {"QMIXER.dll", "QSWaveMixGetDirectSound", 2, nullptr},
     {"QMIXER.dll", "QSWaveMixInitEx", 1, nullptr},

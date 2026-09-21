@@ -1080,15 +1080,27 @@ void k_GetModuleFileNameW(X86 *c) {
 
 void load_library_named(X86 *c, const std::string &module_name);
 
-void get_module_handle_named(X86 *c, const std::string &module_name) {
+std::string library_name(const std::string &module_name) {
     std::string name = lower(module_name);
+    if (name.find('\\') != std::string::npos || name.find('/') != std::string::npos)
+        name = name.substr(name.find_last_of("\\/") + 1);
+    if (name.find('.') == std::string::npos)
+        name += ".dll";
+    return name;
+}
+
+void get_module_handle_named(X86 *c, const std::string &module_name) {
+    std::string name = library_name(module_name);
+    // A handle lookup must neither attach a mapped DLL nor acquire a reference.
+    if (LoaderModule *m = loader_module_named(name.c_str())) {
+        if (!m->attached)
+            set_last_error(126); // ERROR_MOD_NOT_FOUND
+        set_eax(c, m->attached ? m->base : 0);
+        return;
+    }
     auto it = modules().find(name);
     if (it != modules().end()) {
         set_eax(c, it->second);
-        return;
-    }
-    if (name.find("d3dpoptb") != std::string::npos) {
-        set_eax(c, IMAGE_BASE);
         return;
     }
     // Registered DLLs are already available to static imports. Materialize
@@ -1121,41 +1133,46 @@ bool runtime_serves_module(const std::string &lower_name) {
     return imports_has_dll(lower_name.c_str());
 }
 
+// Mapped auxiliary code stays in the arena, but its Win32 lifetime follows
+// LoadLibrary/FreeLibrary. The main executable never enters this DLL path.
+uint32_t call_dll_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
+    if (!m.entry || recomp_module_lookup(m.entry) < 0) {
+        LOGV("%s: DLL entry %08x is not translated, not run", m.name.c_str(), m.entry);
+        return 1;
+    }
+    uint32_t result = guest_call(c, m.entry, m.base, reason, 0);
+    LOGV("%s: DLL entry %08x reason %u returned %08x", m.name.c_str(), m.entry, reason, result);
+    return result;
+}
+
 void load_library_named(X86 *c, const std::string &module_name) {
-    std::string name = lower(module_name);
-    if (name.find('\\') != std::string::npos || name.find('/') != std::string::npos)
-        name = name.substr(name.find_last_of("\\/") + 1);
-    if (name.find(".dll") == std::string::npos)
-        name += ".dll";
+    std::string name = library_name(module_name);
     auto it = modules().find(name);
     if (it != modules().end()) {
         set_eax(c, it->second);
         return;
     }
-    // A translated auxiliary module: the loader mapped it at its configured
-    // base, which is its handle. Its entry point runs once, on first load,
-    // as DllMain(base, DLL_PROCESS_ATTACH, 0) would; a module whose entry is
-    // not among its translated functions is served without it.
+    // Restore post-IAT bytes before each fresh attach, just as remapping the
+    // original DLL would. Never restore the main image or run its EXE entry.
     if (LoaderModule *m = loader_module_named(name.c_str())) {
+        if (m->base == loader_image_base()) {
+            set_eax(c, m->base);
+            return;
+        }
         if (!m->attached) {
+            memcpy(g_mem + m->base, m->initial_image.data(), m->initial_image.size());
             m->attached = true;
-            if (m->entry && recomp_module_lookup(m->entry) >= 0) {
-                uint32_t esp = c->r[R_ESP];
-                wr32(esp - 4, 0);
-                wr32(esp - 8, 1); // DLL_PROCESS_ATTACH
-                wr32(esp - 12, m->base);
-                wr32(esp - 16, GUEST_RETURN_SENTINEL);
-                c->r[R_ESP] = esp - 16;
-                uint32_t eip = c->eip;
-                recomp_call(c, m->entry);
-                c->r[R_ESP] = esp;
-                c->eip = eip;
-                LOGV("LoadLibrary(\"%s\"): entry point %08x returned %08x", name.c_str(), m->entry,
-                     c->r[R_EAX]);
-            } else {
-                LOGV("LoadLibrary(\"%s\"): entry point %08x is not translated, not run",
-                     name.c_str(), m->entry);
+            m->load_refs = 1;
+            if (!call_dll_entry(c, *m, 1)) { // DLL_PROCESS_ATTACH
+                call_dll_entry(c, *m, 0);    // failed attach still receives detach
+                m->attached = false;
+                m->load_refs = 0;
+                set_last_error(1114); // ERROR_DLL_INIT_FAILED
+                set_eax(c, 0);
+                return;
             }
+        } else {
+            ++m->load_refs;
         }
         set_eax(c, m->base);
         return;
@@ -1189,14 +1206,32 @@ void k_LoadLibraryExW(X86 *c) {
 }
 
 void k_FreeLibrary(X86 *c) {
+    uint32_t handle = arg(c, 0);
+    if (const LoaderModule *mapped = loader_module_containing(handle)) {
+        LoaderModule *m = loader_module_named(mapped->name.c_str());
+        if (handle != m->base || handle == loader_image_base() || !m->load_refs) {
+            set_last_error(ERROR_INVALID_HANDLE_);
+            set_eax(c, 0);
+            return;
+        }
+        if (--m->load_refs == 0) {
+            call_dll_entry(c, *m, 0); // DLL_PROCESS_DETACH, before discarding globals
+            m->attached = false;
+        }
+    }
+    // Shim-only libraries have process lifetime and no guest entry point.
     set_eax(c, 1);
 }
 
 void k_GetProcAddress(X86 *c) {
     uint32_t hmod = arg(c, 0);
-    std::string proc = gm_str(arg(c, 1));
+    uint32_t name = arg(c, 1);
+    bool ordinal = name <= 0xffff;
+    std::string proc = ordinal ? "#" + std::to_string(name) : gm_str(name);
     if (const LoaderModule *m = loader_module_containing(hmod)) {
-        uint32_t a = hmod == m->base ? loader_module_export(*m, proc.c_str()) : 0;
+        uint32_t a = hmod == m->base ? (ordinal ? loader_module_export_ordinal(*m, name)
+                                                : loader_module_export(*m, proc.c_str()))
+                                     : 0;
         if (!a)
             log_once(("gpa:" + m->name + "!" + proc).c_str(),
                      "GetProcAddress(%s, \"%s\") -> 0 (no such export)", m->name.c_str(),
@@ -1570,8 +1605,8 @@ void k_SystemTimeToFileTime(X86 *c) {
     const int hour = rd16(in + 8), minute = rd16(in + 10), second = rd16(in + 12);
     const int millis = rd16(in + 14);
     // 1601 is where a FILETIME starts; below it there is nothing to express.
-    if (year < 1601 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
-        minute > 59 || second > 59 || millis > 999) {
+    if (year < 1601 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 ||
+        second > 59 || millis > 999) {
         set_last_error(87);
         set_eax(c, 0);
         return;
@@ -4899,6 +4934,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetLocaleInfoA", 4, k_GetLocaleInfoA},
     {"KERNEL32.dll", "GetEnvironmentVariableA", 3, k_GetEnvironmentVariableA},
     {"KERNEL32.dll", "GetUserDefaultLCID", 0, k_GetUserDefaultLCID},
+    {"KERNEL32.dll", "GetSystemDefaultLCID", 0, k_GetUserDefaultLCID},
     {"KERNEL32.dll", "IsValidCodePage", 1, k_IsValidCodePage},
     {"KERNEL32.dll", "IsValidLocale", 2, k_IsValidLocale},
     {"KERNEL32.dll", "EnumSystemLocalesA", 2, k_EnumSystemLocalesA},

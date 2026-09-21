@@ -44,6 +44,7 @@ __attribute__((weak)) void host_access_counts(HostAccessCounts *out) {
 
 HOST_DEFAULT void host_present(const void *, int, int, int, const uint32_t *, int) {}
 HOST_DEFAULT void host_set_display_mode(int, int, int) {}
+HOST_DEFAULT void host_set_render_resolution(int, int) {}
 
 HOST_DEFAULT void host_d3d_begin_scene() {}
 HOST_DEFAULT void host_d3d_end_scene() {}

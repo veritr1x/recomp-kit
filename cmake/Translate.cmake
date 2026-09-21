@@ -34,7 +34,7 @@ if(POP_HAVE_GEN)
   file(GLOB POP_GEN_SOURCES CONFIGURE_DEPENDS ${POP_GEN_DIR}/chunk_*.c ${POP_GEN_DIR}/table.c)
   add_library(recomp_gen STATIC ${POP_GEN_SOURCES})
   set_target_properties(recomp_gen PROPERTIES
-    ARCHIVE_OUTPUT_DIRECTORY ${POP_OUT} OUTPUT_NAME recomp_gen)
+    ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR} OUTPUT_NAME recomp_gen)
   # -I<gen> for x86.h beside the sources, -I<root> for the canonical copy,
   # -I<runtime> for intrinsics.h: the same three the shell script passed.
   target_include_directories(recomp_gen PRIVATE ${POP_GEN_DIR} ${POP_ROOT} ${POP_ROOT}/runtime)
@@ -68,7 +68,7 @@ if(POP_HAVE_GEN)
     file(GLOB aux_sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c)
     add_library(${aux_target} STATIC ${aux_sources})
     set_target_properties(${aux_target} PROPERTIES
-      ARCHIVE_OUTPUT_DIRECTORY ${POP_OUT} OUTPUT_NAME ${aux_target})
+      ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR} OUTPUT_NAME ${aux_target})
     target_include_directories(${aux_target} PRIVATE ${dir} ${POP_GEN_DIR} ${POP_ROOT} ${POP_ROOT}/runtime)
     # A module's own funcs.h reads the same overrides header, so a native
     # replacement can stand in for one of its functions as for the image's.

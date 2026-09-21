@@ -15,6 +15,21 @@ spec.loader.exec_module(translate)
 
 
 class ConfigureTests(unittest.TestCase):
+    def test_resumable_stacks_is_opt_in_for_main_and_auxiliary_images(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        translate.configure(cfg)
+        self.assertFalse(translate.RESUMABLE_STACKS)
+        cfg["translate"]["resumable_stacks"] = True
+        translate.configure(cfg)
+        self.assertTrue(translate.RESUMABLE_STACKS)
+        cfg["aux_modules"] = [{"key": "aux", "listings_path": Path("analysis/aux"),
+                              "path": Path("original/aux.dll"), "function_alignment": 16,
+                              "entry_points": [0x10001234]}]
+        translate.configure_module(cfg, "aux")
+        self.assertTrue(translate.RESUMABLE_STACKS)
+        self.assertEqual(translate.EXTRA_ENTRY_POINTS, frozenset({0x10001234}))
+        translate.configure(game_config.load(ROOT / "games/stub"))
+
     def test_function_alignment_follows_the_loaded_game(self):
         cfg = game_config.load(ROOT / "games/stub")
         cfg["translate"]["function_alignment"] = 4

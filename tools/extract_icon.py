@@ -21,12 +21,17 @@ import io
 IOS_ICONS = (("Icon-29", 58), ("Icon-40", 80), ("Icon-60", 120), ("Icon-76", 152), ("Icon-83.5", 167))
 
 
+class MissingIconError(ValueError):
+    """The PE is valid but has no icon resource."""
+
+
 def ico_bytes(exe_path):
     """The first icon group of a PE, rebuilt as a .ico file's bytes."""
     pe = pefile.PE(str(exe_path), fast_load=True)
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
     icons, group = {}, None
-    for entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+    resource = getattr(pe, "DIRECTORY_ENTRY_RESOURCE", None)
+    for entry in resource.entries if resource else []:
         kind = pefile.RESOURCE_TYPE.get(entry.id)
         if kind not in ("RT_ICON", "RT_GROUP_ICON"):
             continue
@@ -38,7 +43,7 @@ def ico_bytes(exe_path):
             elif group is None:
                 group = data
     if group is None or not icons:
-        raise ValueError("%s has no icon group" % exe_path)
+        raise MissingIconError("%s has no icon group" % exe_path)
     count = struct.unpack_from("<H", group, 4)[0]
     header = struct.pack("<HHH", 0, 1, count)
     entries, blobs = b"", b""
@@ -63,7 +68,18 @@ def largest_frame(ico):
 
 def write_icons(exe_path, dest, sizes=IOS_ICONS):
     """Write every icon file into `dest`; returns the paths written."""
-    frame = largest_frame(ico_bytes(exe_path))
+    try:
+        icon = ico_bytes(exe_path)
+    except MissingIconError:
+        # Some installers keep the executable's icon beside it instead of
+        # embedding a resource. Windows filenames are case insensitive.
+        exe_path = Path(exe_path)
+        name = exe_path.with_suffix(".ico").name.casefold()
+        matches = [p for p in exe_path.parent.iterdir() if p.name.casefold() == name and p.is_file()]
+        if len(matches) != 1:
+            raise
+        icon = matches[0].read_bytes()
+    frame = largest_frame(icon)
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     written = []

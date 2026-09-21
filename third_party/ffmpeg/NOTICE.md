@@ -34,8 +34,8 @@ set -- \
   --enable-pic \
   --enable-decoder=bink,binkaudio_rdft,binkaudio_dct,smacker,smackaud \
   --enable-decoder=wmv1,wmv2,wmv3,vc1,wmav1,wmav2,wmapro,mp3,mp3float \
-  --enable-decoder=msmpeg4v1,msmpeg4v2,msmpeg4v3 \
-  --enable-demuxer=bink,smacker,asf,mp3 --enable-parser=vc1,mpegaudio \
+  --enable-decoder=msmpeg4v1,msmpeg4v2,msmpeg4v3,indeo5,vorbis,adpcm_ima_wav,pcm_s16le,pcm_u8 \
+  --enable-demuxer=bink,smacker,asf,mp3,avi,ogg --enable-parser=vc1,mpegaudio \
   --enable-protocol=file \
   --disable-autodetect --disable-xlib --disable-libxcb --disable-sdl2 \
   --disable-iconv --disable-zlib --disable-bzlib --disable-lzma \
@@ -58,20 +58,30 @@ native C compiler:
 /bin/sh "$SOURCE_DIR/configure" "$@" --cc="$CMAKE_C_COMPILER"
 ```
 
-Windows requires `bash` and `make` from MSYS2 on `PATH` and a MinGW-compatible
-C compiler. CMake finds both programs before enabling video; it keeps video
-OFF with a status message if either is missing or the compiler uses the
-MSVC ABI. `--toolchain=msvc`/clang-cl support is out of scope. The native
-MinGW configure command is:
+Native Windows builds require MSYS2 `bash` and GNU `make` on `PATH`. CMake
+keeps video OFF if those tools are missing. A MinGW compiler uses:
 
 ```sh
 bash "$SOURCE_DIR/configure" "$@" --cc="$CMAKE_C_COMPILER" --target-os=mingw32
 ```
 
-The DLLs install into `ffmpeg/bin`; their `libavformat.dll.a`,
-`libavcodec.dll.a` and `libavutil.dll.a` import libraries install into
-`ffmpeg/lib`. Linux and Windows builds/loading/playback remain unverified;
-the configure branches were reviewed on macOS.
+An MSVC-ABI compiler uses `--toolchain=msvc --target-os=win64 --arch=x86_64`
+from the Visual Studio developer environment instead. On Linux/macOS, the
+`windows-cross` presets use llvm-mingw, the host's POSIX shell and GNU make:
+
+```sh
+/bin/sh "$SOURCE_DIR/configure" "$@" \
+  --enable-cross-compile --target-os=mingw32 --arch="$RECOMP_WINDOWS_ARCH" \
+  --cross-prefix="$LLVM_MINGW_ROOT/bin/$RECOMP_WINDOWS_ARCH-w64-mingw32-" \
+  --cc="$CMAKE_C_COMPILER" --ar="$CMAKE_AR" --ranlib="$CMAKE_RANLIB" \
+  --nm="$LLVM_MINGW_ROOT/bin/llvm-nm" --strip="$LLVM_MINGW_ROOT/bin/llvm-strip" \
+  --windres="$CMAKE_RC_COMPILER"
+```
+
+`RECOMP_WINDOWS_ARCH` defaults to `x86_64`; append `--disable-x86asm` for
+that target. The cross prefix also selects FFmpeg's import-library generator
+`dlltool`. The DLLs install into `ffmpeg/bin`; MinGW import libraries install
+into `ffmpeg/lib`, while MSVC import libraries install into `ffmpeg/bin`.
 
 iOS targets arm64 devices, minimum iOS 17.0. `CMAKE_OSX_SYSROOT` is the
 absolute iPhoneOS SDK path; when CMake supplies an SDK name, resolve it
@@ -110,14 +120,14 @@ ExternalProject runs `make -j8` and `make install` through `cmake -E env`.
 Native kit builds use `tools/build.py` or `tools/test.py`; FFmpeg's configure
 and make are managed by that build. `RECOMP_VIDEO` defaults to ON for
 macOS, iOS, Android and Linux, and on Windows with the prerequisites above;
-OFF omits FFmpeg entirely. Windows CI explicitly configures OFF.
+OFF omits FFmpeg entirely. Native Windows and Windows cross-build CI enable it.
 
 Automatic optional dependency discovery and external compression/UI/media
 libraries are disabled to avoid dependencies on Homebrew or other local
 packages. The libraries may depend on each other and target system
-libraries/frameworks. `config_components.h` records the five enabled
-decoders (Bink video, Bink RDFT/DCT audio, Smacker video and Smacker audio),
-two demuxers and file protocol; all other decoders/demuxers are disabled.
+libraries/frameworks. `config_components.h` records the enabled movie/audio
+decoders, demuxers and parsers selected by the arguments above, including
+Indeo 5/AVI and Vorbis/Ogg, plus their internal dependencies and file protocol.
 
 ## Dynamic linking and replacement
 

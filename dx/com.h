@@ -56,6 +56,10 @@ enum ComIface : uint16_t {
     IF_DDCOLORCONTROL,
     IF_D3D,
     IF_D3D2,
+    IF_D3D3,
+    IF_D3DDEVICE3,
+    IF_D3DVIEWPORT3,
+    IF_D3DMATERIAL3,
     IF_D3DDEVICE2,
     IF_D3DVIEWPORT2,
     IF_D3DMATERIAL2,
@@ -281,7 +285,9 @@ struct ComObj {
 
     // --- K_D3DDEVICE
     uint32_t dev_d3d = 0;
-    uint32_t render_target = 0; // surface id
+    uint32_t bound_texture = 0;       // Device3 retains its stage-zero texture object.
+    uint32_t texture_stage[32] = {0}; // Single advertised texture stage.
+    uint32_t render_target = 0;       // surface id
     uint32_t current_viewport = 0;
     bool in_scene = false;
     std::vector<uint32_t> viewports;

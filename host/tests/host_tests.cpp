@@ -4366,6 +4366,26 @@ static void test_render_texture(D3DRenderer *renderer) {
     CHECK_EQ(g, 0);
     CHECK_EQ(b, 0);
 
+    // COLORKEYENABLE must also reject the keyed texel with alpha testing and
+    // blending disabled. Turning the state off restores the opaque texel.
+    quad.state[15] = 0;
+    quad.state[27] = 0;
+    for (uint32_t keyed : {1u, 0u}) {
+        quad.state[41] = keyed;
+        renderer->beginScene();
+        renderer->clearFlags(3, nullptr, 0, 0xff802040u, 1.0f);
+        renderer->draw(&quad.cmd);
+        renderer->endScene();
+        rb = read_target(renderer);
+        rb.rgb(56, 56, &r, &g, &b, &a);
+        CHECK_EQ(r, keyed ? 128 : 255);
+        CHECK_EQ(g, keyed ? 32 : 255);
+        CHECK_EQ(b, keyed ? 64 : 255);
+        rb.rgb(8, 8, &r, &g, &b, &a);
+        CHECK_EQ(r, 255);
+        CHECK_EQ(g, 0);
+    }
+
     // MODULATE multiplies the texture by the vertex colour: a half-grey vertex
     // over the red texel is a darker red.
     quad.state[21] = 2; // MODULATE
@@ -5396,7 +5416,26 @@ static void test_three_display_frames_overlap_and_retire_in_order() {
     CHECK_EQ(host_present_unique_completed(), 3u); // shutdown is not presentation
 }
 
-static void test_acquire_drops_immediately_when_all_targets_in_flight() {
+static void test_acquire_waits_for_retained_target() {
+    host_present_test_begin(false);
+    host_present_test_seal(1);
+    host_present_tick_for_test(0);
+    host_present_test_seal(2, HOST_SCREEN_GAMEPLAY, true, true);
+    host_present_test_seal(3);
+    host_present_test_seal(4);
+    CHECK_EQ(host_present_drops(), 1u); // completed mailbox frame, not guest writes
+    auto writer = std::async(std::launch::async,
+                             [] { return host_present_acquire_target(640, 480, 640, 480).w; });
+    CHECK(writer.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    host_present_test_prefix_done(2);
+    CHECK_EQ(writer.get(), 640);
+    CHECK_EQ(host_present_waits(), 1u);
+    CHECK_EQ(host_present_drops(), 1u);
+    CHECK_EQ(host_present_test_faults(), 0u);
+    host_present_stop();
+}
+
+static void test_acquire_faults_when_all_targets_stall() {
     host_present_test_begin(false);
     host_present_test_seal(1);
     host_present_tick_for_test(0);
@@ -5406,12 +5445,12 @@ static void test_acquire_drops_immediately_when_all_targets_in_flight() {
     CHECK_EQ(host_present_drops(), 1u); // 2 is dropped but its prefix still owns a slot
     auto writer = std::async(std::launch::async,
                              [] { return host_present_acquire_target(640, 480, 640, 480).w; });
-    bool immediate = writer.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
-    CHECK(immediate);
-    if (!immediate)
-        host_present_test_prefix_done(2); // fail without hanging on the old wait
+    bool finished = writer.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    CHECK(finished);
+    if (!finished)
+        host_present_test_prefix_done(2); // fail without hanging
     CHECK_EQ(writer.get(), 0);
-    CHECK_EQ(host_present_waits(), 0u);
+    CHECK_EQ(host_present_waits(), 1u);
     CHECK_EQ(host_present_drops(), 2u);
     char stats[768];
     CHECK(host_stats_gameplay_line(stats, sizeof stats) > 0);
@@ -5462,6 +5501,39 @@ static void test_continuous_metric_needs_40s_and_reports_min_bucket() {
     CHECK_EQ(host_metric_throughput(&minimum, &elapsed), 1);
     CHECK_EQ(minimum, 100);
     host_present_stop();
+}
+// A renderer restart can select a larger output without shrinking its UI or
+// changing input coordinates. Requests affect the next writer, never a lease.
+static void test_presenter_render_resolution() {
+    host_present_test_begin();
+    host_set_render_resolution(3840, 2160);
+    auto first = host_present_acquire_target(1280, 720, 0, 0);
+    CHECK_EQ(first.w, 3840);
+    CHECK_EQ(first.h, 2160);
+    host_set_render_resolution(1920, 1080);
+    CHECK_EQ(host_present_acquire_target(1280, 720, 0, 0).w, 3840);
+    host_present_test_seal(1);
+    auto second = host_present_acquire_target(1280, 720, 0, 0);
+    CHECK_EQ(second.w, 1920);
+    CHECK_EQ(second.h, 1080);
+    CHECK(second.world != first.world);
+    host_present_test_seal(2);
+    // An explicit scene request has precedence over the default output size.
+    auto explicit_size = host_present_acquire_target(1280, 720, 2560, 1440);
+    CHECK_EQ(explicit_size.w, 2560);
+    CHECK_EQ(explicit_size.h, 1440);
+    host_present_stop();
+    host_set_render_resolution(0, 0);
+    host_present_test_begin();
+    auto automatic = host_present_acquire_target(1280, 720, 0, 0);
+    host_present_stop();
+    host_set_render_resolution(20000, 2160);
+    host_present_test_begin();
+    auto invalid = host_present_acquire_target(1280, 720, 0, 0);
+    CHECK_EQ(invalid.w, automatic.w);
+    CHECK_EQ(invalid.h, automatic.h);
+    host_present_stop();
+    host_set_render_resolution(0, 0);
 }
 static void test_presenter_allocation_halving() {
     host_present_test_begin();
@@ -6360,11 +6432,13 @@ static void test_presentation_service() {
     test_frame_immutable_after_seal();
     test_release_after_completion_and_presentation();
     test_dropped_prefix_lifetime();
-    test_acquire_drops_immediately_when_all_targets_in_flight();
+    test_acquire_waits_for_retained_target();
+    test_acquire_faults_when_all_targets_stall();
     test_two_display_frames_overlap_and_retire_in_order();
     test_three_display_frames_overlap_and_retire_in_order();
     test_layered_gameplay_skips_unused_compatibility_pixels();
     test_continuous_metric_needs_40s_and_reports_min_bucket();
+    test_presenter_render_resolution();
     test_presenter_allocation_halving();
     test_presenter_layout_and_transitions();
     test_presenter_history_keeps_target_lease();

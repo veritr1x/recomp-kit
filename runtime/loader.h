@@ -41,20 +41,26 @@ uint32_t loader_image_limit();
 uint32_t loader_entry_point();
 const std::vector<SectionInfo> &loader_sections();
 
-// An auxiliary module from game.toml [modules.aux.*], mapped by loader_load
-// beside the image at its configured base. `attached` records whether
-// LoadLibrary has run its entry point (DLL_PROCESS_ATTACH) yet.
+// A mapped PE module. Auxiliary modules come from game.toml [modules.aux.*].
+// The main executable is already attached and also serves code/data exports.
+// Auxiliary load references own DllMain attach/detach. The verified, IAT-patched
+// image is retained so a later load starts with fresh globals and CRT state.
 struct LoaderModule {
     std::string name, path;
     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
     bool attached = false;
+    uint32_t load_refs = 0;
+    std::vector<uint8_t> initial_image;
+    std::vector<SectionInfo> sections;
 };
 uint32_t loader_module_count();
 const LoaderModule *loader_module(uint32_t i);
+// Count/index enumerate auxiliary modules; name/address lookups include the EXE.
 LoaderModule *loader_module_named(const char *name); // case-insensitive, nullptr when unknown
 const LoaderModule *loader_module_containing(uint32_t addr);
 // The guest address of a named export, 0 when the module has none by that name.
 uint32_t loader_module_export(const LoaderModule &m, const char *name);
+uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal);
 // True inside the main image or any auxiliary module.
 bool loader_in_image(uint32_t addr);
 const std::string &loader_exe_path();

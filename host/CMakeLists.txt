@@ -251,6 +251,9 @@ if(TARGET recomp_gen)
     # SDLActivity loads libmain.so from the APK's native library directory.
     set_target_properties(recomp_app PROPERTIES OUTPUT_NAME main)
     target_link_libraries(recomp_app PRIVATE log)
+    # Core adaptations must be available before guest startup on mobile too.
+    # Their manifests are staged into APK assets by tools/build.py.
+    pop_builtin_mods(recomp_app)
   elseif(IOS)
     # No plugin loading on a stock device: the core mods are compiled in.
     pop_builtin_mods(recomp_app RESOURCES $<TARGET_BUNDLE_CONTENT_DIR:recomp_app>)
@@ -283,10 +286,14 @@ if(TARGET recomp_gen)
       --preload-file ${web_resources}@/app/resources)
   elseif(APPLE)
     pop_mac_bundle(recomp_app)
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RECOMP_VIDEO)
-    # The desktop packager places all three directly linked FFmpeg libraries
-    # beside the executable. Retain CMake's build-tree paths for local runs.
-    set_target_properties(recomp_app PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+  else()
+    # Desktop packages carry manifests beside statically linked core plugins.
+    # This avoids shipping a plugin compiled for a different host platform.
+    pop_builtin_mods(recomp_app RESOURCES $<TARGET_FILE_DIR:recomp_app>/resources)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RECOMP_VIDEO)
+      # Keep staged FFmpeg libraries discoverable beside the executable.
+      set_target_properties(recomp_app PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+    endif()
   endif()
 
   if(APPLE AND NOT IOS AND NOT ANDROID AND EXISTS ${RECOMP_GAME_DIR}/mods/examples/luawalk/main.lua) # Objective-C++ source; a desktop test

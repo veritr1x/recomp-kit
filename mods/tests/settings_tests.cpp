@@ -56,6 +56,30 @@ MOD_TEST_SUITE(settings_declare_and_round_trip) {
     MOD_CHECK_EQ(v, 4); // the persisted value beats the default
 }
 
+MOD_TEST_SUITE(settings_host_display_survives_page_reinit_and_profile_reload) {
+    fresh();
+    mods_host_set_main_thread();
+    mods_settings_rows_for_test((1u << DISPLAY_WINDOW) | (1u << DISPLAY_OVERLAY));
+    mods_page_init();
+    MOD_CHECK_EQ(mods_display_set(DISPLAY_WINDOW, 2), POP_OK);
+    MOD_CHECK_EQ(mods_display_set(DISPLAY_OVERLAY, 1), POP_OK);
+    std::string path = mods_settings_path();
+    // Reconstructing the fallback page during a display restart must retain
+    // both the user's values and the host's published overlay state.
+    mods_page_init();
+    MOD_CHECK_EQ(mods_display_value(DISPLAY_WINDOW), 2);
+    MOD_CHECK_EQ(mods_display_value(DISPLAY_OVERLAY), 1);
+    MOD_CHECK_EQ(mods_display_overlay(), 1);
+    mods_settings_reset();
+    MOD_CHECK(mods_settings_load(path.c_str()));
+    mods_page_init();
+    MOD_CHECK_EQ(mods_display_value(DISPLAY_WINDOW), 2);
+    MOD_CHECK_EQ(mods_display_value(DISPLAY_OVERLAY), 1);
+    MOD_CHECK_EQ(mods_display_overlay(), 1);
+    mods_input_remove_all(MODS_OWNER_RUNTIME);
+    mods_settings_rows_for_test((2u << DISPLAY_CONTROLS_BIT) - 1);
+}
+
 MOD_TEST_SUITE(settings_failed_save_keeps_previous_value) {
     fresh();
     mods_settings_declare(2, "a.mod", "volume", "Volume", POP_SETTING_INT, 5, 0, 10);

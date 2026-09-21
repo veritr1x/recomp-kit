@@ -23,8 +23,10 @@ class BuildPyTests(unittest.TestCase):
 
     def test_archive_path_per_platform(self):
         root = Path("/r/build")
-        self.assertEqual(build_py.archive_path(root, "Darwin"), root / "recomp/librecomp_gen.a")
-        self.assertEqual(build_py.archive_path(root, "Windows"), root / "recomp/recomp_gen.lib")
+        self.assertEqual(build_py.archive_path(root, "Darwin"), root / "cmake/macos/lib/librecomp_gen.a")
+        self.assertEqual(build_py.archive_path(root, "Windows"), root / "cmake/windows/lib/recomp_gen.lib")
+        self.assertEqual(build_py.archive_path(root, "Darwin", "macos-debug"),
+                         root / "cmake/macos-debug/lib/librecomp_gen.a")
 
     def test_desktop_hosts_are_allowed_on_linux_and_windows(self):
         for system, preset in (("Linux", "linux"), ("Windows", "windows")):

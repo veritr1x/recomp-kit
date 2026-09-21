@@ -153,9 +153,15 @@ def load(game_dir):
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))
     translate = cfg.setdefault("translate", {})
+    resumable = translate.setdefault("resumable_stacks", False)
+    if not isinstance(resumable, bool):
+        raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)
+    tracks = cfg.setdefault("media", {}).setdefault("cd_tracks", [])
+    if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
+        raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
     cfg.setdefault("hooks", {})
     cfg.setdefault("bundle", {}).setdefault("exclude", [])
     touch = cfg.setdefault("touch", {})
@@ -241,10 +247,16 @@ def load_aux_modules(cfg, game_dir, source):
         alignment = entry.get("function_alignment", 4)
         if type(alignment) is not int or alignment <= 0:
             raise ValueError("%s: [modules.aux.%s] function_alignment must be a positive integer" % (source, key))
+        entries = entry.get("entry_points", [])
+        if not isinstance(entries, list) or any(type(a) is not int or not base <= a < base + size
+                                               for a in entries):
+            raise ValueError("%s: [modules.aux.%s] entry_points must be addresses inside the module"
+                             % (source, key))
         modules.append({
             "key": key, "name": entry["name"], "sha256": entry["sha256"], "base": base, "size": size,
             "path": (game_dir / entry["path"]).resolve(),
             "listings_path": (game_dir / entry.get("listings", "analysis/" + entry["name"])).resolve(),
             "function_alignment": alignment,
+            "entry_points": entries,
         })
     return modules

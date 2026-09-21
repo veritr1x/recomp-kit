@@ -82,6 +82,26 @@ std::string key_of(const char *dll, const char *name) {
     return k;
 }
 
+// x86 stdcall exports may carry their stack byte count in _name@bytes.
+// Only use this ABI evidence when no explicit signature was registered;
+// fastcall (@name@bytes), C++ mangling and malformed suffixes remain unknown.
+uint8_t decorated_stdcall_args(const char *name) {
+    if (!name || name[0] != '_')
+        return ARGC_UNKNOWN;
+    const char *suffix = strrchr(name, '@');
+    if (!suffix || suffix <= name + 1 || !suffix[1])
+        return ARGC_UNKNOWN;
+    unsigned bytes = 0;
+    for (const char *p = suffix + 1; *p; ++p) {
+        if (*p < '0' || *p > '9')
+            return ARGC_UNKNOWN;
+        bytes = bytes * 10 + unsigned(*p - '0');
+        if (bytes > 4u * (ARGC_UNKNOWN - 1))
+            return ARGC_UNKNOWN;
+    }
+    return bytes % 4 ? ARGC_UNKNOWN : uint8_t(bytes / 4);
+}
+
 } // namespace
 
 void imports_register(const ImportShim *shims, size_t count) {
@@ -137,6 +157,8 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
         if (!fn)
             t.argc = ri->second.argc_stdcall;
     }
+    if (t.argc == ARGC_UNKNOWN)
+        t.argc = decorated_stdcall_args(name);
 
     uint32_t idx = (uint32_t)tramps().size();
     if (idx >= TRAMP_MAX) {
@@ -539,7 +561,7 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     call->return_sp = esp;
     callbacks.stack.push_back(call);
     if (!setjmp(call->env))
-        recomp_call(c, fn);
+        recomp_run(c, fn);
     recomp_seh_callback_leave(c, recomp_callback_depth());
     uint32_t eax = c->r[R_EAX];
     c->r[R_ESP] = call->saved_esp;

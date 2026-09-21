@@ -292,7 +292,8 @@ struct PopModApi {
      * arguments on a scratch stack below the hooked frame, and returns its
      * EAX. Every register and the x87 state are restored afterwards, so
      * cdecl, stdcall and thiscall all work. Guest memory it writes stays
-     * written. */
+     * written. Allocated import trampolines (for example an IAT entry) are
+     * also accepted; unallocated trampoline addresses are rejected. */
     PopModStatus (*guest_call)(const PopModApi *api, uint32_t addr, uint32_t ecx,
                                const uint32_t *args, uint32_t nargs, uint32_t *out_eax);
     /* Optional v1 tail. The screen the window is on, in pixels

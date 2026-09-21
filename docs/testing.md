@@ -31,6 +31,16 @@ first builds and runs a deterministic 32-frame entity capture from your own game
 in an isolated directory; no saved capture from another checkout is needed. The gameplay
 runner uses an isolated profile and original textures unless a local pack exists.
 
+For a Windows cross-build, set `LLVM_MINGW_ROOT`, then run
+`tools/build.py --preset windows-cross --stub --target app` and
+`tools/test.py --preset windows-cross-stub --compile-only`. CI verifies the
+Indeo 5/AVI and Vorbis/Ogg components and uses Wine to load `dx_tests.exe` with
+only its three copied FFmpeg DLLs. `RECOMP_TEST_AUDIO=/path/to/track.ogg` exercises
+the CD-music decoder and requires nonzero PCM; CI generates its own sine tone.
+`RECOMP_TEST_AVI=/path/to/movie.avi` exercises the guest AVIFile/Indeo imports,
+requiring changing nonblack frames. Movie probes use private local inputs,
+never uploaded. These headless probes do not open an audio device or game window.
+
 For instruction-translation changes, use the original differential harness:
 
 ```sh

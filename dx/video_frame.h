@@ -1,4 +1,4 @@
-// Decoder-independent, limited-range BT.601 YUV420P row conversion.
+// Decoder-independent, limited-range BT.601 planar YUV row conversion.
 #pragma once
 #include <stdint.h>
 
@@ -8,7 +8,7 @@ enum VideoSurfaceType : uint32_t {
     VIDEO_RGB565 = 10,
 };
 
-// Each chroma sample covers two horizontal luma samples. The caller selects
-// the chroma row for y / 2 and supplies a destination of width * bpp bytes.
+// chroma_shift is 1 for YUV420P or 2 for YUV410P. The caller selects
+// the chroma row for y >> chroma_shift and supplies width * bpp output bytes.
 void video_frame_convert_row(uint8_t *dest, const uint8_t *y, const uint8_t *u, const uint8_t *v,
-                             uint32_t width, VideoSurfaceType type);
+                             uint32_t width, VideoSurfaceType type, unsigned chroma_shift = 1);

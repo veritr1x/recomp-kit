@@ -1,6 +1,6 @@
 #include "../mods/pop_mod_api.h"
 #include "passes.h"
-// d3d.cpp - Direct3D 2: the Direct3D object, the device, viewports,
+// d3d.cpp - Direct3D 2/3: the Direct3D object, the device, viewports,
 // materials, lights and textures.
 //
 // This is a recorder, not a rasterizer. Every draw is forwarded to
@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <algorithm>
+#include <array>
 
 #define IID_BYTES(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                         \
     {(uint8_t)((a) & 0xff),                                                                        \
@@ -54,6 +55,16 @@ static const uint8_t IID_IDirect3D_[16] =
     IID_BYTES(0x3BBA0080, 0x2421, 0x11CF, 0xA3, 0x1A, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56);
 static const uint8_t IID_IDirect3D2_[16] =
     IID_BYTES(0x6AAE1EC1, 0x662A, 0x11D0, 0x88, 0x9D, 0x00, 0xAA, 0x00, 0xBB, 0xB7, 0x6A);
+// DX6 exposes distinct vtables: Device3 removes SwapTextureHandles, takes
+// FVF vertex formats and adds texture-stage methods. These are not IID aliases.
+static const uint8_t IID_IDirect3D3_[16] =
+    IID_BYTES(0xbb223240, 0xe72b, 0x11d0, 0xa9, 0xb4, 0x00, 0xaa, 0x00, 0xc0, 0x99, 0x3e);
+static const uint8_t IID_IDirect3DDevice3_[16] =
+    IID_BYTES(0xb0ab3b60, 0x33d7, 0x11d1, 0xa9, 0x81, 0x00, 0xc0, 0x4f, 0xd7, 0xb1, 0x74);
+static const uint8_t IID_IDirect3DViewport3_[16] =
+    IID_BYTES(0xb0ab3b61, 0x33d7, 0x11d1, 0xa9, 0x81, 0x00, 0xc0, 0x4f, 0xd7, 0xb1, 0x74);
+static const uint8_t IID_IDirect3DMaterial3_[16] =
+    IID_BYTES(0xca9c46f4, 0xd3c5, 0x11d1, 0xb7, 0x5a, 0x00, 0x60, 0x08, 0x52, 0xb3, 0x12);
 // The 9328150x block is NOT in interface-declaration order: the SDK assigns
 // Viewport2 the lowest of the four. Getting it wrong makes QueryInterface
 // hand back the wrong interface for a valid IID, which is worse than failing.
@@ -128,6 +139,30 @@ ComObj *this_d3d(X86 *c) {
 ComObj *this_device(X86 *c) {
     ComObj *o = com_this_arg(c);
     return (o && o->kind == K_D3DDEVICE) ? o : nullptr;
+}
+// Returned interfaces follow the version of the calling device/factory.
+bool version3(X86 *c) {
+    ComIface f = com_iface_of(arg(c, 0));
+    return f == IF_D3D3 || f == IF_D3DDEVICE3;
+}
+ComIface viewport_iface(X86 *c) {
+    return version3(c) ? IF_D3DVIEWPORT3 : IF_D3DVIEWPORT2;
+}
+uint32_t vertex_type(X86 *c, uint32_t type) {
+    if (!version3(c))
+        return type;
+    // These SDK FVF constants describe the exact legacy 32-byte records.
+    // Other layouts must be decoded explicitly, never treated as TL vertices.
+    switch (type) {
+    case 0x112:
+        return D3DVT_VERTEX; // XYZ | NORMAL | TEX1
+    case 0x1e2:
+        return D3DVT_LVERTEX; // XYZ | RESERVED1 | DIFFUSE | SPECULAR | TEX1
+    case 0x1c4:
+        return D3DVT_TLVERTEX; // XYZRHW | DIFFUSE | SPECULAR | TEX1
+    default:
+        return 0;
+    }
 }
 ComObj *this_viewport(X86 *c) {
     ComObj *o = com_this_arg(c);
@@ -1020,7 +1055,7 @@ void Viewport_GetBackgroundDepth(X86 *c) {
 
 // Clear the requested viewport rectangles and record the operation in frame order.
 // Keep the guest surface and host render target consistent for subsequent readers.
-void Viewport_Clear(X86 *c) {
+void viewport_clear(X86 *c, bool explicit_values) {
     ComObj *v = this_viewport(c);
     uint32_t count = arg(c, 1), rects = arg(c, 2), flags = arg(c, 3);
     if (!v) {
@@ -1048,6 +1083,16 @@ void Viewport_Clear(X86 *c) {
         };
         color = (b8(rgba[3]) << 24) | (b8(rgba[0]) << 16) | (b8(rgba[1]) << 8) | b8(rgba[2]);
     }
+    float z = 1.0f;
+    if (explicit_values) {
+        if (flags & ~(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER)) {
+            com_ret(c, DDERR_UNSUPPORTED); // No stencil buffer is advertised.
+            return;
+        }
+        color = arg(c, 4);
+        uint32_t bits = arg(c, 5);
+        memcpy(&z, &bits, sizeof z);
+    }
     // Clear is part of the frame's draw list, in its own place in the order:
     // a frame replayed later has to clear where the guest cleared, before the
     // draws the guest made after it. The rectangles are copied, because the
@@ -1061,7 +1106,7 @@ void Viewport_Clear(X86 *c) {
         d->kind = HOST_DRAW_CLEAR;
         d->clear_flags = flags;
         d->clear_color = color;
-        d->clear_z = 1.0f;
+        d->clear_z = z;
         if (count) {
             int32_t *r = (int32_t *)ddraw_frame_alloc(count * 16u, 4);
             if (r) {
@@ -1115,9 +1160,16 @@ void Viewport_Clear(X86 *c) {
     } else {
         // No arena, so nothing was recorded: clear straight through, reading
         // the guest's rectangles while they are still the guest's.
-        host_d3d_clear(flags, count ? (const int32_t *)gm_ptr(rects) : nullptr, count, color, 1.0f);
+        host_d3d_clear(flags, count ? (const int32_t *)gm_ptr(rects) : nullptr, count, color, z);
     }
     com_ret(c, D3D_OK_);
+}
+
+void Viewport_Clear(X86 *c) {
+    viewport_clear(c, false);
+}
+void Viewport_Clear2(X86 *c) {
+    viewport_clear(c, true);
 }
 
 void Viewport_AddLight(X86 *c) {
@@ -1285,7 +1337,7 @@ void Device_GetStats(X86 *c) {
 void Device_AddViewport(X86 *c) {
     ComObj *dev = this_device(c);
     uint32_t a = arg(c, 1);
-    ComObj *v = a ? com_this(a, IF_D3DVIEWPORT2) : nullptr;
+    ComObj *v = a ? com_this(a, viewport_iface(c)) : nullptr;
     if (!dev || !v) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
@@ -1304,7 +1356,7 @@ void Device_AddViewport(X86 *c) {
 void Device_DeleteViewport(X86 *c) {
     ComObj *dev = this_device(c);
     uint32_t a = arg(c, 1);
-    ComObj *v = a ? com_this(a, IF_D3DVIEWPORT2) : nullptr;
+    ComObj *v = a ? com_this(a, viewport_iface(c)) : nullptr;
     if (!dev || !v) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
@@ -1344,7 +1396,7 @@ void Device_NextViewport(X86 *c) {
         }
         idx = dev->viewports.size() - 1;
     } else {
-        ComObj *v = cur ? com_this(cur, IF_D3DVIEWPORT2) : nullptr;
+        ComObj *v = cur ? com_this(cur, viewport_iface(c)) : nullptr;
         if (!v) {
             com_ret(c, DDERR_INVALIDPARAMS);
             return;
@@ -1365,7 +1417,7 @@ void Device_NextViewport(X86 *c) {
         return;
     }
     com_addref(v);
-    com_out_ptr(out, com_view(v, IF_D3DVIEWPORT2));
+    com_out_ptr(out, com_view(v, viewport_iface(c)));
     com_ret(c, D3D_OK_);
 }
 
@@ -1428,7 +1480,7 @@ void Device_EnumTextureFormats(X86 *c) {
         wr32(pf + DDPF_OFF_dwGBitMask, f.g);
         wr32(pf + DDPF_OFF_dwBBitMask, f.b);
         wr32(pf + DDPF_OFF_dwRGBAlphaBitMask, f.a);
-        if (guest_call(c, cb, d, ctx) != DDENUMRET_OK)
+        if (guest_call(c, cb, version3(c) ? pf : d, ctx) != DDENUMRET_OK)
             break;
     }
     com_ret(c, D3D_OK_);
@@ -1479,14 +1531,14 @@ void Device_GetDirect3D(X86 *c) {
         return;
     }
     com_addref(d3d);
-    com_out_ptr(out, com_view(d3d, IF_D3D2));
+    com_out_ptr(out, com_view(d3d, version3(c) ? IF_D3D3 : IF_D3D2));
     com_ret(c, D3D_OK_);
 }
 
 void Device_SetCurrentViewport(X86 *c) {
     ComObj *dev = this_device(c);
     uint32_t a = arg(c, 1);
-    ComObj *v = a ? com_this(a, IF_D3DVIEWPORT2) : nullptr;
+    ComObj *v = a ? com_this(a, viewport_iface(c)) : nullptr;
     if (!dev || !v) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
@@ -1518,7 +1570,7 @@ void Device_GetCurrentViewport(X86 *c) {
         return;
     }
     com_addref(v);
-    com_out_ptr(out, com_view(v, IF_D3DVIEWPORT2));
+    com_out_ptr(out, com_view(v, viewport_iface(c)));
     com_ret(c, D3D_OK_);
 }
 
@@ -1563,7 +1615,7 @@ void Device_GetRenderTarget(X86 *c) {
         return;
     }
     com_addref(s);
-    com_out_ptr(out, com_view(s, IF_DDSURFACE));
+    com_out_ptr(out, com_view(s, version3(c) ? IF_DDSURFACE4 : IF_DDSURFACE));
     com_ret(c, D3D_OK_);
 }
 
@@ -1605,7 +1657,7 @@ void Device_Begin(X86 *c) {
         return;
     }
     g_im_prim = arg(c, 1);
-    g_im_vtype = arg(c, 2);
+    g_im_vtype = vertex_type(c, arg(c, 2));
     g_im_stride = d3d_vertex_stride(g_im_vtype);
     if (!g_im_stride) {
         com_ret(c, DDERR_INVALIDPARAMS);
@@ -1625,7 +1677,7 @@ void Device_BeginIndexed(X86 *c) {
         return;
     }
     g_im_prim = arg(c, 1);
-    g_im_vtype = arg(c, 2);
+    g_im_vtype = vertex_type(c, arg(c, 2));
     g_im_stride = d3d_vertex_stride(g_im_vtype);
     uint32_t verts = arg(c, 3);
     uint32_t nverts = arg(c, 4);
@@ -1826,7 +1878,12 @@ void Device_DrawPrimitive(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    submit(c, dev, arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), 0, 0);
+    uint32_t type = vertex_type(c, arg(c, 2));
+    if (!d3d_vertex_stride(type)) {
+        com_ret(c, DDERR_UNSUPPORTED);
+        return;
+    }
+    submit(c, dev, arg(c, 1), type, arg(c, 3), arg(c, 4), 0, 0);
     com_ret(c, D3D_OK_);
 }
 
@@ -1836,7 +1893,12 @@ void Device_DrawIndexedPrimitive(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    submit(c, dev, arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), arg(c, 6));
+    uint32_t type = vertex_type(c, arg(c, 2));
+    if (!d3d_vertex_stride(type)) {
+        com_ret(c, DDERR_UNSUPPORTED);
+        return;
+    }
+    submit(c, dev, arg(c, 1), type, arg(c, 3), arg(c, 4), arg(c, 5), arg(c, 6));
     com_ret(c, D3D_OK_);
 }
 
@@ -1970,7 +2032,7 @@ void D3D_CreateMaterial(X86 *c) {
         return;
     }
     ComObj *m = com_new(K_MATERIAL);
-    uint32_t view = com_view(m, IF_D3DMATERIAL2);
+    uint32_t view = com_view(m, version3(c) ? IF_D3DMATERIAL3 : IF_D3DMATERIAL2);
     if (!view) {
         com_release(m);
         com_ret(c, E_OUTOFMEMORY);
@@ -1988,7 +2050,7 @@ void D3D_CreateViewport(X86 *c) {
         return;
     }
     ComObj *v = com_new(K_VIEWPORT);
-    uint32_t view = com_view(v, IF_D3DVIEWPORT2);
+    uint32_t view = com_view(v, viewport_iface(c));
     if (!view) {
         com_release(v);
         com_ret(c, E_OUTOFMEMORY);
@@ -2128,7 +2190,15 @@ void D3D_CreateDevice(X86 *c) {
     dev->render_state[D3DRENDERSTATE_SPECULARENABLE] = 1;
     dev->render_state[D3DRENDERSTATE_NORMALIZENORMALS] = 1;
 
-    uint32_t view = com_view(dev, IF_D3DDEVICE2);
+    // DX6's first texture stage defaults to modulated colour and texture alpha.
+    dev->texture_stage[1] = 4;                         // COLOROP = MODULATE
+    dev->texture_stage[2] = dev->texture_stage[5] = 2; // ARG1 = TEXTURE
+    dev->texture_stage[3] = dev->texture_stage[6] = 1; // ARG2 = CURRENT
+    dev->texture_stage[4] = 2;                         // ALPHAOP = SELECTARG1
+    dev->texture_stage[12] = dev->texture_stage[13] = dev->texture_stage[14] = 1;
+    dev->texture_stage[16] = dev->texture_stage[17] = 1; // point filtering
+    dev->texture_stage[18] = 1;                          // no mip filtering
+    uint32_t view = com_view(dev, version3(c) ? IF_D3DDEVICE3 : IF_D3DDEVICE2);
     if (!view) {
         com_release(dev);
         com_ret(c, E_OUTOFMEMORY);
@@ -2169,7 +2239,212 @@ const ComMethod g_d3d2[] = {
     {"CreateDevice", 4, D3D_CreateDevice},
 };
 
+// Device3 owns its bound texture. The draw recorder still uses the surface's
+// stable handle and revision lease, so texture writes and releases stay coherent.
+void Device3_SetTexture(X86 *c) {
+    ComObj *dev = this_device(c);
+    uint32_t stage = arg(c, 1), ptr = arg(c, 2);
+    ComObj *tex = ptr ? com_this(ptr, IF_D3DTEXTURE2) : nullptr;
+    if (!dev || stage || (ptr && (!tex || tex->kind != K_SURFACE))) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (tex) {
+        com_addref(tex);
+        if (!tex->texture_handle) {
+            tex->texture_handle = g_next_texture_handle++;
+            bind_handle(tex->texture_handle, tex->id);
+            d3d_upload_texture(tex);
+        }
+    }
+    if (ComObj *old = com_get(dev->bound_texture))
+        com_release(old);
+    dev->bound_texture = tex ? tex->id : 0;
+    dev->render_state[D3DRENDERSTATE_TEXTUREHANDLE] = tex ? tex->texture_handle : 0;
+    com_ret(c, D3D_OK_);
+}
+void Device3_GetTexture(X86 *c) {
+    ComObj *dev = this_device(c);
+    uint32_t out = arg(c, 2);
+    if (!dev || arg(c, 1) || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    ComObj *tex = com_get(dev->bound_texture);
+    if (tex)
+        com_addref(tex);
+    wr32(out, tex ? com_view(tex, IF_D3DTEXTURE2) : 0);
+    com_ret(c, D3D_OK_);
+}
+
+// Translate the single texture stage to the recorder's legacy blend modes.
+// Stage zero CURRENT means DIFFUSE. Unsupported combiners fail validation.
+bool stage_blend(ComObj *dev) {
+    const uint32_t *s = dev->texture_stage;
+    bool color_mod = s[1] == 4 && s[2] == 2 && s[3] <= 1;
+    bool alpha_mod = s[4] == 4 && s[5] == 2 && s[6] <= 1;
+    uint32_t blend = color_mod && alpha_mod                             ? 4
+                     : color_mod && s[4] == 2 && s[5] == 2              ? 2
+                     : s[1] == 2 && s[2] == 2 && s[4] == 2 && s[5] == 2 ? 1
+                                                                        : 0;
+    if (!blend)
+        return false;
+    dev->render_state[D3DRENDERSTATE_TEXTUREMAPBLEND] = blend;
+    return true;
+}
+void Device3_GetTextureStageState(X86 *c) {
+    ComObj *dev = this_device(c);
+    uint32_t type = arg(c, 2), out = arg(c, 3);
+    if (!dev || arg(c, 1) || !type || type >= 32 || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, dev->texture_stage[type]);
+    com_ret(c, D3D_OK_);
+}
+void Device3_SetTextureStageState(X86 *c) {
+    ComObj *dev = this_device(c);
+    uint32_t type = arg(c, 2), value = arg(c, 3);
+    if (!dev || arg(c, 1) || !type || type >= 32) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    switch (type) {
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+        dev->texture_stage[type] = value;
+        stage_blend(dev); // Calls can configure colour and alpha in either order.
+        break;
+    case 12:
+    case 13:
+    case 14: // ADDRESS, ADDRESSU, ADDRESSV
+        if (value < 1 || value > 4) {
+            com_ret(c, DDERR_UNSUPPORTED);
+            return;
+        }
+        dev->texture_stage[type] = value;
+        if (type == 12 || type == 13)
+            dev->render_state[D3DRENDERSTATE_TEXTUREADDRESSU] = value;
+        if (type == 12 || type == 14)
+            dev->render_state[D3DRENDERSTATE_TEXTUREADDRESSV] = value;
+        break;
+    case 16:
+    case 17: // MAGFILTER, MINFILTER
+        if (value != 1 && value != 2) {
+            com_ret(c, DDERR_UNSUPPORTED);
+            return;
+        }
+        dev->texture_stage[type] = value;
+        dev->render_state[type == 16 ? D3DRENDERSTATE_TEXTUREMAG : D3DRENDERSTATE_TEXTUREMIN] =
+            value;
+        break;
+    case 11: // TEXCOORDINDEX: the advertised single coordinate set.
+        if (value) {
+            com_ret(c, DDERR_UNSUPPORTED);
+            return;
+        }
+        dev->texture_stage[type] = value;
+        break;
+    default:
+        com_ret(c, DDERR_UNSUPPORTED);
+        return;
+    }
+    com_ret(c, D3D_OK_);
+}
+void Device3_ValidateDevice(X86 *c) {
+    ComObj *dev = this_device(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, 0);
+    if (!stage_blend(dev)) {
+        com_ret(c, DDERR_UNSUPPORTED);
+        return;
+    }
+    wr32(out, 1);
+    com_ret(c, D3D_OK_);
+}
+DX_STUB(Device3_DrawPrimitiveStrided, DDERR_UNSUPPORTED)
+DX_STUB(Device3_DrawIndexedPrimitiveStrided, DDERR_UNSUPPORTED)
+DX_STUB(Device3_DrawPrimitiveVB, DDERR_UNSUPPORTED)
+DX_STUB(Device3_DrawIndexedPrimitiveVB, DDERR_UNSUPPORTED)
+DX_STUB(Device3_ComputeSphereVisibility, DDERR_UNSUPPORTED)
+DX_STUB(D3D3_CreateVertexBuffer, DDERR_UNSUPPORTED)
+void D3D3_EnumZBufferFormats(X86 *c) {
+    uint32_t cb = arg(c, 2), ctx = arg(c, 3);
+    if (!this_d3d(c) || !cb) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    bool known = false;
+    for (const DevEntry &e : g_devices)
+        known |= guid_equals(arg(c, 1), e.guid);
+    if (!known) {
+        com_ret(c, DDERR_NOTFOUND);
+        return;
+    }
+    uint32_t pf = scratch(DDPF_SIZE);
+    if (!pf) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(pf, DDPF_SIZE);
+    wr32(pf + 4, DDPF_ZBUFFER);
+    wr32(pf + 12, 16);
+    wr32(pf + 20, 0xffff); // dwZBitMask, not the union's stencil-bit count.
+    guest_call(c, cb, pf, ctx);
+    com_ret(c, D3D_OK_);
+}
+void D3D3_EvictManagedTextures(X86 *c) {
+    // Host uploads are revision-owned and can be recreated from surface bytes.
+    uploaded_revisions().clear();
+    com_ret(c, this_d3d(c) ? D3D_OK_ : DDERR_INVALIDOBJECT);
+}
+const auto g_d3d3 = [] {
+    std::array<ComMethod, 12> m{};
+    std::copy(std::begin(g_d3d2), std::end(g_d3d2), m.begin());
+    m[8] = {"CreateDevice", 5, D3D_CreateDevice};
+    m[9] = {"CreateVertexBuffer", 5, D3D3_CreateVertexBuffer};
+    m[10] = {"EnumZBufferFormats", 4, D3D3_EnumZBufferFormats};
+    m[11] = {"EvictManagedTextures", 1, D3D3_EvictManagedTextures};
+    return m;
+}();
+const auto g_viewport3 = [] {
+    std::array<ComMethod, 21> m{};
+    std::copy(std::begin(g_viewport2), std::end(g_viewport2), m.begin());
+    m[18] = {"SetBackgroundDepth2", 2, Viewport_SetBackgroundDepth};
+    m[19] = {"GetBackgroundDepth2", 3, Viewport_GetBackgroundDepth};
+    m[20] = {"Clear2", 7, Viewport_Clear2};
+    return m;
+}();
+const auto g_device3 = [] {
+    std::array<ComMethod, 42> m{};
+    // Device3 removes Device2's slot 4 (SwapTextureHandles).
+    std::copy(g_device2, g_device2 + 4, m.begin());
+    std::copy(g_device2 + 5, std::end(g_device2), m.begin() + 4);
+    m[32] = {"DrawPrimitiveStrided", 6, Device3_DrawPrimitiveStrided};
+    m[33] = {"DrawIndexedPrimitiveStrided", 8, Device3_DrawIndexedPrimitiveStrided};
+    m[34] = {"DrawPrimitiveVB", 6, Device3_DrawPrimitiveVB};
+    m[35] = {"DrawIndexedPrimitiveVB", 6, Device3_DrawIndexedPrimitiveVB};
+    m[36] = {"ComputeSphereVisibility", 6, Device3_ComputeSphereVisibility};
+    m[37] = {"GetTexture", 3, Device3_GetTexture};
+    m[38] = {"SetTexture", 3, Device3_SetTexture};
+    m[39] = {"GetTextureStageState", 4, Device3_GetTextureStageState};
+    m[40] = {"SetTextureStageState", 4, Device3_SetTextureStageState};
+    m[41] = {"ValidateDevice", 2, Device3_ValidateDevice};
+    return m;
+}();
+
 void device_destroy(ComObj *dev) {
+    if (ComObj *t = com_get(dev->bound_texture))
+        com_release(t);
+    dev->bound_texture = 0;
     ddraw_note_device(0);
     for (uint32_t id : dev->viewports) {
         ComObj *v = com_get(id);
@@ -2397,7 +2672,22 @@ void d3d_register() {
     com_define(IF_D3DLIGHT, "DDRAW.dll", "IDirect3DLight", g_light, std::size(g_light));
     com_define(IF_D3DTEXTURE2, "DDRAW.dll", "IDirect3DTexture2", g_texture2, std::size(g_texture2));
 
-    // Both Direct3D interfaces live on the DirectDraw object.
+    com_define(IF_D3D3, "DDRAW.dll", "IDirect3D3", g_d3d3.data(), g_d3d3.size());
+    com_define(IF_D3DDEVICE3, "DDRAW.dll", "IDirect3DDevice3", g_device3.data(), g_device3.size());
+    com_define(IF_D3DVIEWPORT3, "DDRAW.dll", "IDirect3DViewport3", g_viewport3.data(),
+               g_viewport3.size());
+    com_define(IF_D3DMATERIAL3, "DDRAW.dll", "IDirect3DMaterial3", g_material2,
+               std::size(g_material2));
+    com_bind(IF_D3D3, K_DDRAW);
+    com_bind(IF_D3DDEVICE3, K_D3DDEVICE);
+    com_bind(IF_D3DVIEWPORT3, K_VIEWPORT);
+    com_bind(IF_D3DMATERIAL3, K_MATERIAL);
+    com_register_iid(IF_D3D3, IID_IDirect3D3_);
+    com_register_iid(IF_D3DDEVICE3, IID_IDirect3DDevice3_);
+    com_register_iid(IF_D3DVIEWPORT3, IID_IDirect3DViewport3_);
+    com_register_iid(IF_D3DMATERIAL3, IID_IDirect3DMaterial3_);
+
+    // All Direct3D factory interfaces live on the DirectDraw object.
     com_bind(IF_D3D, K_DDRAW);
     com_bind(IF_D3D2, K_DDRAW);
     com_bind(IF_D3DDEVICE2, K_D3DDEVICE);

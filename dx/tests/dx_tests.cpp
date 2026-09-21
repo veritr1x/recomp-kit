@@ -18,6 +18,7 @@
 #include "../../runtime/display_seam.h"
 #include "../riff.h"
 #include "../video_frame.h"
+#include "../mf_media.h"
 #include "../ddraw.h"
 #include "../../runtime/memory.h"
 #include "../../runtime/win32.h"
@@ -5816,6 +5817,131 @@ static void test_configurable_display_modes() {
     ddraw_reset_modes();
 }
 
+// DX6 ABI path: real vtable slots and stdcall cleanup, independent of a game.
+// Literal IIDs/slot numbers keep this from mirroring the adapter's declarations.
+static void test_d3d3_pipeline() {
+    cpu_reset();
+    g_draws.clear();
+    uint32_t target = make_render_target_for_test(640, 480, 16);
+    uint32_t dd = rec_dd(), iid = sc(0x40), out = sc(0x60);
+    const uint8_t iid3[16] = {0x40, 0x32, 0x22, 0xbb, 0x2b, 0xe7, 0xd0, 0x11,
+                              0xa9, 0xb4, 0,    0xaa, 0,    0xc0, 0x99, 0x3e};
+    memcpy(gm_ptr(iid), iid3, 16);
+    CHECK_EQ(call_method(dd, 0, {iid, out}), S_OK);
+    uint32_t d3d = rd32(out);
+    CHECK_EQ(com_iface_of(d3d), IF_D3D3);
+    const uint8_t hal[16] = {0xe0, 0x3d, 0xe6, 0x84, 0xaa, 0x46, 0xcf, 0x11,
+                             0x81, 0x6f, 0,    0,    0xc0, 0x20, 0x15, 0x6e};
+    memcpy(gm_ptr(iid), hal, 16);
+    CHECK_EQ(call_method(d3d, 8, {iid, target, out, 0}), D3D_OK_);
+    uint32_t dev = rd32(out);
+    CHECK_EQ(com_iface_of(dev), IF_D3DDEVICE3);
+    CHECK_EQ(call_method(dev, 11, {out}), D3D_OK_);
+    CHECK_EQ(rd32(out), d3d);
+    call_method(rd32(out), 2, {});
+    CHECK_EQ(call_method(dev, 15, {out}), D3D_OK_);
+    CHECK_EQ(com_iface_of(rd32(out)), IF_DDSURFACE4);
+    call_method(rd32(out), 2, {});
+
+    CHECK_EQ(call_method(d3d, 6, {out, 0}), D3D_OK_);
+    uint32_t vp = rd32(out);
+    CHECK_EQ(com_iface_of(vp), IF_D3DVIEWPORT3);
+    CHECK_EQ(call_method(dev, 5, {vp}), D3D_OK_);
+    uint32_t vpd = sc(0x100);
+    gm_zero(vpd, 44);
+    wr32(vpd, 44);
+    wr32(vpd + 12, 640);
+    wr32(vpd + 16, 480);
+    wrf32(vpd + 40, 1.0f);
+    CHECK_EQ(call_method(vp, 17, {vpd}), D3D_OK_);
+    CHECK_EQ(call_method(dev, 12, {vp}), D3D_OK_);
+    CHECK_EQ(call_method(dev, 13, {out}), D3D_OK_);
+    CHECK_EQ(rd32(out), vp);
+    call_method(vp, 2, {});
+
+    static uint32_t formats = imports_alloc_trampoline(
+        "TEST", "DX6PixelFormat",
+        [](X86 *c) {
+            uint32_t pf = arg(c, 0), count = arg(c, 1);
+            CHECK_EQ(rd32(pf), 32u); // DDPIXELFORMAT, not a DDSURFACEDESC.
+            CHECK((rd32(pf + 4) & (DDPF_RGB | DDPF_ZBUFFER)) != 0);
+            wr32(count, rd32(count) + 1);
+            set_eax(c, DDENUMRET_OK);
+        },
+        2);
+    wr32(out, 0);
+    CHECK_EQ(call_method(dev, 8, {formats, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 6u);
+    wr32(out, 0);
+    CHECK_EQ(call_method(d3d, 10, {iid, formats, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 1u);
+
+    uint32_t surface = rec_make_surface(4, 4, 16, DDSCAPS_TEXTURE);
+    ComObj *tex = com_this(surface);
+    uint32_t texid = tex->id, texture = com_view(tex, IF_D3DTEXTURE2);
+    CHECK_EQ(call_method(dev, 38, {0, texture}), D3D_OK_);
+    CHECK_EQ(tex->refs, 2);
+    CHECK_EQ(call_method(dev, 38, {0, texture}), D3D_OK_);
+    CHECK_EQ(tex->refs, 2); // self-bind does not release the resource first.
+    CHECK_EQ(call_method(dev, 37, {0, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), texture);
+    call_method(texture, 2, {});
+    CHECK_EQ(tex->refs, 2);
+    CHECK_EQ(call_method(dev, 40, {0, 4, 4}), D3D_OK_);  // alpha modulation
+    CHECK_EQ(call_method(dev, 40, {0, 12, 3}), D3D_OK_); // clamp both axes
+    CHECK_EQ(call_method(dev, 40, {0, 16, 2}), D3D_OK_); // linear magnification
+    CHECK_EQ(call_method(dev, 39, {0, 16, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 2u);
+    CHECK_EQ(call_method(dev, 41, {out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 1u);
+    ComObj *device = com_this(dev);
+    CHECK_EQ(device->render_state[21], 4u);
+    CHECK_EQ(device->render_state[44], 3u);
+    CHECK_EQ(device->render_state[45], 3u);
+    CHECK_EQ(device->render_state[27], 0u); // NORMALIZENORMALS is 143, not alpha blend.
+    CHECK_EQ(device->render_state[143], 1u);
+    CHECK_EQ(device->render_state[3], 1u); // TEXTUREADDRESS is 3, not COLORKEYENABLE.
+    CHECK_EQ(device->render_state[41], 0u);
+    CHECK_EQ(call_method(dev, 38, {1, texture}), DDERR_INVALIDPARAMS);
+
+    uint32_t verts = sc(0x1800);
+    gm_zero(verts, 3 * 32);
+    for (uint32_t i = 0; i < 3; ++i) {
+        wrf32(verts + i * 32, float(i * 20));
+        wrf32(verts + i * 32 + 4, float(i == 1 ? 50 : 10));
+        wrf32(verts + i * 32 + 12, 1.0f);
+        wr32(verts + i * 32 + 16, 0xffffffff);
+    }
+    CHECK_EQ(call_method(dev, 9, {}), D3D_OK_);
+    CHECK_EQ(call_method(dev, 28, {4, 0x1c4, verts, 3, 0}), D3D_OK_);
+    CHECK_EQ(g_draws.size(), 1u);
+    if (!g_draws.empty()) {
+        CHECK_EQ(g_draws.back().vertex_type, D3DVT_TLVERTEX);
+        CHECK_EQ(g_draws.back().texture_handle, tex->texture_handle);
+        CHECK_EQ(g_draws.back().vertices.size(), 96u);
+    }
+    CHECK_EQ(call_method(dev, 28, {4, 0xdead, verts, 3, 0}), DDERR_UNSUPPORTED);
+    CHECK_EQ(g_draws.size(), 1u);
+    HostFrameHandle frame = host_frame_current();
+    uint32_t before = host_frame_draw_count(frame);
+    CHECK_EQ(call_method(vp, 20, {0, 0, 3, 0xff123456, 0x3f000000, 0}), D3D_OK_);
+    const HostD3DDrawSnapshot *clear = host_frame_draw(frame, before);
+    CHECK(clear != nullptr);
+    if (clear) {
+        CHECK_EQ(clear->clear_color, 0xff123456u);
+        CHECK(clear->clear_z == 0.5f);
+    }
+    CHECK_EQ(call_method(dev, 10, {}), D3D_OK_);
+    call_method(surface, 2, {}); // device keeps the texture alive
+    CHECK(com_get(texid) != nullptr);
+    CHECK_EQ(call_method(dev, 38, {0, 0}), D3D_OK_);
+    CHECK(com_get(texid) == nullptr);
+    call_method(dev, 2, {});
+    call_method(vp, 2, {});
+    call_method(target, 2, {});
+    call_method(d3d, 2, {});
+}
+
 // The Direct3D path the game takes: QueryInterface for IDirect3D2, FindDevice
 // for the HAL device, CreateDevice on a 3D back buffer, a viewport, then a
 // scene with a textured indexed draw.
@@ -7506,6 +7632,10 @@ static void test_vtable_integrity() {
         {IF_DDCLIPPER, 9, "IDirectDrawClipper"},
         {IF_D3D, 9, "IDirect3D"},
         {IF_D3D2, 9, "IDirect3D2"},
+        {IF_D3D3, 12, "IDirect3D3"},
+        {IF_D3DDEVICE3, 42, "IDirect3DDevice3"},
+        {IF_D3DVIEWPORT3, 21, "IDirect3DViewport3"},
+        {IF_D3DMATERIAL3, 6, "IDirect3DMaterial3"},
         {IF_D3DDEVICE2, 33, "IDirect3DDevice2"},
         {IF_D3DVIEWPORT2, 18, "IDirect3DViewport2"},
         {IF_D3DMATERIAL2, 6, "IDirect3DMaterial2"},
@@ -12047,6 +12177,361 @@ static void test_media_foundation_session() {
     CHECK_EQ(rd32(sc(0x80)), 0u);
 }
 
+// Driver output pointers, master gain, named MP3, and WAVEHDR completion are
+// observable API contracts: success without these leaves real games silent.
+static void test_legacy_audio() {
+    cpu_reset();
+    g_plays.clear();
+    g_sample_tracking = true;
+    auto ail = [](const char *n, std::initializer_list<uint32_t> a) {
+        return call_shim(tramp("mss32.dll", n), a);
+    };
+    uint32_t wav = build_test_wave(), fmt = wav + 20;
+    CHECK_EQ(ail("_AIL_waveOutOpen@16", {sc(0), 0, UINT32_MAX, fmt}), 0u);
+    uint32_t driver = rd32(sc(0));
+    CHECK(driver != 0);
+    CHECK_EQ(ail("_AIL_set_preference@8", {15, 7}), 0u);
+    CHECK_EQ(ail("_AIL_get_preference@4", {15}), 7u);
+    ail("_AIL_set_preference@8", {15, 0});
+    ail("_AIL_digital_configuration@16", {driver, sc(4), sc(8), sc(0x300)});
+    CHECK_EQ(rd32(sc(4)), 22050u);
+    CHECK(std::string(gm_str(sc(0x300))).find("Native") != std::string::npos);
+    uint32_t sample = ail("_AIL_allocate_sample_handle@4", {driver});
+    ail("_AIL_set_sample_file@12", {sample, wav, 0});
+    ail("_AIL_set_digital_master_volume@8", {driver, 64});
+    ail("_AIL_start_sample@4", {sample});
+    CHECK(!g_plays.empty());
+    if (!g_plays.empty())
+        CHECK_EQ(g_plays.back().volume, -595);
+    uint32_t mp3 = heap_alloc(sizeof kToneMp3);
+    memcpy(g_mem + mp3, kToneMp3, sizeof kToneMp3);
+    gm_put_str(sc(0x300), "mp3", 8);
+    CHECK_EQ(ail("_AIL_set_named_sample_file@20", {sample, sc(0x300), mp3, sizeof kToneMp3, 0}),
+             1u);
+    ail("_AIL_start_sample@4", {sample});
+    CHECK_EQ(g_plays.back().bits, 16);
+    CHECK(g_plays.back().bytes > 1000);
+    ail("_AIL_waveOutClose@4", {driver});
+    CHECK_EQ(ail("_AIL_sample_status@4", {sample}), 1u);
+    heap_free(mp3);
+    auto wave = [](const char *n, std::initializer_list<uint32_t> a) {
+        return call_shim(tramp("_INMM.dll", n), a);
+    };
+    g_queue_enabled = true;
+    g_test_audio_pos = 0;
+    g_stream_base = g_stream_played = 0;
+    g_plays.clear();
+    CHECK_EQ(wave("waveOutOpen", {sc(0), UINT32_MAX, fmt, 0, 0, 0}), 0u);
+    uint32_t h = rd32(sc(0));
+    CHECK(h != 0);
+    uint32_t hdr = sc(0x400);
+    gm_zero(hdr, 32);
+    wr32(hdr, wav + 44);
+    wr32(hdr + 4, 8);
+    CHECK_EQ(wave("waveOutPrepareHeader", {h, hdr, 32}), 0u);
+    CHECK_EQ(rd32(hdr + 16), 2u);
+    wave("waveOutPause", {h});
+    CHECK_EQ(wave("waveOutWrite", {h, hdr, 32}), 0u);
+    CHECK(g_plays.empty());
+    CHECK_EQ(rd32(hdr + 16), 18u);
+    CHECK_EQ(wave("waveOutUnprepareHeader", {h, hdr, 32}), 33u);
+    wave("waveOutRestart", {h});
+    CHECK_EQ(g_plays.size(), 1u);
+    if (!g_plays.empty())
+        CHECK_EQ(g_plays.back().bytes, 8u);
+    g_stream_played = 7;
+    waveout_frame_pump(&g_cpu);
+    CHECK_EQ(rd32(hdr + 16), 18u);
+    g_stream_played = 8;
+    waveout_frame_pump(&g_cpu);
+    CHECK_EQ(rd32(hdr + 16), 3u);
+    CHECK_EQ(wave("waveOutUnprepareHeader", {h, hdr, 32}), 0u);
+    CHECK_EQ(wave("waveOutClose", {h}), 0u);
+#ifdef RECOMP_HAVE_FFMPEG
+    // A generated mono IMA block decodes into nine 16-bit samples. Header
+    // completion follows those 18 PCM bytes, not the eight compressed bytes.
+    uint32_t adpcm_fmt = sc(0x500), block = sc(0x520);
+    gm_zero(adpcm_fmt, 20);
+    wr16(adpcm_fmt, 0x11);
+    wr16(adpcm_fmt + 2, 1);
+    wr32(adpcm_fmt + 4, 22050);
+    wr32(adpcm_fmt + 8, 19600);
+    wr16(adpcm_fmt + 12, 8);
+    wr16(adpcm_fmt + 14, 4);
+    wr16(adpcm_fmt + 16, 2);
+    wr16(adpcm_fmt + 18, 9);
+    wr32(block, 1000); // Predictor 1000, step index/reserved zero.
+    wr32(block + 4, 0x11111111);
+    CHECK_EQ(wave("waveOutOpen", {sc(0), UINT32_MAX, adpcm_fmt, 0, 0, 0}), 0u);
+    h = rd32(sc(0));
+    gm_zero(hdr, 32);
+    wr32(hdr, block);
+    wr32(hdr + 4, 8);
+    g_plays.clear();
+    g_stream_played = 0;
+    CHECK_EQ(wave("waveOutPrepareHeader", {h, hdr, 32}), 0u);
+    CHECK_EQ(wave("waveOutWrite", {h, hdr, 32}), 0u);
+    CHECK_EQ(g_plays.size(), 1u);
+    if (!g_plays.empty()) {
+        const auto &decoded = g_plays.back();
+        CHECK_EQ(decoded.bits, 16);
+        CHECK_EQ(decoded.bytes, 18u);
+        if (decoded.pcm.size() == 18) {
+            CHECK_EQ(uint16_t(decoded.pcm[0] | (decoded.pcm[1] << 8)), 1000u);
+            CHECK(uint16_t(decoded.pcm[16] | (decoded.pcm[17] << 8)) > 1000);
+        }
+    }
+    g_stream_played = 8;
+    waveout_frame_pump(&g_cpu);
+    CHECK_EQ(rd32(hdr + 16), 18u);
+    g_stream_played = 18;
+    waveout_frame_pump(&g_cpu);
+    CHECK_EQ(rd32(hdr + 16), 3u);
+    CHECK_EQ(wave("waveOutUnprepareHeader", {h, hdr, 32}), 0u);
+    CHECK_EQ(wave("waveOutClose", {h}), 0u);
+#endif
+    // ExitProcess can leave wave handles open. Host teardown must reclaim
+    // them while audio is alive, and a repeated shutdown must be harmless.
+    CHECK_EQ(wave("waveOutOpen", {sc(0), UINT32_MAX, fmt, 0, 0, 0}), 0u);
+    h = rd32(sc(0));
+    gm_zero(hdr, 32);
+    wr32(hdr, wav + 44);
+    wr32(hdr + 4, 8);
+    CHECK_EQ(wave("waveOutPrepareHeader", {h, hdr, 32}), 0u);
+    CHECK_EQ(wave("waveOutWrite", {h, hdr, 32}), 0u);
+    size_t stops = g_stops.size();
+    waveout_shutdown();
+    CHECK_EQ(g_stops.size(), stops + 1);
+    CHECK_EQ(wave("waveOutClose", {h}), 5u);
+    waveout_shutdown();
+    CHECK_EQ(g_stops.size(), stops + 1);
+    g_queue_enabled = false;
+    g_sample_tracking = false;
+}
+
+// Small generated RIFF fixture: stream metadata, keyframe search, sample/byte
+// units, buffer negotiation and shared file lifetime need no private assets.
+static void test_avi_reader() {
+    cpu_reset();
+    auto put = [](std::vector<uint8_t> &v, uint32_t n) {
+        for (int i = 0; i < 4; ++i)
+            v.push_back(uint8_t(n >> (i * 8)));
+    };
+    auto chunk = [&](const char *tag, const std::vector<uint8_t> &data) {
+        std::vector<uint8_t> v(tag, tag + 4);
+        put(v, uint32_t(data.size()));
+        v.insert(v.end(), data.begin(), data.end());
+        if (data.size() & 1)
+            v.push_back(0);
+        return v;
+    };
+    auto append = [](std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+        a.insert(a.end(), b.begin(), b.end());
+    };
+    auto set = [](std::vector<uint8_t> &v, size_t pos, uint32_t n) {
+        for (int i = 0; i < 4; ++i)
+            v[pos + i] = uint8_t(n >> (i * 8));
+    };
+    std::vector<uint8_t> sh(64), fmt(40);
+    set(sh, 0, 0x73646976);
+    set(sh, 4, 0x30355649);
+    set(sh, 20, 1);
+    set(sh, 24, 30);
+    set(sh, 32, 3);
+    set(sh, 36, 3);
+    set(fmt, 0, 40);
+    set(fmt, 4, 2);
+    set(fmt, 8, 2);
+    set(fmt, 12, 0x180001);
+    set(fmt, 16, 0x30355649);
+    std::vector<uint8_t> strl = {'s', 't', 'r', 'l'};
+    append(strl, chunk("strh", sh));
+    append(strl, chunk("strf", fmt));
+    std::vector<uint8_t> hdrl = {'h', 'd', 'r', 'l'};
+    append(hdrl, chunk("LIST", strl));
+    std::vector<uint8_t> movi = {'m', 'o', 'v', 'i'};
+    append(movi, chunk("00dc", {1, 2, 3}));
+    append(movi, chunk("00dc", {4, 5}));
+    append(movi, chunk("00dc", {6}));
+    std::vector<uint8_t> index;
+    for (unsigned i = 0; i < 3; ++i) {
+        put(index, 0x63643030);
+        put(index, i == 1 ? 0 : 16);
+        put(index, 0);
+        put(index, 3 - i);
+    }
+    std::vector<uint8_t> body = {'A', 'V', 'I', ' '};
+    append(body, chunk("LIST", hdrl));
+    append(body, chunk("LIST", movi));
+    append(body, chunk("idx1", index));
+    auto data = chunk("RIFF", body);
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/recomp-avi-XXXXXX", os_temp_dir());
+    CHECK(os_mkdtemp(dir) == 0);
+    std::string path = std::string(dir) + "/fixture.avi";
+    FILE *f = fopen(path.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (!f)
+        return;
+    fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+    win32_init(dir);
+    gm_put_str(sc(0x100), "fixture.avi", 64);
+    auto avi = [](const char *n, std::initializer_list<uint32_t> a) {
+        return call_shim(tramp("AVIFIL32.dll", n), a);
+    };
+    CHECK_EQ(avi("AVIFileOpenA", {sc(0), sc(0x100), 0x20, 0}), 0u);
+    uint32_t file = rd32(sc(0));
+    CHECK(file != 0);
+    CHECK_EQ(avi("AVIFileGetStream", {file, sc(4), 0x73646976, 0}), 0u);
+    uint32_t stream = rd32(sc(4));
+    CHECK(stream != 0);
+    CHECK_EQ(avi("AVIStreamInfoA", {stream, sc(0x200), 140}), 0u);
+    CHECK_EQ(rd32(sc(0x214)), 1u);
+    CHECK_EQ(rd32(sc(0x218)), 30u);
+    CHECK_EQ(rd32(sc(0x220)), 3u);
+    CHECK_EQ(avi("AVIStreamReadFormat", {stream, 0, 0, sc(8)}), 0u);
+    CHECK_EQ(rd32(sc(8)), 40u);
+    wr32(sc(8), 1);
+    CHECK(avi("AVIStreamReadFormat", {stream, 0, sc(0x300), sc(8)}) != 0);
+    CHECK_EQ(rd32(sc(8)), 40u);
+    CHECK_EQ(avi("AVIStreamSampleToTime", {stream, 30}), 1000u);
+    CHECK_EQ(avi("AVIStreamTimeToSample", {stream, 1000}), 30u);
+    CHECK_EQ(avi("AVIStreamTimeToSample", {stream, uint32_t(-1000)}), uint32_t(-30));
+    CHECK_EQ(avi("AVIStreamFindSample", {stream, 1, 0x14}), 0u);
+    CHECK_EQ(avi("AVIStreamFindSample", {stream, 1, 0x11}), 2u);
+    avi("AVIFileRelease", {file}); // the stream still owns the bytes
+    CHECK_EQ(avi("AVIStreamRead", {stream, 0, 1, 0, 0, sc(8), sc(12)}), 0u);
+    CHECK_EQ(rd32(sc(8)), 3u);
+    CHECK_EQ(rd32(sc(12)), 1u);
+    wr32(sc(0x300), 0xdeadbeef);
+    CHECK(avi("AVIStreamRead", {stream, 0, 1, sc(0x300), 2, sc(8), sc(12)}) != 0);
+    CHECK_EQ(rd32(sc(0x300)), 0xdeadbeefu);
+    CHECK_EQ(avi("AVIStreamRead", {stream, 0, 2, sc(0x300), 5, sc(8), sc(12)}), 0u);
+    CHECK_EQ(rd32(sc(8)), 5u);
+    CHECK_EQ(rd32(sc(12)), 2u);
+    CHECK_EQ(rd8(sc(0x304)), 5u);
+    CHECK_EQ(avi("AVIStreamRead", {stream, 3, 1, sc(0x300), 5, sc(8), sc(12)}), 0u);
+    CHECK_EQ(rd32(sc(8)), 0u);
+    avi("AVIStreamRelease", {stream});
+    CHECK(avi("AVIStreamRead", {stream, 0, 1, 0, 0, 0, 0}) != 0);
+    CHECK_EQ(imports_argc(tramp("MSVFW32.dll", "ICDecompress")), ARGC_CDECL);
+    os_unlink(path.c_str());
+    os_rmdir(dir);
+}
+
+// Optional private-asset probe: exercise the same AVI/codec imports as the
+// guest, without redistributing a movie or using a host media player.
+static void test_avi_asset(const char *path) {
+    cpu_reset();
+    std::string full = path;
+    size_t slash = full.find_last_of("/\\");
+    CHECK(slash != std::string::npos);
+    if (slash == std::string::npos)
+        return;
+    win32_init(full.substr(0, slash));
+    gm_put_str(sc(0x100), full.substr(slash + 1).c_str(), 1024);
+    auto avi = [](const char *name, std::initializer_list<uint32_t> args) {
+        return call_shim(tramp("AVIFIL32.dll", name), args);
+    };
+    auto ic = [](const char *name, std::initializer_list<uint32_t> args) {
+        return call_shim(tramp("MSVFW32.dll", name), args);
+    };
+    CHECK_EQ(avi("AVIFileOpenA", {sc(0), sc(0x100), 0x20, 0}), 0u);
+    uint32_t file = rd32(sc(0));
+    if (!file)
+        return;
+    CHECK_EQ(avi("AVIFileGetStream", {file, sc(4), 0x73646976, 0}), 0u);
+    uint32_t video = rd32(sc(4));
+    CHECK_EQ(avi("AVIStreamInfoA", {video, sc(0x600), 140}), 0u);
+    wr32(sc(8), 256);
+    CHECK_EQ(avi("AVIStreamReadFormat", {video, 0, sc(0x800), sc(8)}), 0u);
+    uint32_t codec = ic("ICLocate", {0x63646976, rd32(sc(0x804 + 12)), sc(0x800), 0, 2});
+    CHECK(codec != 0);
+    if (!codec)
+        return;
+    memcpy(g_mem + sc(0x900), g_mem + sc(0x800), 40);
+    wr16(sc(0x90e), 16);
+    wr32(sc(0x910), 0);
+    uint32_t bytes = rd32(sc(0x804)) * rd32(sc(0x808)) * 2;
+    uint32_t output = heap_alloc(bytes), input = heap_alloc(2 * 1024 * 1024);
+    bool nonblack = false;
+    uint32_t prev = 0;
+    unsigned changes = 0;
+    unsigned repeats = 0;
+    uint32_t limit = 150;
+    if (const char *frames = getenv("RECOMP_TEST_AVI_FRAMES"))
+        limit = uint32_t(strtoul(frames, nullptr, 10));
+    if (!limit)
+        limit = rd32(sc(0x620));
+    CHECK_EQ(ic("ICSendMessage", {codec, 0x400c, sc(0x800), sc(0x900)}), 0u);
+    for (uint32_t frame = 0; frame < std::min(limit, rd32(sc(0x620))); ++frame) {
+        CHECK_EQ(avi("AVIStreamRead", {video, frame, 1, input, 2 * 1024 * 1024, sc(12), sc(16)}),
+                 0u);
+        uint32_t result = ic("ICDecompress", {codec, 0, sc(0x800), input, sc(0x900), output});
+        if (result) {
+            printf("AVI decode frame %u returned %08x, format %ux%u\n", frame, result,
+                   rd32(sc(0x804)), rd32(sc(0x808)));
+            CHECK_EQ(result, 0u);
+            break;
+        }
+        uint32_t hash = 2166136261u;
+        for (uint32_t i = 0; i < bytes; ++i) {
+            hash = (hash ^ rd8(output + i)) * 16777619u;
+            nonblack |= rd8(output + i) != 0;
+        }
+        changes += frame && hash != prev;
+        if (frame && !rd32(sc(12))) {
+            CHECK_EQ(hash, prev);
+            ++repeats;
+        }
+        prev = hash;
+    }
+    CHECK(nonblack);
+    CHECK(changes > 10);
+    printf("AVI decoded changing image: %u changes, %u empty-frame repeats, nonblack=%d\n", changes,
+           repeats, nonblack);
+    ic("ICClose", {codec});
+    avi("AVIStreamRelease", {video});
+    avi("AVIFileRelease", {file});
+    heap_free(input);
+    heap_free(output);
+}
+
+// Optional audio probe uses the same decoder as file-backed CD music. A
+// generated Ogg tone works in CI; private tracks can be checked locally.
+static void test_audio_asset(const char *path) {
+    mf::Media media;
+    std::string why;
+    bool opened = media.open(path, &why);
+    CHECK(opened);
+    if (!opened) {
+        printf("Audio open failed: %s\n", why.c_str());
+        return;
+    }
+    CHECK(media.has_audio());
+    CHECK(media.audio_rate() > 0);
+    CHECK(media.audio_channels() > 0);
+    CHECK(media.duration() > 0);
+    if (!media.has_audio() || media.audio_rate() <= 0 || media.audio_channels() <= 0)
+        return;
+    size_t samples = 0;
+    int peak = 0;
+    for (int block = 0; block < 4; ++block) {
+        media.fill_audio(size_t(media.audio_rate()) * media.audio_channels());
+        auto pcm = media.take_audio();
+        samples += pcm.size();
+        for (int16_t sample : pcm)
+            peak = std::max(peak, std::abs(int(sample)));
+        if (media.finished())
+            break;
+    }
+    CHECK(samples > 0);
+    CHECK(peak > 0);
+    printf("Audio decoded: %zu samples, %d Hz, %d channels, peak=%d\n", samples, media.audio_rate(),
+           media.audio_channels(), peak);
+}
+
 int main() {
     // Unbuffered, not line buffered: Windows treats _IOLBF as full buffering
     // and a fail-fast abort drops everything queued, including the name of
@@ -12061,6 +12546,15 @@ int main() {
     if (!g_scratch) {
         fprintf(stderr, "cannot allocate scratch\n");
         return 1;
+    }
+
+    if (const char *path = getenv("RECOMP_TEST_AVI")) {
+        test_avi_asset(path);
+        return g_failures ? 1 : 0;
+    }
+    if (const char *path = getenv("RECOMP_TEST_AUDIO")) {
+        test_audio_asset(path);
+        return g_failures ? 1 : 0;
     }
 
     struct {
@@ -12145,6 +12639,7 @@ int main() {
         {"configurable modes", test_configurable_display_modes},
         {"Classic probe surfaces", test_classic_probe_surface_creation},
         {"Direct3D pipeline", test_d3d_pipeline},
+        {"Direct3D3 pipeline", test_d3d3_pipeline},
         {"DirectSound", test_dsound},
         {"DirectInput", test_dinput},
         {"QMixer", test_qmixer},
@@ -12154,6 +12649,8 @@ int main() {
         {"Miles arities", test_mss32_arities},
         {"RIFF WAVE", test_riff_parse},
         {"Miles samples", test_mss32_sample},
+        {"Legacy audio", test_legacy_audio},
+        {"AVI reader", test_avi_reader},
         {"Miles streams", test_mss32_stream},
         {"Bink/Smacker stubs", test_bink_smack_stubs},
         {"Bink entry points resolve", test_bink_entry_points_resolve},

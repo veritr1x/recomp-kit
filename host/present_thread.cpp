@@ -33,6 +33,18 @@
 #include <thread>
 #include "../platform/os.h"
 
+// Packed into one atomic so a producer never combines dimensions from two
+// renderer restarts. Already sealed frames retain their own target and layout.
+static std::atomic<uint64_t> render_resolution{0};
+extern "C" void host_set_render_resolution(int w, int h) {
+    const uint64_t size = w > 0 && h > 0 && w <= 16384 && h <= 16384
+                              ? (uint64_t(uint32_t(w)) << 32) | uint32_t(h)
+                              : 0;
+    render_resolution.store(size);
+    fprintf(stderr, "presenter: render resolution %dx%d (%s)\n", int(size >> 32),
+            int(uint32_t(size)), size ? "logical canvas retained" : "automatic");
+}
+
 // Minimal hosts can link the service without the app's present.mm. Unknown
 // mode keeps first-write acquisition on the service's last guest dimensions.
 // App and smoke hosts override this with their current display mode.
@@ -515,8 +527,10 @@ struct Service : std::enable_shared_from_this<Service> {
         c->format = format;
         return c;
     }
-    // Acquire a writable scene target under the queue mutex using the selected guest mode
-    // and requested render size. Pool exhaustion drops this frame until seal instead of retrying each draw.
+    // Apply backpressure before the first write. Dropping an unrendered frame
+    // loses persistent surface updates (dirty HUD rectangles, cursor erasure),
+    // even if later whole-scene frames can still be displayed. Completed frames
+    // may be discarded by the mailbox after their surface contents are retained.
     HostSceneTarget acquire(int gw, int gh, int rw, int rh) {
         std::unique_lock lock(mutex);
         if (stop || gw <= 0 || gh <= 0)
@@ -526,6 +540,11 @@ struct Service : std::enable_shared_from_this<Service> {
         guest_w = gw;
         guest_h = gh;
         const HostGameRect rect = game_rect();
+        const uint64_t resolution = render_resolution.load();
+        if (rw <= 0 && rh <= 0 && resolution) {
+            rw = int(resolution >> 32);
+            rh = int(uint32_t(resolution));
+        }
         if (rw <= 0)
             rw = rect.w;
         if (rh <= 0)
@@ -543,11 +562,23 @@ struct Service : std::enable_shared_from_this<Service> {
         };
         int slot = free_slot();
         if (slot < 0) {
+            ++waits;
+            wake.notify_one();
+            // Keep a stalled GPU/worker from trapping the guest forever. This
+            // is a fault deadline, not the normal frame pacing mechanism.
+            completed.wait_for(lock, std::chrono::milliseconds(250), [&] {
+                slot = free_slot();
+                return stop || slot >= 0;
+            });
+            if (stop)
+                return {};
+        }
+        if (slot < 0) {
             // Latch the drop until seal: later draws/CPU staging in this same
             // guest frame must neither retry acquisition nor count it twice.
             ++drops;
-            fault(1, "target pool exhausted; guest frame dropped, check worker/GPU/presentation "
-                     "progress");
+            fault(1, "target pool stalled for 250ms; guest frame dropped, check "
+                     "worker/GPU/presentation progress");
             writing = std::make_shared<Frame>();
             writing->dropped = true;
             return {};

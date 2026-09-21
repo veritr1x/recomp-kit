@@ -89,6 +89,23 @@ def table(entries):
     return {TABLE + 4 * k: v for k, v in entries.items()}
 
 
+def test_pre_scaled_byte_offsets_use_unaligned_dword_table():
+    base = TABLE + 2
+    targets, tr = decode([(0, "MOV EAX,dword ptr [ECX + 0x40]"),
+                          (3, "JMP dword ptr [EAX + 0x%x]" % base),
+                          (0x10, "RET"), (0x20, "RET")],
+                         {base: FN + 0x10, base + 4: FN + 0x20, base + 8: 0})
+    assert targets == [FN + 0x10, FN + 0x20]
+    assert (base, base + 8) in tr.table_ranges
+
+
+def test_unscaled_static_field_is_not_assumed_to_be_a_table():
+    targets, tr = decode([(0, "JMP dword ptr [EAX + 0x%x]" % TABLE), (0x10, "RET")],
+                         {TABLE: 0x12345678, TABLE + 4: FN + 0x10})
+    assert not targets
+    assert not tr.table_sites
+
+
 @pytest.mark.parametrize("operand", [
     "dword ptr [EAX + EBX*0x4 + -0x75]",
     "dword ptr [EAX*0x4 + 0x10097]",

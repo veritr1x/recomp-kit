@@ -55,7 +55,8 @@ endfunction()
 
 # Video is enabled on the hosts with shared-library packaging support.
 set(RECOMP_VIDEO_DEFAULT OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR IOS OR ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR IOS OR ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Linux"
+    OR (WIN32 AND NOT CMAKE_HOST_WIN32))
   set(RECOMP_VIDEO_DEFAULT ON)
 elseif(WIN32)
   # FFmpeg's configure needs an MSYS2 shell and GNU make. The shell is looked
@@ -78,9 +79,9 @@ set(RECOMP_FFMPEG_MSVC OFF)
 if(WIN32 AND NOT MINGW AND (MSVC OR CMAKE_C_SIMULATE_ID STREQUAL "MSVC"))
   set(RECOMP_FFMPEG_MSVC ON)
 endif()
-option(RECOMP_VIDEO "Build the shared FFmpeg Bink and Smacker dependency" ${RECOMP_VIDEO_DEFAULT})
-if(WIN32 AND NOT RECOMP_VIDEO_DEFAULT)
-  set(RECOMP_VIDEO OFF CACHE BOOL "Build the shared FFmpeg Bink and Smacker dependency" FORCE)
+option(RECOMP_VIDEO "Build the shared FFmpeg movie and music dependency" ${RECOMP_VIDEO_DEFAULT})
+if(WIN32 AND CMAKE_HOST_WIN32 AND NOT RECOMP_VIDEO_DEFAULT)
+  set(RECOMP_VIDEO OFF CACHE BOOL "Build the shared FFmpeg movie and music dependency" FORCE)
 endif()
 
 if(RECOMP_VIDEO)
@@ -88,7 +89,7 @@ if(RECOMP_VIDEO)
     message(FATAL_ERROR "RECOMP_VIDEO is not supported on ${CMAKE_SYSTEM_NAME}")
   endif()
   include(ExternalProject)
-  if(NOT WIN32)
+  if(NOT WIN32 OR NOT CMAKE_HOST_WIN32)
     set(RECOMP_FFMPEG_SHELL /bin/sh)
     find_program(RECOMP_FFMPEG_MAKE NAMES make REQUIRED)
   endif()
@@ -105,8 +106,8 @@ if(RECOMP_VIDEO)
     # Windows Media Encoder era usually holds one of these rather than a
     # WMV-numbered codec, and the demuxer that reads the container is no
     # use without the decoder that reads the frames.
-    --enable-decoder=msmpeg4v1,msmpeg4v2,msmpeg4v3
-    --enable-demuxer=bink,smacker,asf,mp3 --enable-parser=vc1,mpegaudio
+    --enable-decoder=msmpeg4v1,msmpeg4v2,msmpeg4v3,indeo5,vorbis,adpcm_ima_wav,pcm_s16le,pcm_u8
+    --enable-demuxer=bink,smacker,asf,mp3,avi,ogg --enable-parser=vc1,mpegaudio
     --enable-protocol=file
     --disable-autodetect --disable-xlib --disable-libxcb --disable-sdl2
     --disable-iconv --disable-zlib --disable-bzlib --disable-lzma
@@ -144,6 +145,17 @@ if(RECOMP_VIDEO)
   elseif(APPLE)
     list(APPEND RECOMP_FFMPEG_CONFIGURE
       --install-name-dir=@rpath --cc=${CMAKE_C_COMPILER})
+  elseif(WIN32 AND CMAKE_CROSSCOMPILING)
+    # configure must not run Windows probes on the POSIX build host or use
+    # its native binutils. Select every tool from the llvm-mingw toolchain.
+    get_filename_component(RECOMP_FFMPEG_TOOLCHAIN_BIN "${CMAKE_C_COMPILER}" DIRECTORY)
+    list(APPEND RECOMP_FFMPEG_CONFIGURE
+      --enable-cross-compile --target-os=mingw32 --arch=${CMAKE_SYSTEM_PROCESSOR}
+      --cross-prefix=${RECOMP_FFMPEG_TOOLCHAIN_BIN}/${CMAKE_SYSTEM_PROCESSOR}-w64-mingw32-
+      --cc=${CMAKE_C_COMPILER} --ar=${CMAKE_AR} --ranlib=${CMAKE_RANLIB}
+      --nm=${RECOMP_FFMPEG_TOOLCHAIN_BIN}/llvm-nm
+      --strip=${RECOMP_FFMPEG_TOOLCHAIN_BIN}/llvm-strip
+      --windres=${CMAKE_RC_COMPILER})
   else()
     if(RECOMP_FFMPEG_MSVC)
       # cl.exe and link.exe from the Visual Studio developer environment;
@@ -203,10 +215,10 @@ if(RECOMP_VIDEO)
   endforeach()
   # FFmpeg uses a shell configure script and GNU make, not CMake or Ninja.
   # CMAKE_COMMAND is the same (venv) CMake that configured the kit.
-  # On Windows the MSYS2 tools run with their own directory first on PATH, so
+  # On a Windows host MSYS2 tools run with their own directory first on PATH, so
   # configure and make find sed, awk and sh there and nowhere else.
   set(RECOMP_FFMPEG_ENV ${CMAKE_COMMAND} -E env)
-  if(WIN32)
+  if(WIN32 AND CMAKE_HOST_WIN32)
     get_filename_component(RECOMP_FFMPEG_MSYS_BIN "${RECOMP_FFMPEG_MAKE}" DIRECTORY)
     list(APPEND RECOMP_FFMPEG_ENV --modify "PATH=path_list_prepend:${RECOMP_FFMPEG_MSYS_BIN}")
   endif()

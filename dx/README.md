@@ -20,6 +20,10 @@ Metal and AVAudioEngine. That keeps every test here headless.
 | `ddraw.cpp` | IDirectDraw/2/4, IDirectDrawSurface/2/3/4, palette, clipper |
 | `d3d.cpp` | IDirect3D/2, device, viewport, material, light, texture |
 | `dsound.cpp` | IDirectSound, buffer, 3D buffer, 3D listener, notify |
+| `mss32.cpp` | Miles digital drivers, PCM/MP3 samples and streams |
+| `redbook.cpp` | Miles CD audio backed by configured media files |
+| `waveout.cpp` | WinMM PCM/IMA ADPCM queues and device-clock WAVEHDR completion |
+| `avi.cpp` | Read-only AVIFile streams and Indeo 5 Video for Windows decoding |
 | `dshow.cpp` | DirectShow multimedia streaming, the reading side: IAMMultiMediaStream over an MP3 file, IAudioMediaStream, AMAudioData, IAudioStreamSample (minimp3) |
 | `dinput.cpp` | IDirectInputA, mouse and keyboard devices |
 | `dinput_joystick.cpp` | the virtual pad as a DirectInput joystick, when a game asks for native pad input |

@@ -5,6 +5,7 @@
 #include "profile.h"
 #include "mods_seam.h"
 #include "intrinsics.h"
+#include "game_config.h"
 #include "discovery.h"
 #include "interp.h"
 #include "loader.h"
@@ -85,6 +86,19 @@ int32_t module_index(const RecompModule *m, uint32_t target) {
 } // namespace
 
 extern "C" {
+
+const int recomp_resumable_stacks = RECOMP_RESUMABLE_STACKS;
+
+// A switched guest stack owns its saved registers and return address. A
+// generated CALL propagates a mismatched EIP here instead of continuing in
+// the wrong native caller. All CALL continuations are dispatch entries in
+// this opt-in translation mode; ordinary games retain their existing path.
+void recomp_run(X86 *c, uint32_t target) {
+    c->eip = target;
+    do {
+        recomp_call(c, c->eip);
+    } while (recomp_resumable_stacks && c->eip != GUEST_RETURN_SENTINEL);
+}
 
 void recomp_module_register(const RecompModule *m) {
     modules().push_back(m);
@@ -219,13 +233,13 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
         // copies into its own record before any handler runs.
         uint32_t info = 0;
         if (exception_info_block(c, &info)) {
-        wr32(info, 8);
-        wr32(info + 4, target);
-        log_once("null-call",
-                 "call to %08x (return=%08x): raising an access violation, as Windows "
-                 "would, for the guest's handlers",
-                 target, ret);
-        recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
+            wr32(info, 8);
+            wr32(info + 4, target);
+            log_once("null-call",
+                     "call to %08x (return=%08x): raising an access violation, as Windows "
+                     "would, for the guest's handlers",
+                     target, ret);
+            recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
         }
     }
     char key[64];
@@ -303,7 +317,7 @@ void recomp_null_access(uint32_t addr, int write) {
                  "would, for the guest's handlers",
                  write ? "write" : "read", addr, c->eip);
         recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
-        raising_at = 0;   // it returned, so nothing handled it
+        raising_at = 0; // it returned, so nothing handled it
     }
     // Returning would put the guest straight back on the same instruction to
     // fault again, which is the spin this exists to end.

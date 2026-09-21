@@ -73,8 +73,8 @@ when CMake's `RECOMP_VIDEO` option is `ON` (the default). It uses the Xcode
 Command Line Tools' compiler and make plus the existing Python/CMake/Ninja
 environment; no Homebrew FFmpeg or assembler is needed. Intel macOS builds
 pass `--disable-x86asm`. Source is pinned by SHA-256, automatic external
-library detection is disabled, and only Bink/Smacker decoders and demuxers
-and the file protocol are enabled. The exact command and LGPL license are
+library detection is disabled, and only the selected legacy media decoders,
+demuxers and the file protocol are enabled. The exact command and LGPL license are
 in [third_party/ffmpeg/NOTICE.md](third_party/ffmpeg/NOTICE.md).
 
 To disable video for an already configured game tree, run from the kit
@@ -104,21 +104,26 @@ build-tree rpaths for local runs.
 Verify the package on Linux with `readelf -d` and `ldd` after moving it away
 from the build tree, then launch it and check cinematic playback.
 
-On Windows, FFmpeg's configure requires MSYS2 `bash` and GNU `make` on
-`PATH`. CMake uses `find_program` for both; missing either forces video OFF
-with a status message, including when a cache previously enabled it. With
-both tools, a MinGW-compatible compiler defaults video ON and configure uses
-`--target-os=mingw32` and CMake's C compiler. Select a matching MinGW clang
-toolchain for the entire kit. The Visual Studio/MSVC-ABI compiler path stays
-video OFF: `--toolchain=msvc` and clang-cl support are out of scope. An
-explicit `-DRECOMP_VIDEO=OFF` always disables video; Windows CI sets it.
-The packager copies `avformat-61.dll`, `avcodec-61.dll`, `avutil-59.dll` and
-the notice; MinGW import libraries stay in the build tree. Repackaging with
-video OFF removes only the staged FFmpeg files and preserves player files.
+On a native Windows host, FFmpeg's configure requires MSYS2 `bash` and GNU
+`make` on `PATH`. CMake locates bash beside make to avoid picking Git/WSL
+by accident; missing either keeps video OFF with a status message. MinGW uses
+`--target-os=mingw32`; an MSVC-ABI build uses `--toolchain=msvc` in the Visual
+Studio developer environment. Native Windows CI builds with video enabled.
 
-Linux and Windows video builds, DLL/ELF loading and playback have not been
-run here. Verification is limited to reviewing their CMake branches,
-macOS stub configurations with video ON/OFF and fake-file packaging tests.
+For Linux/macOS hosts cross-compiling Windows, set `LLVM_MINGW_ROOT` and use
+`tools/build.py --preset windows-cross --target app`. The preset enables video,
+using the host's POSIX shell and GNU make with llvm-mingw's compiler, resource
+compiler and binutils. No MSYS2 installation is needed. FFmpeg receives an
+explicit target architecture and cross prefix, so configure never executes a
+Windows probe or accidentally selects the host's `dlltool`.
+
+The Windows packager copies `avformat-61.dll`, `avcodec-61.dll`, `avutil-59.dll`
+and the notice beside the app; import libraries stay in the build tree. An
+explicit `-DRECOMP_VIDEO=OFF` at CMake configure time omits media support.
+Repackaging with video OFF removes only staged FFmpeg files and preserves player
+files. The cross-build CI loads the copied Windows DLLs under Wine and decodes a
+generated Ogg tone. This checks decoder loading and PCM output, not a physical
+audio device or target-OS gameplay.
 
 For a video-enabled macOS app, check the executable and all three dylibs
 with `otool -L`: only Apple system paths and the bundled `@rpath/libav*`

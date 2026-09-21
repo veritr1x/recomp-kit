@@ -2,6 +2,7 @@
 #include "imports.h"
 #include "gdi_image.h"
 #include "gdi32_internal.h"
+#include <cstdlib>
 #include "user32_internal.h"
 #include "display_seam.h"
 #include <climits>

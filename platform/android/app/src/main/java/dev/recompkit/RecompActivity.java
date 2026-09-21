@@ -62,6 +62,14 @@ public class RecompActivity extends SDLActivity {
         if (getResources().getConfiguration().smallestScreenWidthDp >= 600)
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE);
         unpackControlLayouts();
+        File resources = getExternalFilesDir(null);
+        if (resources != null) {
+            try {
+                unpackCoreAssets("mods/core", new File(resources, "mods/core"));
+            } catch (Exception e) {
+                android.util.Log.e("recomp", "Cannot unpack core mod resources", e);
+            }
+        }
         super.onCreate(savedInstanceState);
         sActivity = this;
         takeViewIntent(getIntent());
@@ -125,6 +133,43 @@ public class RecompActivity extends SDLActivity {
         if (copied > 0 || removed > 0)
             android.util.Log.i("recomp", "unpacked " + copied + " and removed " + removed
                     + " control layout(s) in " + dir);
+    }
+
+    /** Refresh only the app-owned core resources before native startup.
+     * Same-sized edits are copied too; user mods and profiles live elsewhere.
+     */
+    private void unpackCoreAssets(String asset, File target) throws java.io.IOException {
+        String[] children = getAssets().list(asset);
+        if (children != null && children.length > 0) {
+            if (!target.isDirectory() && !target.mkdirs())
+                throw new java.io.IOException("Cannot create " + target);
+            for (String child : children)
+                unpackCoreAssets(asset + "/" + child, new File(target, child));
+            HashSet<String> shipped = new HashSet<>(Arrays.asList(children));
+            File[] existing = target.listFiles();
+            if (existing != null)
+                for (File file : existing)
+                    if (!shipped.contains(file.getName()))
+                        removeCoreAsset(file);
+        } else if (asset.equals("mods/core")) {
+            removeCoreAsset(target); // this build has no core mods
+        } else {
+            try (InputStream in = getAssets().open(asset);
+                 OutputStream out = new FileOutputStream(target)) {
+                byte[] buffer = new byte[16 * 1024];
+                for (int n; (n = in.read(buffer)) > 0; )
+                    out.write(buffer, 0, n);
+            }
+        }
+    }
+
+    private void removeCoreAsset(File target) throws java.io.IOException {
+        File[] children = target.listFiles();
+        if (children != null)
+            for (File child : children)
+                removeCoreAsset(child);
+        if (target.exists() && !target.delete())
+            throw new java.io.IOException("Cannot remove stale core resource " + target);
     }
 
     @Override

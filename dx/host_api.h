@@ -45,6 +45,10 @@ void host_present(const void *pixels, int w, int h, int bpp, const uint32_t *pal
 // The display mode the guest selected, before any surface exists.
 void host_set_display_mode(int w, int h, int bpp);
 
+// Optional rasterization size independent of the guest's UI/input canvas.
+// Call at a renderer restart; 0,0 restores automatic drawable sizing.
+void host_set_render_resolution(int w, int h);
+
 // A pending host close lets long-running guest media loops finish cooperatively.
 // Hosts without a boot loop report no request.
 int host_close_requested(void);

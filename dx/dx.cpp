@@ -565,6 +565,8 @@ void dx_free_audio_channel(int32_t ch) {
 // shared with display and callback-driven audio. All run under the guest baton.
 static void file_audio_frame_pump(X86 *c) {
     mss32_frame_pump(c);
+    redbook_frame_pump(c);
+    waveout_frame_pump(c);
     dshow_frame_pump(c);
     fmod_frame_pump(c);
     soundlib_frame_pump(c);
@@ -595,6 +597,9 @@ void dx_register_shims() {
     dshow_register();
     qmixer_register();
     mss32_register();
+    redbook_register();
+    avi_register();
+    waveout_register();
     fmod_register();
     soundlib_register();
     galaxy_stub_register();

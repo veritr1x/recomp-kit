@@ -674,8 +674,17 @@ static void test_loader() {
         check(loader_image_limit() == expect.base + expect.size,
               "the image ends at %08x, derived from SizeOfImage %x", loader_image_limit(),
               expect.size);
-        check(loader_iat_patched() == expect.imports.size(), "patched %u IAT slots (expected %zu)",
-              loader_iat_patched(), expect.imports.size());
+        uint32_t aux_imports = 0;
+        for (uint32_t i = 0; const LoaderModule *m = loader_module(i); ++i) {
+            uint32_t opt = m->base + rd32(m->base + 0x3c) + 24;
+            uint32_t imports = rd32(opt + 104);
+            for (uint32_t d = m->base + imports; imports && rd32(d + 12); d += 20)
+                for (uint32_t thunk = m->base + rd32(d + 16); rd32(thunk); thunk += 4)
+                    ++aux_imports;
+        }
+        check(loader_iat_patched() == expect.imports.size() + aux_imports,
+              "patched %u IAT slots (expected %zu main + %u auxiliary)", loader_iat_patched(),
+              expect.imports.size(), aux_imports);
         const auto &got = loader_sections();
         check(got.size() == expect.sections.size(), "section count %zu matches pefile %zu",
               got.size(), expect.sections.size());
@@ -876,8 +885,89 @@ static void test_discovery_recorder() {
     check(file_text(file) == std::string(want) + "\n",
           "and the run's end records how often it was reached, as \"%s\": %s", want,
           file_text(file).c_str());
+    for (uint32_t i = 0; i < loader_module_count(); ++i) {
+        const LoaderModule *module = loader_module(i);
+        for (const SectionInfo &sec : module->sections) {
+            uint32_t before = discovery_count();
+            bool executable = (sec.characteristics & 0x20000000u) != 0;
+            discovery_note("call", sec.va, module->base);
+            check(discovery_count() == before + unsigned(executable),
+                  "auxiliary discovery respects %s section %s execute flag", module->name.c_str(),
+                  sec.name.c_str());
+        }
+    }
     os_unsetenv("RECOMP_DISCOVERY");
     remove_tree(dir);
+}
+
+namespace stack_switch_test {
+constexpr uint32_t entry = 0x0e100100, resume = entry + 0x10, worker = entry + 0x20;
+uint32_t saved_stack, worker_stack, visits;
+void guest_ret(X86 *c) {
+    c->eip = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4;
+    recomp_return(c);
+}
+void continuation(X86 *c) {
+    ++visits;
+    c->r[R_EAX] += 1;
+    guest_ret(c);
+}
+void start(X86 *c) {
+    c->r[R_ESP] -= 4;
+    wr32(c->r[R_ESP], resume);
+    saved_stack = c->r[R_ESP];
+    c->r[R_ESP] = worker_stack;
+    guest_ret(c); // A scheduler RET on the other stack names the worker.
+    if (c->eip != resume)
+        return;
+    continuation(c);
+}
+void other_stack(X86 *c) {
+    c->r[R_EAX] += 10;
+    c->r[R_ESP] = saved_stack;
+    guest_ret(c); // Resume a CALL continuation whose host frame has unwound.
+}
+} // namespace stack_switch_test
+
+// Exercise two guest stacks and a resumed CALL continuation through the real
+// entry driver. The translator suite separately checks the emitted CALL guards.
+static void test_resumable_stacks() {
+    if (!recomp_resumable_stacks)
+        return;
+    section("cooperative guest stacks");
+    using namespace stack_switch_test;
+    static const uint32_t addresses[] = {entry, resume, worker};
+    static void (*const functions[])(X86 *) = {start, continuation, other_stack};
+    static RecompHookFn hooks[3]{};
+    static uint8_t hooked[3]{};
+    static const RecompModule module = {"stack-switch-test",
+                                        entry,
+                                        worker + 1,
+                                        addresses,
+                                        3,
+                                        functions,
+                                        hooks,
+                                        hooked,
+                                        nullptr,
+                                        0,
+                                        nullptr};
+    recomp_module_register(&module);
+    const uint32_t stacks = heap_alloc(512);
+    X86 c{};
+    c.r[R_ESP] = stacks + 128;
+    wr32(c.r[R_ESP], GUEST_RETURN_SENTINEL);
+    worker_stack = stacks + 384;
+    wr32(worker_stack, worker);
+    wr32(worker_stack + 4, 0x12345678);
+    visits = 0;
+    recomp_run(&c, entry);
+    check(c.r[R_EAX] == 11 && visits == 1,
+          "worker ran before the original continuation, exactly once");
+    check(c.eip == GUEST_RETURN_SENTINEL && c.r[R_ESP] == stacks + 132,
+          "return restored the original stack and reached its caller");
+    check(rd32(worker_stack + 4) == 0x12345678, "suspended worker stack was preserved");
+    heap_free(stacks);
 }
 
 static void test_allocator() {
@@ -3618,11 +3708,71 @@ static void test_undeliverable_calls(X86 *c) {
     c->r[R_ESP] = esp0;
 }
 
+static void test_startup_apis(X86 *c) {
+    section("startup API calling conventions and failures");
+    check(call_import(c, "KERNEL32.dll", "GetSystemDefaultLCID", {}) == 0x409,
+          "system locale matches the virtual Windows locale");
+    uint32_t out = scratch_block(32), size = scratch_block(4);
+    wr32(size, 2);
+    wr32(out, 0xabababab);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameA", {out, size}) == 0 && rd32(size) == 7 &&
+              rd32(out) == 0xabababab && get_last_error() == 122,
+          "user name reports required size without truncating");
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameA", {out, size}) == 1 &&
+              gm_str(out) == "Player" && rd32(size) == 7,
+          "user name includes terminator in returned size");
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameA", {out, 0}) == 0 && get_last_error() == 87,
+          "user name rejects an invalid size pointer");
+    wr32(out, 0xdeadbeef);
+    check(call_import(c, "AVIFIL32.dll", "AVIFileOpenA", {out, 0, 0, 0}) == 0x80040154u &&
+              rd32(out) == 0,
+          "unavailable AVI codec returns failure and no interface");
+    check(call_import(c, "_INMM.dll", "mciSendCommandA", {0, 0x803, 0, out}) == 266,
+          "MCI forwarding reports no device and preserves the caller's stack");
+    for (const char *name : {"_missing@0", "_missing@8", "_missing@16"}) {
+        uint32_t tramp = imports_alloc_trampoline("abi-test.dll", name, nullptr, ARGC_UNKNOWN);
+        uint8_t count = name[9] == '0' ? 0 : name[9] == '8' ? 2 : 4;
+        check(imports_argc(tramp) == count, "decorated stdcall arity: %s", name);
+        if (count == 0)
+            call_import(c, "abi-test.dll", name, {});
+        else if (count == 2)
+            call_import(c, "abi-test.dll", name, {1, 2});
+        else
+            call_import(c, "abi-test.dll", name, {1, 2, 3, 4});
+    }
+    for (const char *name : {"_bad@3", "_bad@", "_bad@8x", "_bad@99999999999", "@fast@8"}) {
+        uint32_t tramp = imports_alloc_trampoline("abi-test.dll", name, nullptr, ARGC_UNKNOWN);
+        check(imports_argc(tramp) == ARGC_UNKNOWN, "reject ambiguous decoration: %s", name);
+    }
+    uint32_t cdecl = imports_alloc_trampoline("abi-test.dll", "_explicit@8", nullptr, ARGC_CDECL);
+    check(imports_argc(cdecl) == ARGC_CDECL, "explicit signature overrides decorated spelling");
+}
+
 static void test_registry(X86 *c) {
     section("registry round trip");
     printf("  using %s\n", registry_path().c_str());
     os_unlink(registry_path().c_str());
     registry_load();
+
+    // Roots exist even with an empty profile. Null/empty subkeys reopen the
+    // predefined handle for both encodings; nonexistent children still fail.
+    uint32_t root_out = scratch_block(4), empty = scratch_block(4);
+    wr32(empty, 0);
+    for (const char *api : {"RegOpenKeyExA", "RegOpenKeyExW"}) {
+        for (uint32_t name : {0u, empty}) {
+            wr32(root_out, 0);
+            check(call_import(c, "ADVAPI32.dll", api, {0x80000002u, name, 0, 0x20019, root_out}) ==
+                          0 &&
+                      rd32(root_out) == 0x80000002u,
+                  "%s null/empty subkey reopens HKLM without stored values", api);
+            call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(root_out)});
+        }
+    }
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA",
+                      {0x80000002u, put_str("MissingRootChild"), 0, 0, root_out}) == 2,
+          "a missing root child still fails");
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA", {0x12345678u, 0, 0, 0, root_out}) == 6,
+          "an empty subkey does not validate an invalid handle");
 
     uint32_t sub = put_str("Software\\RecompTests\\Registry");
     uint32_t phk = scratch_block(4), pdisp = scratch_block(4);
@@ -5751,6 +5901,13 @@ static void test_user32_window_model() {
     check(call_import(&c, "USER32.dll", "GetWindowPlacement", {hwnd, s + 0x200}) == 1 &&
               rd32(s + 0x208) == 3 && call_import(&c, "USER32.dll", "IsZoomed", {hwnd}) == 1,
           "placement and maximized state");
+    check(call_import(&c, "USER32.dll", "CloseWindow", {hwnd}) == 1 &&
+              call_import(&c, "USER32.dll", "IsIconic", {hwnd}) == 1 &&
+              call_import(&c, "USER32.dll", "IsWindow", {hwnd}) == 1,
+          "CloseWindow minimizes and preserves the window");
+    call_import(&c, "USER32.dll", "ShowWindow", {hwnd, 9});
+    check(call_import(&c, "USER32.dll", "IsIconic", {hwnd}) == 0,
+          "restoring a closed window clears minimized state");
     uint32_t desktop = call_import(&c, "USER32.dll", "GetDesktopWindow", {});
     check(desktop && call_import(&c, "USER32.dll", "GetWindowRect", {desktop, s + 0x300}) == 1 &&
               rd32(s + 0x308) == call_import(&c, "USER32.dll", "GetSystemMetrics", {0}),
@@ -6156,11 +6313,178 @@ static void test_user32_services() {
 // its configured base, LoadLibrary hands that base out as the handle and
 // GetProcAddress answers from the module's own export directory. A game with
 // no auxiliary modules exercises only the empty registry.
+// Exercise lookup with synthetic PE export data, including data exports,
+// holes, forwarders and malformed RVAs. No translated routines are called.
+static void test_pe_exports() {
+    section("PE code and data exports");
+    LoaderModule m;
+    m.base = 0x00310000;
+    m.size = 0x1000;
+    m.export_rva = 0x100;
+    m.export_size = 0x100;
+    memset(g_mem + m.base, 0, m.size);
+    uint32_t dir = m.base + m.export_rva;
+    wr32(dir + 16, 7);
+    wr32(dir + 20, 3);
+    wr32(dir + 24, 2);
+    wr32(dir + 28, 0x200);
+    wr32(dir + 32, 0x220);
+    wr32(dir + 36, 0x230);
+    wr32(m.base + 0x200, 0x400);
+    wr32(m.base + 0x204, 0x500);
+    wr32(m.base + 0x220, 0x300);
+    wr32(m.base + 0x224, 0x310);
+    wr16(m.base + 0x230, 0);
+    wr16(m.base + 0x232, 1);
+    gm_put_str(m.base + 0x300, "Code", 16);
+    gm_put_str(m.base + 0x310, "Data", 16);
+    check(loader_module_export(m, "Code") == m.base + 0x400,
+          "code export resolves to its guest address");
+    uint32_t data = loader_module_export(m, "Data");
+    check(data == m.base + 0x500, "data export resolves into the image too");
+    if (data) {
+        wr32(data, 0x12345678);
+        check(rd32(m.base + 0x500) == 0x12345678, "data export shares storage with its image");
+    }
+    check(loader_module_export(m, "code") == 0 && loader_module_export(m, "Missing") == 0,
+          "export names are case sensitive and missing exports fail");
+    check(loader_module_export_ordinal(m, 7) == m.base + 0x400 &&
+              loader_module_export_ordinal(m, 8) == m.base + 0x500,
+          "nonzero ordinal base resolves code and data");
+    check(loader_module_export_ordinal(m, 6) == 0 && loader_module_export_ordinal(m, 9) == 0 &&
+              loader_module_export_ordinal(m, 10) == 0,
+          "ordinal underflow, holes and overflow fail");
+    wr32(m.base + 0x200, 0x150);
+    check(loader_module_export(m, "Code") == 0 && loader_module_export_ordinal(m, 7) == 0,
+          "unsupported forwarders are not returned as code");
+    wr32(m.base + 0x200, m.size);
+    check(loader_module_export(m, "Code") == 0 && loader_module_export_ordinal(m, 7) == 0,
+          "out-of-image exports fail");
+    wr32(dir + 20, 0x40000001);
+    check(loader_module_export(m, "Code") == 0 && loader_module_export_ordinal(m, 7) == 0,
+          "oversized address tables fail without arithmetic wrap");
+    m.export_rva = m.size - 20;
+    check(loader_module_export(m, "Code") == 0 && loader_module_export_ordinal(m, 7) == 0,
+          "truncated export directories fail");
+}
+
+namespace dll_lifetime_test {
+constexpr uint32_t entry = 0x0e110100;
+LoaderModule *mapped;
+uint32_t attaches, detaches;
+bool fail_attach;
+
+void dll_entry(X86 *c) {
+    uint32_t reason = arg(c, 1);
+    check(arg(c, 0) == mapped->base && arg(c, 2) == 0,
+          "DllMain receives the module base and null reserved argument");
+    if (reason == 1) {
+        ++attaches;
+        check(memcmp(g_mem + mapped->base, mapped->initial_image.data(), mapped->size) == 0,
+              "attach starts with pristine globals, PE headers and patched imports");
+        wr32(mapped->base + 0x20, 0x12345678);
+        c->r[R_EAX] = fail_attach ? 0 : 1;
+    } else {
+        ++detaches;
+        check(reason == 0 && rd32(mapped->base + 0x20) == 0x12345678,
+              "detach runs before the loaded module's state is discarded");
+        wr32(mapped->base + 0x20, 0xbad);
+        c->r[R_EAX] = 1;
+    }
+    c->eip = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 16; // stdcall DllMain(base, reason, reserved)
+    recomp_return(c);
+}
+} // namespace dll_lifetime_test
+
+// Replace only an auxiliary entry with a synthetic translated DllMain. The
+// real pinned PE mapping and real KERNEL32 imports exercise module lifetimes
+// without executing game initialization in the stub-linked runtime suite.
+static void test_dll_lifetime() {
+    section("DLL unload and reload");
+    using namespace dll_lifetime_test;
+    if (!loader_module_count()) {
+        ++g_skips;
+        printf("  [skip] no configured auxiliary DLL\n");
+        return;
+    }
+    mapped = loader_module_named(loader_module(0)->name.c_str());
+    LoaderModule saved = *mapped;
+    static const uint32_t addresses[] = {entry};
+    static void (*const functions[])(X86 *) = {dll_entry};
+    static RecompHookFn hooks[1]{};
+    static uint8_t hooked[1]{};
+    static const RecompModule module = {"dll-lifetime-test",
+                                        entry,
+                                        entry + 1,
+                                        addresses,
+                                        1,
+                                        functions,
+                                        hooks,
+                                        hooked,
+                                        nullptr,
+                                        0,
+                                        nullptr};
+    recomp_module_register(&module);
+    mapped->entry = entry;
+    X86 c;
+    loader_init_context(&c);
+    uint32_t s = 0x00300000, esp = c.r[R_ESP];
+    gm_put_str(s, mapped->name.c_str(), 128);
+    gm_put_wstr(s + 128, mapped->name.c_str(), 128);
+    check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == 0 && attaches == 0,
+          "lookup of a mapped but unloaded DLL does not initialize it");
+    fail_attach = true;
+    check(call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s}) == 0 &&
+              call_import(&c, "KERNEL32.dll", "GetLastError", {}) == 1114 && attaches == 1 &&
+              detaches == 1 && !mapped->attached && !mapped->load_refs,
+          "failed initialization detaches and reports ERROR_DLL_INIT_FAILED");
+    fail_attach = false;
+    for (uint32_t cycle = 0; cycle < 3; ++cycle) {
+        uint32_t before_attach = attaches, before_detach = detaches;
+        uint32_t h = call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s});
+        check(h == mapped->base && attaches == before_attach + 1,
+              "load cycle %u initializes the DLL exactly once", cycle);
+        check(call_import(&c, "KERNEL32.dll", "LoadLibraryW", {s + 128}) == h &&
+                  attaches == before_attach + 1,
+              "a second load acquires a reference without initializing again");
+        check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == h,
+              "handle lookup finds the attached DLL");
+        check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h}) == 1 &&
+                  detaches == before_detach && mapped->attached,
+              "first release keeps a multiply loaded DLL alive");
+        check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h}) == 1 &&
+                  detaches == before_detach + 1 && !mapped->attached,
+              "final release detaches once; handle lookup acquired no reference");
+        check(call_import(&c, "KERNEL32.dll", "GetModuleHandleW", {s + 128}) == 0 &&
+                  call_import(&c, "KERNEL32.dll", "FreeLibrary", {h}) == 0 &&
+                  detaches == before_detach + 1,
+              "unloaded DLL is absent and cannot be detached twice");
+    }
+    gm_put_str(s + 384, RECOMP_EXECUTABLE, 128);
+    uint32_t before_attach = attaches, before_detach = detaches;
+    check(call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s + 384}) == loader_image_base() &&
+              call_import(&c, "KERNEL32.dll", "FreeLibrary", {loader_image_base()}) == 0 &&
+              loader_module_named(RECOMP_EXECUTABLE)->attached && attaches == before_attach &&
+              detaches == before_detach,
+          "main executable cannot be reinitialized or unloaded as a DLL");
+    check(c.r[R_ESP] == esp && c.eip == g_fake_ret,
+          "nested DllMain callbacks preserve the import caller's stack and return");
+    *mapped = saved;
+    memcpy(g_mem + mapped->base, mapped->initial_image.data(), mapped->initial_image.size());
+}
+
 static void test_auxiliary_modules() {
     section("auxiliary modules");
     X86 c;
     loader_init_context(&c);
     uint32_t s = 0x00300000;
+    const LoaderModule *main = loader_module_named(RECOMP_EXECUTABLE);
+    check(main && main->base == loader_image_base() && main->attached,
+          "main executable participates in module lookups without DLL initialization");
+    gm_put_str(s, RECOMP_EXECUTABLE, 128);
+    check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == loader_image_base(),
+          "main executable's configured name returns its image handle");
     check(loader_module_count() == RECOMP_AUX_MODULE_COUNT, "%u auxiliary modules mapped",
           loader_module_count());
     for (uint32_t i = 0; const LoaderModule *m = loader_module(i); ++i) {
@@ -6174,6 +6498,28 @@ static void test_auxiliary_modules() {
         check(call_import(&c, "KERNEL32.dll", "IsBadCodePtr", {m->base}) == 0,
               "the module's base is code");
         check(rd16(m->base) == 0x5a4d, "PE headers mapped at %08x", m->base);
+        // Compare every import from the main executable against that image's
+        // export table. In particular, a data import must not be a trampoline.
+        uint32_t opt = m->base + rd32(m->base + 0x3c) + 24;
+        uint32_t imports = rd32(opt + 104), main_imports = 0;
+        bool bound = true;
+        for (uint32_t d = m->base + imports; imports && rd32(d + 12); d += 20) {
+            if (os_strcasecmp(gm_str(m->base + rd32(d + 12)).c_str(), RECOMP_EXECUTABLE))
+                continue;
+            uint32_t original = rd32(d), iat = rd32(d + 16);
+            for (uint32_t n = 0; original && rd32(m->base + original + n * 4); ++n) {
+                uint32_t t = rd32(m->base + original + n * 4);
+                uint32_t expected =
+                    !main ? 0
+                    : (t & 0x80000000u)
+                        ? loader_module_export_ordinal(*main, t & 0xffff)
+                        : loader_module_export(*main, gm_str(m->base + t + 2).c_str());
+                bound &= expected && rd32(m->base + iat + n * 4) == expected;
+                ++main_imports;
+            }
+        }
+        check(bound, "%s binds %u imports directly to main-image exports", m->name.c_str(),
+              main_imports);
         gm_put_str(s + 256, "no-such-export", 64);
         check(call_import(&c, "KERNEL32.dll", "GetProcAddress", {h, s + 256}) == 0,
               "GetProcAddress(%s, no-such-export) -> 0", m->name.c_str());
@@ -6332,7 +6678,21 @@ int main(int argc, char **argv) {
 
     test_loader();
     test_discovery_recorder();
+    test_pe_exports();
+    test_dll_lifetime();
     test_auxiliary_modules();
+    test_resumable_stacks();
+    if (argc == 2 && strcmp(argv[1], "--startup-contracts") == 0) {
+        // A new port can validate mapping and registry contracts before its
+        // remaining platform APIs or optional resources are supported.
+        scratch = 0x0ee00000;
+        test_startup_apis(loader_context());
+        test_registry(loader_context());
+        printf("\n%d startup checks, %d failures, %d skipped\n", g_checks, g_failures, g_skips);
+        return g_failures ? 1 : 0;
+    }
+    scratch = 0x0ee00000;
+    test_startup_apis(loader_context());
     test_import_return_trace();
     test_modules_and_wide();
     test_preferred_ui_languages();

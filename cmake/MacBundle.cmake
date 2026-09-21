@@ -2,6 +2,14 @@
 # RECOMP_APP_NAME, with Info.plist copied verbatim and the resources,
 # core mods, texture pack and ad-hoc signature applied after the link.
 function(pop_mac_bundle target)
+  # Core plugins are compiled during bundle finishing. Relink/repackage when
+  # their source or manifests change, even if the host itself is unchanged.
+  file(GLOB_RECURSE core_inputs CONFIGURE_DEPENDS
+    ${RECOMP_GAME_DIR}/mods/core/*.c ${RECOMP_GAME_DIR}/mods/core/*.h
+    ${RECOMP_GAME_DIR}/mods/core/*.toml)
+  if(core_inputs)
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${core_inputs})
+  endif()
   configure_file(${POP_ROOT}/host/Info.plist.in ${CMAKE_BINARY_DIR}/generated/Info.plist @ONLY)
   set_target_properties(${target} PROPERTIES
     MACOSX_BUNDLE ON

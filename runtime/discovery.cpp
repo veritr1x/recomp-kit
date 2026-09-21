@@ -42,12 +42,16 @@ bool g_registered = false;
 // reads - data in the image included. Recording any of those would stop the
 // next pass dead, so ask the question the translator asks.
 bool in_code_section(uint32_t target) {
-    for (const SectionInfo &s : loader_sections()) {
+    const auto *sections = &loader_sections();
+    if (const LoaderModule *m = loader_module_containing(target))
+        if (m->base != loader_image_base())
+            sections = &m->sections;
+    for (const SectionInfo &s : *sections) {
         uint32_t size = s.vsize ? s.vsize : s.raw_size;
         if (target >= s.va && target < s.va + size)
             return (s.characteristics & 0x20000000u) != 0; // IMAGE_SCN_MEM_EXECUTE
     }
-    return false; // the PE headers, a gap, an auxiliary module, or no image yet
+    return false; // the PE headers, a gap, or no image yet
 }
 
 // The caller holds g_mutex.

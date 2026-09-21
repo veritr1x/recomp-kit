@@ -9,6 +9,7 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import copy_layouts  # noqa: E402
+from copy_core_mods import copy_core_mods  # noqa: E402
 
 
 def stage(app_binary: Path, cfg: dict, out_dir: Path, system=None, build_dir=None, game_dir=None) -> Path:
@@ -52,6 +53,7 @@ def stage(app_binary: Path, cfg: dict, out_dir: Path, system=None, build_dir=Non
 
     if game_dir is not None:
         files.extend(copy_layouts.copy_layouts(game_dir, resources / "controls"))
+        files.extend(copy_core_mods(game_dir, resources / "mods/core"))
 
     # Read the actual preset's cache, including an explicit video-OFF override.
     # Exact SONAMEs avoid bundling build tools or unrelated files from ffmpeg/.

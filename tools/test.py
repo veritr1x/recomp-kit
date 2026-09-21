@@ -176,7 +176,7 @@ def main():
     if game_backed and not cfg["developer_exe_path"].is_file():
         parser.error("This suite needs your game installation; run tools/setup.py first, "
                      "or run `ctest --test-dir <build dir> -L nogame` for the portable suites")
-    if game_backed and not build_py.archive_path(build_root).is_file():
+    if game_backed and not build_py.archive_path(build_root, preset=args.preset).is_file():
         parser.error("Build the game with tools/build.py before running this suite")
     env = probe_module().without_switches(os.environ)
     env["PY"] = sys.executable

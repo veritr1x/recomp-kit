@@ -1,4 +1,3 @@
-import pytest
 """Driver-level rules of the translator that need no game to check.
 
     .venv/bin/python -m pytest -q tools/recomp/tests/test_translate_driver.py
@@ -241,7 +240,8 @@ def test_output_records_the_loaded_image_base(tmp_path, monkeypatch, artifact, p
         assert "case %s: goto L_%08x;" % (T.hexlit(landing), landing) in text
 
 
-def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resumable", [False, True])
+def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch, resumable):
     """Direct and indirect CALL lengths name returns, not new dispatch entries."""
     import re
     import struct
@@ -269,10 +269,20 @@ def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch):
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
     monkeypatch.setattr(T, "EXTRA_ENTRY_POINTS", frozenset())
+    monkeypatch.setattr(T, "RESUMABLE_STACKS", resumable)
     monkeypatch.setattr(T, "Image", lambda path: img)
+    discovered = tmp_path / "discovered.txt"
+    discovered.write_text("00601080 call 00601005 1\n1000d250 call 1000bad0 1\n")
     monkeypatch.setattr(sys, "argv", ["translate.py", "--game", str(tmp_path),
-                                     "--out", str(out), "--quiet"])
+                                     "--out", str(out), "--quiet",
+                                     "--discovered", str(discovered)])
     assert T.main() == 0
+    assert callee in T.EXTRA_ENTRY_POINTS
+    assert 0x1000d250 not in T.EXTRA_ENTRY_POINTS
+    chunks = "\n".join(p.read_text() for p in out.glob("chunk_*.c"))
+    for address in (entry + 7, entry + 12, entry + 18):
+        assert ("if (c->eip != %s) return;" % T.hexlit(address) in chunks) == resumable
+        assert ("void fn_%08x(X86 *c)" % address in chunks) == resumable
     text = (out / "table.c").read_text()
     assert "int recomp_is_call_return(uint32_t target)" in text
     array = text.split("recomp_call_returns[] = {", 1)[1].split("};", 1)[0]
@@ -1662,4 +1672,3 @@ def test_a_wide_literal_behind_a_halt_is_not_code(tmp_path, monkeypatch):
     import re
     placed = set(re.findall(r"^(L_[0-9a-f]{8}): ;", text, re.M))
     assert set(re.findall(r"goto (L_[0-9a-f]{8});", text)) <= placed
-

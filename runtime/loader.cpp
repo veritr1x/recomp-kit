@@ -23,6 +23,7 @@ __attribute__((weak)) const uint32_t recomp_data_seed_count = 0;
 #include <stdlib.h>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include "../platform/os.h"
 
 const char *const LOADER_DEFAULT_EXE = RECOMP_DEVELOPER_EXE;
@@ -37,6 +38,7 @@ std::string g_error;
 std::string g_exe_path;
 uint32_t g_base = 0, g_size = 0, g_entry = 0, g_iat_patched = 0, g_iat_data = 0;
 std::vector<SectionInfo> g_sections;
+LoaderModule g_main;
 X86 g_ctx;
 LoaderTls g_tls = {0, 0, 0, 0, 0, 0xffffffffu};
 
@@ -254,6 +256,21 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
                 std::string n = gm_str(g_base + t + 2, 260);
                 snprintf(namebuf, sizeof namebuf, "%s", n.c_str());
             }
+            // DLLs can import code AND data from the executable. Both slots
+            // must hold the original guest address, not a host trampoline or
+            // a separately allocated copy of an exported global.
+            if (const LoaderModule *module = loader_module_named(dll.c_str())) {
+                uint32_t address = (t & 0x80000000u)
+                                       ? loader_module_export_ordinal(*module, t & 0xffff)
+                                       : loader_module_export(*module, namebuf);
+                if (!address) {
+                    g_error = "missing mapped export " + dll + "!" + namebuf;
+                    return false;
+                }
+                wr32(slot, address);
+                ++g_iat_patched;
+                continue;
+            }
             uint32_t data = imports_alloc_data(dll.c_str(), namebuf);
             if (data) {
                 // An imported variable, not a function: the slot holds the
@@ -381,6 +398,7 @@ bool load_aux_module(const AuxSpec &spec) {
         uint32_t raw_size = rd<uint32_t>(file, s + 16);
         uint32_t raw_ptr = rd<uint32_t>(file, s + 20);
         uint32_t span = vsize ? vsize : raw_size;
+        m.sections.push_back({nm, va, vsize, raw_size, raw_ptr, rd<uint32_t>(file, s + 36)});
         if (va < image_base || (uint64_t)va + span > (uint64_t)image_base + size_image) {
             g_error = std::string(spec.name) + ": section " + nm + " lies outside the image";
             return false;
@@ -400,6 +418,7 @@ bool load_aux_module(const AuxSpec &spec) {
         g_error = std::string(spec.name) + ": " + g_error;
         return false;
     }
+    m.initial_image.assign(g_mem + image_base, g_mem + image_base + m.size);
     g_aux.push_back(m);
     LOGV("mapped auxiliary module %s: base %08x size %08x entry %08x", spec.name, m.base,
          size_image, m.entry);
@@ -417,12 +436,16 @@ const LoaderModule *loader_module(uint32_t i) {
 LoaderModule *loader_module_named(const char *name) {
     if (!name)
         return nullptr;
+    if (g_main.base && os_strcasecmp(g_main.name.c_str(), name) == 0)
+        return &g_main;
     for (LoaderModule &m : g_aux)
         if (os_strcasecmp(m.name.c_str(), name) == 0)
             return &m;
     return nullptr;
 }
 const LoaderModule *loader_module_containing(uint32_t addr) {
+    if (g_main.base && addr >= g_main.base && addr - g_main.base < g_main.size)
+        return &g_main;
     for (const LoaderModule &m : g_aux)
         if (addr >= m.base && addr < m.base + m.size)
             return &m;
@@ -435,28 +458,46 @@ bool loader_in_image(uint32_t addr) {
 // The PE export directory read from guest memory, so a lookup sees the mapped
 // bytes. Names are compared case sensitively, as GetProcAddress does.
 uint32_t loader_module_export(const LoaderModule &m, const char *name) {
-    if (!m.export_rva || !name)
+    if (!m.export_rva || !name || !rva_in(m.size, m.export_rva, 40))
         return 0;
     auto in = [&](uint32_t rva, uint32_t len) { return rva_in(m.size, rva, len); };
     uint32_t dir = m.base + m.export_rva;
     uint32_t nfuncs = rd32(dir + 20), nnames = rd32(dir + 24);
     uint32_t funcs = rd32(dir + 28), names = rd32(dir + 32), ords = rd32(dir + 36);
-    if (!in(funcs, 4 * nfuncs) || !in(names, 4 * nnames) || !in(ords, 2 * nnames))
+    if (nfuncs > m.size / 4 || nnames > m.size / 4 || !in(funcs, 4 * nfuncs) ||
+        !in(names, 4 * nnames) || !in(ords, 2 * nnames))
         return 0;
     for (uint32_t i = 0; i < nnames; ++i) {
         uint32_t name_rva = rd32(m.base + names + 4 * i);
-        if (!in(name_rva, 1) || gm_str(m.base + name_rva, 260) != name)
+        if (!in(name_rva, 1) ||
+            gm_str(m.base + name_rva, std::min(260u, m.size - name_rva)) != name)
             continue;
         uint32_t ordinal = rd16(m.base + ords + 2 * i);
         if (ordinal >= nfuncs)
             return 0;
         uint32_t rva = rd32(m.base + funcs + 4 * ordinal);
         // A forwarder (an RVA inside the export directory) is not served.
-        if (!rva || rva_in(m.export_size, rva - m.export_rva, 1))
+        if (!rva || !in(rva, 1) || rva_in(m.export_size, rva - m.export_rva, 1))
             return 0;
         return m.base + rva;
     }
     return 0;
+}
+
+// Ordinals index the same address table as names, offset by the directory's
+// ordinal base. Missing entries and forwarded exports are not executable.
+uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal) {
+    if (!m.export_rva || !rva_in(m.size, m.export_rva, 40))
+        return 0;
+    uint32_t dir = m.base + m.export_rva;
+    uint32_t first = rd32(dir + 16), count = rd32(dir + 20), table = rd32(dir + 28);
+    if (ordinal < first || ordinal - first >= count || count > m.size / 4 ||
+        !rva_in(m.size, table, 4 * count))
+        return 0;
+    uint32_t rva = rd32(m.base + table + 4 * (ordinal - first));
+    if (!rva || !rva_in(m.size, rva, 1) || rva_in(m.export_size, rva - m.export_rva, 1))
+        return 0;
+    return m.base + rva;
 }
 
 const char *loader_error() {
@@ -499,6 +540,7 @@ bool loader_load(const char *exe_path) {
     g_error.clear();
     g_sections.clear();
     g_aux.clear();
+    g_main = LoaderModule{};
     g_iat_patched = 0;
     g_iat_data = 0;
     g_exe_path = exe_path && *exe_path ? exe_path : LOADER_DEFAULT_EXE;
@@ -577,6 +619,20 @@ bool loader_load(const char *exe_path) {
     g_base = image_base;
     g_size = size_image;
     g_entry = image_base + entry_rva;
+    g_main.name = RECOMP_EXECUTABLE;
+    g_main.path = g_exe_path;
+    g_main.base = g_base;
+    g_main.size = g_size;
+    g_main.entry = g_entry;
+    g_main.attached = true; // Its process entry must never run as DllMain.
+    if (opt_size >= 104 && rd<uint32_t>(file, opt_off + 92) > 0) {
+        g_main.export_rva = rd<uint32_t>(file, opt_off + 96);
+        g_main.export_size = rd<uint32_t>(file, opt_off + 100);
+        if (g_main.export_rva && !rva_in(g_size, g_main.export_rva, g_main.export_size)) {
+            g_error = "main export directory lies outside the image";
+            return false;
+        }
+    }
 
     // PE headers, then each section at its virtual address. The arena is zero
     // filled by mmap, so the tail of a section past SizeOfRawData (.bss) is
@@ -778,13 +834,13 @@ void run_entry(X86 *c) {
             wr32(esp - 16, GUEST_RETURN_SENTINEL);
             c->r[R_ESP] = esp - 16;
             c->eip = cb;
-            recomp_call(c, cb);
+            recomp_run(c, cb);
             c->r[R_ESP] = esp;
             ++count;
         }
         LOGV("ran %u TLS process-attach callbacks", count);
         c->eip = g_entry;
-        recomp_call(c, g_entry);
+        recomp_run(c, g_entry);
     } else
         LOGW("guest process exited with code %u", process_exit_code());
     sched_set_guest_thread(false);

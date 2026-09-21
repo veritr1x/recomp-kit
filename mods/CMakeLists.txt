@@ -3,7 +3,7 @@ file(GLOB POP_LUA_SOURCES CONFIGURE_DEPENDS ${POP_ROOT}/third_party/lua/*.c)
 add_library(lua STATIC ${POP_LUA_SOURCES})
 set_target_properties(lua PROPERTIES
   C_STANDARD 99 C_EXTENSIONS OFF
-  ARCHIVE_OUTPUT_DIRECTORY ${POP_OUT} OUTPUT_NAME lua)
+  ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR} OUTPUT_NAME lua)
 target_include_directories(lua PUBLIC ${POP_ROOT}/third_party/lua)
 target_compile_options(lua PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(lua PRIVATE
@@ -16,6 +16,9 @@ pop_optimize(lua 2)
 # picked up by the next configure.
 file(GLOB POP_MODS_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/lua/*.cpp)
+list(REMOVE_ITEM POP_MODS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/builtin_mods.cpp)
+add_library(recomp_builtin_defaults STATIC builtin_mods.cpp)
+set_target_properties(recomp_builtin_defaults PROPERTIES ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR})
 # The capture seam includes the page-tracking harness from native,
 # which is mprotect and signal handlers. Windows gets the stub that says so.
 list(REMOVE_ITEM POP_MODS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/capture_seam_win32.cpp)
@@ -26,7 +29,7 @@ endif()
 
 add_library(recomp_mods OBJECT ${POP_MODS_SOURCES})
 target_include_directories(recomp_mods PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
-target_link_libraries(recomp_mods PUBLIC lua recomp_runtime)
+target_link_libraries(recomp_mods PUBLIC lua recomp_runtime recomp_builtin_defaults)
 target_compile_options(recomp_mods PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_mods 2)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -37,7 +40,7 @@ endif()
 if(NOT IOS AND NOT ANDROID)
 add_library(recomp_mods_testing OBJECT ${POP_MODS_SOURCES})
 target_include_directories(recomp_mods_testing PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
-target_link_libraries(recomp_mods_testing PUBLIC lua recomp_runtime_testing)
+target_link_libraries(recomp_mods_testing PUBLIC lua recomp_runtime_testing recomp_builtin_defaults)
 target_compile_definitions(recomp_mods_testing PUBLIC POPM_TESTING=1)
 target_compile_options(recomp_mods_testing PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_mods_testing 1)

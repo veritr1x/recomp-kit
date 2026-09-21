@@ -74,10 +74,10 @@ def build_dir_for(build_root, preset):
     return Path(build_root) / "cmake" / preset
 
 
-def archive_path(build_root, system=None):
+def archive_path(build_root, system=None, preset=None):
     """Where CMake writes the translated archive on this platform."""
     name = "recomp_gen.lib" if (system or platform.system()) == "Windows" else "librecomp_gen.a"
-    return Path(build_root) / "recomp" / name
+    return Path(build_root) / "cmake" / (preset or default_preset(system)) / "lib" / name
 
 
 def cmake_tool(name):
@@ -193,6 +193,16 @@ def android_stage_layout_assets(out, game_dir):
     return copy_layouts.copy_layouts(game_dir, controls)
 
 
+def android_stage_core_assets(out, game_dir):
+    """Package core manifests/data; native plugins are linked into libmain.so.
+
+    Never carry a developer's desktop binaries, sources or debug bundles into
+    the APK. Only the app-owned core tree is rebuilt; profiles are unrelated.
+    """
+    from copy_core_mods import copy_core_mods
+    copy_core_mods(game_dir, Path(out) / "app/src/main/assets/mods/core")
+
+
 def android_apk(build_root, cfg, *, gen_dir, game_dir):
     """Stage the native libraries beside the SDL activity and assemble a debug APK."""
     library = Path(gen_dir) / "host/libmain.so"
@@ -223,6 +233,7 @@ def android_apk(build_root, cfg, *, gen_dir, game_dir):
     else:
         notice.unlink(missing_ok=True)
     android_stage_layout_assets(out, game_dir)
+    android_stage_core_assets(out, game_dir)
     wrapper = "gradlew.bat" if platform.system() == "Windows" else "./gradlew"
     subprocess.run([wrapper, "assembleDebug"], cwd=out, check=True)
     apk = out / "app/build/outputs/apk/debug/app-debug.apk"
@@ -488,14 +499,15 @@ def main():
                         android_install_and_launch(apk, cfg["game"]["bundle_id"], args.device, args.console,
                                                    game_cfg=cfg if args.push_game else None,
                                                    build_root=args.build_root)
-                system = platform.system()
+                system = "Windows" if preset.startswith("windows-cross") else platform.system()
                 if args.target == "app" and not args.stub and system in {"Linux", "Windows"}:
                     # The desktop Ninja presets write OUTPUT_NAME into POP_OUT.
+                    desktop_root = args.build_root / "windows" if preset.startswith("windows-cross") else args.build_root
                     suffix = ".exe" if system == "Windows" else ""
-                    binary = args.build_root / "recomp" / (cfg["game"]["app_name"] + suffix)
+                    binary = desktop_root / "recomp" / (cfg["game"]["app_name"] + suffix)
                     if not binary.is_file():
                         parser.exit(1, "No desktop app binary at %s after the build\n" % binary)
-                    packaged = package_desktop.stage(binary, cfg, args.build_root / "package",
+                    packaged = package_desktop.stage(binary, cfg, desktop_root / "package",
                                                      system=system, build_dir=build_dir, game_dir=args.game_dir)
                     print("Packaged %s" % packaged)
     except subprocess.CalledProcessError as error:

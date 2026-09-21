@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("extract_icon", ROOT / "tools/extract_icon.py")
@@ -11,6 +12,25 @@ extract_icon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(extract_icon)
 
 EXE = ROOT / "original/gog/D3DPopTB.exe"
+
+
+class SidecarIconTests(unittest.TestCase):
+    def test_missing_resource_uses_case_insensitive_sibling_icon(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "Sample.exe"
+            Image.new("RGBA", (32, 32), (20, 40, 60, 255)).save(root / "sample.ICO")
+            with patch.object(extract_icon, "ico_bytes", side_effect=extract_icon.MissingIconError("missing")):
+                paths = extract_icon.write_icons(exe, root / "icons")
+            self.assertEqual(len(paths), len(extract_icon.IOS_ICONS))
+            with Image.open(paths[0]) as image:
+                self.assertEqual(image.getpixel((0, 0)), (20, 40, 60))
+
+    def test_corrupt_executable_is_not_hidden_by_sidecar_fallback(self):
+        with patch.object(extract_icon, "ico_bytes", side_effect=ValueError("corrupt")):
+            with self.assertRaisesRegex(ValueError, "corrupt"):
+                extract_icon.write_icons(Path("invalid.exe"), Path("unused"))
 
 
 @unittest.skipUnless(EXE.is_file(), "needs the developer's game installation")

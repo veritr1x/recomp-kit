@@ -619,16 +619,39 @@ CASES += [
 ]
 
 
+CASES += [
+    Case("%s short register form writes %s" % (name, dest),
+         0x0D02D100 + i * 0x100,
+         [(0, "FLD double ptr [EAX]"), (2, "FLD double ptr [EAX + 0x8]"),
+          (5, name + " ST1"), (5 + len(bytes.fromhex(code)), "FSTP double ptr [EDX]"),
+          (7 + len(bytes.fromhex(code)), "FSTP double ptr [EDX + 0x8]"),
+          (10 + len(bytes.fromhex(code)), "RET")],
+         "dd00 dd4008 " + code + " dd1a dd5a08 c3",
+         lambda rng: {"regs": rand_regs(rng, EAX=SCRATCH, EDX=SCRATCH + 0x100),
+                      "mem": [(SCRATCH, struct.pack("<2d", 8.0, 2.0))]})
+    for i, (name, code, dest) in enumerate([
+        ("FADD", "d8c1", "ST0"), ("FADD", "dcc1", "ST1"),
+        ("FMUL", "d8c9", "ST0"), ("FMUL", "dcc9", "ST1"),
+        ("FSUB", "d8e1", "ST0"), ("FSUB", "dce9", "ST1"),
+        ("FSUBR", "d8e9", "ST0"), ("FSUBR", "dce1", "ST1"),
+        ("FDIV", "d8f1", "ST0"), ("FDIV", "dcf9", "ST1"),
+        ("FDIVR", "d8f9", "ST0"), ("FDIVR", "dcf1", "ST1"),
+        ("FMUL", "66dcc9", "ST1 with prefix")])
+]
+
+
 # -------------------------------------------------------------- translate --
 
 class NoImage(object):
-    """The translator's view of a program that has no bytes: every synthetic
-    case is straight-line code whose listing is complete, so nothing here is
-    ever consulted for real."""
+    """Complete synthetic listings need no recovery, but expose their bytes
+    to disambiguate instruction forms that share the same listing text."""
     base = 0
     end = 0
     size = 0
     md = None
+
+    def __init__(self, case=None):
+        self.case = case
 
     def insn_end(self, addr, mnem):
         return None
@@ -637,6 +660,8 @@ class NoImage(object):
         return None
 
     def rd8(self, va):
+        if self.case and self.case.addr <= va < self.case.addr + len(self.case.code):
+            return self.case.code[va - self.case.addr]
         return None
 
     def is_exec(self, va):
@@ -652,7 +677,7 @@ class Opts(object):
 
 def translate_case(case):
     """The emitted C for one case, or the TranslateError it raised."""
-    tr = T.Translator(NoImage(), {a for c in CASES for a in (c.addr,) + c.entries}, Opts())
+    tr = T.Translator(NoImage(case), {a for c in CASES for a in (c.addr,) + c.entries}, Opts())
     insns = T.parse_listing_text(case.listing())
     fn = T.Function(case.addr, case.name, len(case.code), insns)
     fn.measure(NoImage())

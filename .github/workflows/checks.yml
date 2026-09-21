@@ -49,6 +49,52 @@ jobs:
       - name: Check the SDLActivity library name
         run: test -s build/cmake/android-stub/host/libmain.so
 
+  windows-cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install cross-build and media test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential glslc ffmpeg wine64 wine xvfb
+          python3 -m venv .ci
+          .ci/bin/python -m pip install cmake==4.1.2 ninja==1.13.0
+          echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+      - name: Install the pinned llvm-mingw UCRT toolchain
+        run: |
+          curl -fL --retry 3 -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/llvm-mingw-20260908-ucrt-ubuntu-22.04-x86_64.tar.xz
+          echo "2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092  $RUNNER_TEMP/llvm-mingw.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/llvm-mingw"
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP/llvm-mingw" --strip-components=1
+          echo "LLVM_MINGW_ROOT=$RUNNER_TEMP/llvm-mingw" >> "$GITHUB_ENV"
+      - name: Cross-build the app and test binaries with media enabled
+        run: |
+          .ci/bin/python tools/build.py --preset windows-cross --stub --target app --jobs 4
+          .ci/bin/python tools/test.py --preset windows-cross-stub --compile-only --jobs 4
+      - name: Check bundled codecs and decode Ogg with the Windows DLLs
+        env:
+          WINEDEBUG: -all
+          WINEARCH: win64
+        run: |
+          grep -q '^RECOMP_VIDEO:BOOL=ON$' build/cmake/windows-cross-stub/CMakeCache.txt
+          for component in INDEO5_DECODER VORBIS_DECODER AVI_DEMUXER OGG_DEMUXER; do
+            grep -q "^#define CONFIG_${component} 1$" build/cmake/windows-cross-stub/ffmpeg-prefix/src/ffmpeg-build/config_components.h
+          done
+          mkdir -p "$RUNNER_TEMP/media-check"
+          media_bin=build/windows-stub/recomp
+          cp "$media_bin/dx_tests.exe" "$RUNNER_TEMP/media-check/"
+          for dll in avformat-61.dll avcodec-61.dll avutil-59.dll; do
+            test -s "$media_bin/$dll"
+            cp "$media_bin/$dll" "$RUNNER_TEMP/media-check/"
+          done
+          ffmpeg -v error -f lavfi -i sine=frequency=440:duration=1 -ar 44100 -ac 2 \
+            -c:a libvorbis "$RUNNER_TEMP/media-check/tone.ogg"
+          export WINEPREFIX="$RUNNER_TEMP/media-wine"
+          cd "$RUNNER_TEMP/media-check"
+          RECOMP_TEST_AUDIO=tone.ogg xvfb-run -a wine ./dx_tests.exe
+
   native-compile:
     # Game files and generated code are never available in CI. The *-stub
     # presets link every host against tools/gen_stub_translation.py's link-only

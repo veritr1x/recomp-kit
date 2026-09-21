@@ -9,6 +9,8 @@
 #include <stdio.h>
 
 extern "C" void recomp_call(X86 *c, uint32_t target) {
+    if (recomp_module_call(c, target))
+        return;
     if (imports_dispatch(c, target))
         return;
     if (recomp_run_thunk(c, target))
@@ -16,6 +18,13 @@ extern "C" void recomp_call(X86 *c, uint32_t target) {
     fprintf(stderr, "[stub] recomp_call to %08x: no generated function table in this build\n",
             target);
     c->r[R_EAX] = 0;
+}
+
+extern "C" int32_t recomp_index_of(uint32_t) {
+    return -1; // This test host has no main-image translation table.
+}
+extern "C" int recomp_is_call_return(uint32_t) {
+    return 0;
 }
 
 // interp.cpp hands a tail call on to the table, so the stand-in needs the jump

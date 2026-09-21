@@ -48,6 +48,29 @@ def test_android_templates_render(tmp_path):
     assert app.find("activity").get(android + "screenOrientation") == "fullUser"
 
 
+def test_android_core_assets_replace_stale_manifests_without_shipping_binaries(tmp_path):
+    game = tmp_path / "game"
+    core = game / "mods/core/display"
+    core.mkdir(parents=True)
+    for name in ("mod.toml", "palette.json", "display.c", "display.dylib", "display.so"):
+        (core / name).write_text(name)
+    out = tmp_path / "apk"
+    stale = out / "app/src/main/assets/mods/core/stale/mod.toml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale")
+    profile = out / "profile/save.dat"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("keep")
+    build.android_stage_core_assets(out, game)
+    staged = out / "app/src/main/assets/mods/core"
+    assert sorted(p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file()) == [
+        "display/mod.toml", "display/palette.json"]
+    assert profile.read_text() == "keep"
+    (core / "mod.toml").write_text("new")
+    build.android_stage_core_assets(out, game)
+    assert (staged / "display/mod.toml").read_text() == "new"
+
+
 def test_android_assets_carry_the_games_control_layouts(tmp_path):
     cfg = {"game": {"app_name": "StubRecomp", "bundle_id": "dev.recompkit.stub", "id": "stub"}}
     game_dir = tmp_path / "game"

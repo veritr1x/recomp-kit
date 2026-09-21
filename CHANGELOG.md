@@ -37,6 +37,63 @@
   switch stays available, touches through hidden controls reach the game,
   and disconnecting restores the player's saved keyboard visibility.
 
+- Windows cross-builds enable FFmpeg movie and file-backed music decoding,
+  use the POSIX host's shell/make with llvm-mingw tools, and bundle the media DLLs.
+  CI cross-builds the Windows app and decodes a generated Ogg track under Wine.
+- Ports can request an output render size independently of the logical
+  display canvas, keeping UI/input coordinates stable at high resolutions.
+  A changed request applies to the next frame without resizing leased targets.
+- macOS bundles rebuild their core plugins when plugin sources or manifests change.
+- Android links core plugins into its native library and refreshes their packaged
+  manifests/data before startup, preserving user mods and player profiles.
+- Linux and Windows desktop apps also link core plugins and package their
+  manifests/data, making game adaptations available in standalone packages.
+- Mod hook callbacks can call allocated import trampolines through `guest_call`,
+  preserving registers just as calls to translated functions do.
+- Static archives live inside each CMake preset's build tree, preventing desktop
+  and mobile builds of the same game from overwriting each other's libraries.
+- iOS icon extraction accepts a same-named sibling ICO when a valid executable
+  has no embedded icon resource.
+- Auxiliary DLLs now detach on their final FreeLibrary and initialize again
+  from verified, import-patched image bytes on reload. This lets games rebuild
+  their renderer when changing resolution. Handle lookups do not acquire a
+  load reference, and failed initialization reports an error.
+- Colour-keyed RGB textures now apply the legacy implicit alpha test when
+  COLORKEYENABLE is set and explicit alpha testing is off, preserving the
+  content behind transparent menu overlays even without alpha blending.
+- Added read-only AVIFile and Indeo 5 Video for Windows decoding, including
+  cdecl ICDecompress, YUV410P conversion and empty-frame image retention.
+  WinMM waveform output now plays
+  PCM and IMA ADPCM with queued WAVEHDR completion and redirection aliases.
+  Abandoned waveform handles are released before host audio shutdown.
+- Miles digital driver initialization now returns a driver handle, retains
+  preferences and master gain, and decodes named MP3 effects. Optional
+  `[media].cd_tracks` maps disc track numbers to file-backed music, with
+  Ogg/Vorbis added to the packaged FFmpeg build.
+
+- Renderer target pressure waits for completion before accepting new guest
+  writes, preserving incremental HUD updates during ordinary GPU backpressure.
+  Scene-slot capacity now covers the presenter's full target pool.
+- Short x87 arithmetic listings use the instruction bytes to distinguish
+  ST0 and STi destinations, preserving matrix multiplication results.
+- D3D3, Device3, Viewport3 and Material3 expose their versioned ABI, FVF
+  vertex input, texture binding and single-stage texture states. Unsupported
+  vertex-buffer/strided paths return errors with the correct stack cleanup.
+- Ports may opt into `translate.resumable_stacks` when their guest scheduler
+  switches stacks. CALL continuations become dispatch entries and a changed
+  return address unwinds to the entry driver before resuming the guest.
+- Auxiliary modules accept reviewed `entry_points`; runtime discovery records
+  missing DLL code, and each translation filters discoveries to its image.
+  Table recovery also recognizes pre-scaled byte offsets into dword tables.
+- Decorated stdcall imports retain their argument cleanup even before their
+  implementation exists. Startup shims now cover system locale, bounded user
+  name queries and window minimization; unavailable AVI/MCI paths return errors.
+- Auxiliary DLL imports can bind directly to the main executable's code and
+  data exports. Module lookup includes the executable, and GetProcAddress
+  resolves named and ordinal exports with image bounds checks.
+- Opening a predefined registry root with a null or empty subkey succeeds
+  even when the writable profile contains no values for that root.
+
 - On-screen controls replace the split keypad. Every game now starts with a
   PlayStation-styled gamepad as well as the keyboard: two sticks, a dpad,
   ✕○□△, shoulders and triggers, start and select, drawn over the game. A

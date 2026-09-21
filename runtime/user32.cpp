@@ -1547,7 +1547,20 @@ void u_GetMenu(X86 *c) {
     set_eax(c, 0);
 }
 void u_IsIconic(X86 *c) {
-    set_eax(c, 0);
+    Window *w = find_window(arg(c, 0));
+    set_eax(c, w && (w->style & 0x20000000u) ? 1 : 0);
+}
+// CloseWindow minimizes the guest window; DestroyWindow owns its lifetime.
+void u_CloseWindow(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    if (!w) {
+        set_last_error(1400);
+        set_eax(c, 0);
+        return;
+    }
+    w->show_cmd = 2;
+    w->style = (w->style | 0x20000000u) & ~0x01000000u;
+    set_eax(c, 1);
 }
 void u_WaitMessage(X86 *c) {
     // A blocking wait in the original; here a scheduling checkpoint so the
@@ -1743,6 +1756,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "SetFocus", 1, u_SetFocus},
     {"USER32.dll", "GetMenu", 1, u_GetMenu},
     {"USER32.dll", "IsIconic", 1, u_IsIconic},
+    {"USER32.dll", "CloseWindow", 1, u_CloseWindow},
     {"USER32.dll", "SetForegroundWindow", 1, u_SetForegroundWindow},
     {"USER32.dll", "SetActiveWindow", 1, u_SetActiveWindow},
     {"USER32.dll", "OpenClipboard", 1, u_OpenClipboard},

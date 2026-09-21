@@ -26,6 +26,26 @@ def test_stage_layout(tmp_path):
     assert (tmp_path / "out" / "StubRecomp-linux-x86_64.tar.gz").is_file()
 
 
+def test_stage_includes_core_manifests_for_builtin_plugins(tmp_path):
+    exe = tmp_path / "recomp_app"
+    exe.write_bytes(b"\x7fELF")
+    core = tmp_path / "game/mods/core/display"
+    core.mkdir(parents=True)
+    (core / "mod.toml").write_text('id = "sample.display"')
+    (core / "display.c").write_text("source")
+    (core / "display.dylib").write_bytes(b"other platform")
+    cfg = {"game": {"app_name": "StubRecomp", "name": "Stub Game", "executable": "STUB.EXE"}}
+    with patch("platform.machine", return_value="x86_64"):
+        out = package_desktop.stage(exe, cfg, tmp_path / "out", system="Linux",
+                                    game_dir=tmp_path / "game")
+    manifest = out / "resources/mods/core/display/mod.toml"
+    assert manifest.read_text() == 'id = "sample.display"'
+    assert not (manifest.parent / "display.c").exists()
+    assert not (manifest.parent / "display.dylib").exists()
+    with tarfile.open(tmp_path / "out/StubRecomp-linux-x86_64.tar.gz") as tar:
+        assert tar.extractfile("StubRecomp/resources/mods/core/display/mod.toml").read() == manifest.read_bytes()
+
+
 @pytest.mark.parametrize("machine,arch", [("x86_64", "x86_64"), ("AMD64", "x86_64"),
                                          ("aarch64", "aarch64"), ("arm64", "aarch64")])
 def test_linux_archive_contents(tmp_path, monkeypatch, machine, arch):
