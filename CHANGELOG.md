@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Find hash-pinned auxiliary DLLs in their configured installation subfolders
+  after moving a game directory to a mobile device or another computer.
+
 - Initialize settings-page input in the smoke host on its first presented frame,
   matching the app so automated F10 and native Options checks can open the page.
 

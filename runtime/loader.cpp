@@ -295,8 +295,8 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
 // --------------------------------------------------------------------------
 // Auxiliary modules: DLLs game.toml names, mapped beside the main image at
 // their preferred base (no relocation support, as for the image itself) and
-// verified by content hash like it. The runtime finds each one beside the
-// executable, which is where the game would have loaded it from.
+// verified by content hash like it. Preserve configured installation subfolders
+// when the executable and its game directory have moved onto another device.
 // --------------------------------------------------------------------------
 struct AuxSpec {
     const char *name, *path, *sha256;
@@ -311,9 +311,19 @@ bool load_aux_module(const AuxSpec &spec) {
     m.path = dirname_of(g_exe_path) + "/" + spec.name;
     std::vector<uint8_t> file;
     if (!read_file(m.path.c_str(), file)) {
-        // The developer's copy from game.toml, for hosts run against the game tree.
-        m.path = spec.path;
-        if (!read_file(m.path.c_str(), file)) {
+        const std::string root = std::string(RECOMP_DEVELOPER_GAME_DIR) + "/";
+        const std::string configured = spec.path;
+        bool found = false;
+        if (configured.compare(0, root.size(), root) == 0) {
+            m.path = dirname_of(g_exe_path) + "/" + configured.substr(root.size());
+            found = read_file(m.path.c_str(), file);
+        }
+        if (!found) {
+            // Modules kept outside the install still have a developer fallback.
+            m.path = configured;
+            found = read_file(m.path.c_str(), file);
+        }
+        if (!found) {
             g_error =
                 std::string("cannot read auxiliary module ") + spec.name + " beside " + g_exe_path;
             return false;
