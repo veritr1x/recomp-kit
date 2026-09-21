@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep tablet keyboard halves and their KEYS tabs inside the system safe area,
+  including the combined pad-and-keys layout. Controls tracing now records
+  touch routing and keyboard press/release events for device diagnostics.
+
 - Preserve GPU frame color formats when staging them for display. BGRA
   backbuffers no longer have red and blue exchanged by an RGBA staging texture,
   including when a pooled frame switches between GPU and CPU pixel uploads.

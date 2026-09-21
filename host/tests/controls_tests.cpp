@@ -656,6 +656,44 @@ static void center(const Layout &l, int group, int control, const Screen &s, dou
     *y = r.y + r.h / 2.0;
 }
 
+// Tablet keyboard tabs must remain in the touchable safe area even when both
+// halves are collapsed, then reveal keys that can receive a complete press.
+static void test_tablet_keyboard_safe_area() {
+    for (const char *name : {"keys", "pad+keys"}) {
+        Layout l;
+        std::string error;
+        CHECK(parse_layout(builtin_layout(name, Form::Tablet), &l, &error));
+        Screen s = screen(2420, 1668, 2.0);
+        s.safe = {24, 48, 2372, 1572};
+        Router r;
+        Rec rec;
+        r.set_layout(&l, rec);
+        r.set_screen(s);
+        l.groups[0].visible = l.groups[1].visible = false;
+        for (int side = 0; side < 2; ++side) {
+            const Rect tab = control_rect(l, 2, side, s);
+            CHECK(tab.x >= s.safe.x && tab.y >= s.safe.y);
+            CHECK(tab.x + tab.w <= s.safe.x + s.safe.w);
+            CHECK(tab.y + tab.h <= s.safe.y + s.safe.h);
+            CHECK(r.finger_down(1, tab.x + tab.w / 2., tab.y + tab.h / 2., 0, rec));
+            CHECK(r.finger_up(1, 1, rec));
+            CHECK(l.groups[side].visible);
+            for (int c = 0; c < int(l.groups[side].controls.size()); ++c) {
+                const Rect key = control_rect(l, side, c, s);
+                CHECK(key.x >= s.safe.x && key.y >= s.safe.y);
+                CHECK(key.x + key.w <= s.safe.x + s.safe.w);
+                CHECK(key.y + key.h <= s.safe.y + s.safe.h);
+            }
+        }
+        double x, y;
+        center(l, 1, find_key(l, 1, kScanReturn), s, &x, &y);
+        rec.calls.clear();
+        CHECK(r.finger_down(2, x, y, 2, rec));
+        CHECK(r.finger_up(2, 3, rec));
+        CHECK((rec.calls == std::vector<std::string>{"k40+", "tap", "k40-"}));
+    }
+}
+
 static void test_router_space_key() {
     Layout l = keys_layout();
     const Screen s = screen(1180, 820, 1.0);
@@ -3972,6 +4010,7 @@ int main(int argc, char **argv) {
     test_raster_text();
     test_raster_matches_legacy_keypad_pixels();
     test_router_space_key();
+    test_tablet_keyboard_safe_area();
     test_router_latched_shift();
     test_router_left_tab_toggle();
     test_router_gap_is_claimed_silently();
