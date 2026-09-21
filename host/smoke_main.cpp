@@ -27,6 +27,7 @@
 #include "game_config.h"
 #include "script.h"
 #include "script_touch.h"
+#include "controls/vpad.h"
 #include "smoke_dumpat.h"
 #include "landmark.h"
 #include "fixture_view.h"
@@ -1372,6 +1373,28 @@ void run_step(const HostScriptStep &step) {
         // exactly as it would from a real keyboard.
         uint32_t lparam = host_key_lparam(m, step.down != 0, false, step.down == 0);
         post(step.down ? WM_KEYDOWN_ : WM_KEYUP_, m.vk, lparam);
+        break;
+    }
+    case HOST_SCRIPT_PAD: {
+        static controls::PadState pad;
+        const int index = step.button;
+        if (index < 13) {
+            const uint16_t bit = uint16_t(1u << index);
+            pad.buttons = step.x ? pad.buttons | bit : pad.buttons & ~bit;
+            if (index == 6)
+                pad.l2 = float(step.x);
+            if (index == 7)
+                pad.r2 = float(step.x);
+        } else if (index < 17) {
+            const uint8_t bit = uint8_t(1u << (index - 13));
+            pad.hat = step.x ? pad.hat | bit : pad.hat & ~bit;
+        } else {
+            float *axes[] = {&pad.lx, &pad.ly, &pad.rx, &pad.ry, &pad.l2, &pad.r2};
+            *axes[index - 17] = step.x / 32767.0f;
+        }
+        controls::vpad().set_source(controls::kPadSourceTouch, pad);
+        printf("[smoke-pad] control %d value %d packet %u\n", index, step.x,
+               controls::vpad().packet());
         break;
     }
     case HOST_SCRIPT_FOCUS:

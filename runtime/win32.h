@@ -351,6 +351,8 @@ uint32_t host_main_window();              // first created top-level HWND, or 0
 uint32_t host_window_proc(uint32_t hwnd); // guest WNDPROC address, or 0
 bool host_window_rect(uint32_t hwnd, int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 void host_set_client_size(uint32_t hwnd, int32_t w, int32_t h);
+// Host input is in client pixels; GetCursorPos/MSG.pt are screen pixels.
+void host_set_client_cursor_pos(uint32_t hwnd, int32_t x, int32_t y);
 void host_set_key_state(int vk, bool down); // feeds GetAsyncKeyState
 void host_set_cursor_pos(int32_t x, int32_t y);
 // Installs the host's event-loop pump. GetMessageA calls it each time round

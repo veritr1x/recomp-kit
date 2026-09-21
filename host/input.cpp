@@ -511,8 +511,9 @@ void host_input_motion(int32_t x, int32_t y, int32_t dx, int32_t dy) {
     g.y = y;
     g.dx += dx;
     g.dy += dy;
-    // GetCursorPos and the message queue's point field both read this.
-    host_set_cursor_pos(x, y);
+    // GetCursorPos and MSG.pt are screen coordinates. DirectInput and the
+    // mouse messages' lParam stay in client pixels, even for a moved window.
+    host_set_client_cursor_pos(host_main_window(), x, y);
     notify_input_changed();
 }
 

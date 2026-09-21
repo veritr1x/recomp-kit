@@ -28,6 +28,9 @@
 //                            left click world x/z/altitude through the current
 //                            projection; fail if unavailable or outside the view.
 //   key ESCAPE down           by DirectInput scan-code name
+//   pad cross down            virtual pad button (or up); uses the native APIs
+//   pad left_x -32767         stick axis -32767..32767 (+y down)
+//   pad right_trigger 32767   trigger axis 0..32767
 //   dump menu                 write a frame and a scene dump named for this
 //   peek 0x8e0428 179         read guest memory and print it. Addresses may be
 //                             decimal or 0x-hex, and a read is at most 256
@@ -214,6 +217,7 @@ enum HostScriptOp {
     HOST_SCRIPT_ENTITYMOVE,  // same semantic resolution, motion only
     HOST_SCRIPT_WORLDMOVE,
     HOST_SCRIPT_FOCUS, // down: 1 the window gains focus, 0 it loses it
+    HOST_SCRIPT_PAD,   // button: control index; x: button level or axis value
 };
 
 struct HostScriptStep {

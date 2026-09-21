@@ -157,6 +157,12 @@ void host_set_cursor_pos(int32_t x, int32_t y) {
     g_cursor_x = x;
     g_cursor_y = y;
 }
+void host_set_client_cursor_pos(uint32_t hwnd, int32_t x, int32_t y) {
+    int32_t origin_x = 0, origin_y = 0;
+    client_origin(hwnd, &origin_x, &origin_y);
+    host_set_cursor_pos(int32_t(uint32_t(x) + uint32_t(origin_x)),
+                        int32_t(uint32_t(y) + uint32_t(origin_y)));
+}
 void host_set_message_waiter(bool (*fn)()) {
     g_message_waiter = fn;
 }

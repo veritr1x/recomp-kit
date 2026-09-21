@@ -206,6 +206,31 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
                 return fail(line_number, "wait cannot go backwards", ms);
             clock_ms += (uint32_t)v;
             continue; // wait moves the clock, it is not a step
+        } else if (equal_nocase(verb, "pad")) {
+            // PadButton order, then hat directions, then PadState's six axes.
+            static const char *names[] = {
+                "cross",  "circle",  "square",  "triangle",     "l1",           "r1",
+                "l2",     "r2",      "l3",      "r3",           "select",       "start",
+                "ps",     "up",      "right",   "down",         "left",         "left_x",
+                "left_y", "right_x", "right_y", "left_trigger", "right_trigger"};
+            char *control = word(&cursor), *value = word(&cursor);
+            int index = -1;
+            for (int i = 0; control && i < (int)(sizeof names / sizeof names[0]); ++i)
+                if (equal_nocase(control, names[i]))
+                    index = i;
+            if (index < 0 || !value)
+                return fail(line_number, "pad needs a known control and value", control);
+            long v = 0;
+            if (index < 17) {
+                if (!equal_nocase(value, "down") && !equal_nocase(value, "up"))
+                    return fail(line_number, "pad button needs down or up", value);
+                v = equal_nocase(value, "down") ? 1 : 0;
+            } else if (!whole(value, &v) || v < (index < 21 ? -32767 : 0) || v > 32767) {
+                return fail(line_number, "pad axis is outside its range", value);
+            }
+            step.op = HOST_SCRIPT_PAD;
+            step.button = index;
+            step.x = (int32_t)v;
         } else if (equal_nocase(verb, "viewmove") || equal_nocase(verb, "viewclick") ||
                    equal_nocase(verb, "camera")) {
             char *x = word(&cursor);

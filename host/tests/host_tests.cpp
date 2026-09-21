@@ -544,6 +544,24 @@ static void test_script_parsing() {
     for (const char *bad : {"tap 1\n", "tap x 2\n", "tap -1 2\n", "tap 1 2 extra\n"})
         CHECK_EQ(host_script_parse(bad, steps, 64, err, sizeof err), -1);
 
+    CHECK_EQ(host_script_parse("pad cross down\nwait 200\npad cross up\npad left_x -32767\n"
+                               "pad right_trigger 32767\npad right down\n",
+                               steps, 64, err, sizeof err),
+             5);
+    CHECK_EQ(steps[0].op, HOST_SCRIPT_PAD);
+    CHECK_EQ(steps[0].button, 0);
+    CHECK_EQ(steps[0].x, 1);
+    CHECK_EQ(steps[1].x, 0);
+    CHECK_EQ(steps[1].at_ms, 200);
+    CHECK_EQ(steps[2].button, 17);
+    CHECK_EQ(steps[2].x, -32767);
+    CHECK_EQ(steps[3].button, 22);
+    CHECK_EQ(steps[4].button, 14);
+    for (const char *bad :
+         {"pad cross\n", "pad cross 1\n", "pad missing down\n", "pad left_x -32768\n",
+          "pad right_trigger -1\n", "pad left_y 32768\n", "pad cross up extra\n"})
+        CHECK_EQ(host_script_parse(bad, steps, 64, err, sizeof err), -1);
+
     const char *good = "# a comment, and a blank line follow\n"
                        "\n"
                        "wait 500\n"

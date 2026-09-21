@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Convert host mouse and touch positions from client to screen coordinates
+  for GetCursorPos and MSG.pt, fixing click offsets in games whose window
+  starts away from the desktop origin.
+
+- Smoke scripts can drive native virtual-pad buttons, dpad, sticks and
+  triggers through the same DirectInput/XInput adapters as the app.
+
 - Switching from a collapsed keyboard to the pad no longer hides its sticks
   and buttons. Saved hidden bits apply only to groups with a reveal tab.
 

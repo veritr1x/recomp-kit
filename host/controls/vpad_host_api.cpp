@@ -1,8 +1,8 @@
 // vpad_host_api.cpp - the strong host_pad_* callbacks (dx/host_api.h) over the
 // process-wide virtual pad. They override host_api.cpp's weak defaults in the
-// app only: this file needs the generated game_config.h, so the SDL-free
-// controls_tests link vpad.cpp without it, and the headless and smoke hosts
-// keep the "no pad" defaults.
+// app and smoke host: both use the game's generated configuration. The
+// SDL-free controls_tests link vpad.cpp without it, and the headless host
+// keeps the "no pad" defaults.
 // Design: docs/superpowers/specs/2026-09-17-touch-controls-design.md, 7.2-7.4.
 #include "../../dx/host_api.h"
 #include "game_config.h"

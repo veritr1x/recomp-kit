@@ -2199,6 +2199,29 @@ static void test_windows(X86 *c) {
     check(host_main_window() == hwnd, "host_main_window sees it");
     check(host_window_proc(hwnd) == wndproc, "the class WNDPROC was recorded");
 
+    // A touch at a client point must survive the game's GetCursorPos ->
+    // ScreenToClient round trip, including negative desktop origins.
+    uint32_t touch_point = scratch_block(8);
+    for (int32_t origin : {100, -100}) {
+        call_import(c, "USER32.dll", "SetWindowPos",
+                    {hwnd, 0, uint32_t(origin), uint32_t(origin), 640, 480, 0});
+        host_set_client_cursor_pos(hwnd, 320, 240);
+        call_import(c, "USER32.dll", "GetCursorPos", {touch_point});
+        check(int32_t(rd32(touch_point)) == 320 + origin &&
+                  int32_t(rd32(touch_point + 4)) == 240 + origin,
+              "host client cursor is converted to screen coordinates at origin %d", origin);
+        call_import(c, "USER32.dll", "ScreenToClient", {hwnd, touch_point});
+        check(rd32(touch_point) == 320 && rd32(touch_point + 4) == 240,
+              "touch round trip returns the requested client point");
+        host_post_message(hwnd, 0x0200, 0, (240u << 16) | 320u);
+        call_import(c, "USER32.dll", "PeekMessageA", {msgbuf, hwnd, 0x0200, 0x0200, 1});
+        check(int32_t(rd32(msgbuf + 20)) == 320 + origin &&
+                  int32_t(rd32(msgbuf + 24)) == 240 + origin &&
+                  rd32(msgbuf + 12) == ((240u << 16) | 320u),
+              "MSG.pt is in screen pixels while mouse lParam stays in client pixels");
+    }
+    call_import(c, "USER32.dll", "SetWindowPos", {hwnd, 0, 0, 0, 640, 480, 0});
+
     uint32_t rc = scratch_block(16);
     call_import(c, "USER32.dll", "GetClientRect", {hwnd, rc});
     check(rd32(rc + 8) == 640 && rd32(rc + 12) == 480, "GetClientRect -> %ux%u", rd32(rc + 8),
