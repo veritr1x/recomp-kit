@@ -2113,6 +2113,9 @@ extern "C" void host_set_display_mode(int w, int h, int bpp) {
 // Capture and UI instrumentation operate on copies, preserving the game surface.
 extern "C" void host_present(const void *pixels, int w, int h, int bpp, const uint32_t *palette,
                              int pitch) {
+    // Match the app's first-present initialization so scripted F10 presses
+    // reach the settings page even when the scene has no CPU pixels.
+    host_page_overlay(nullptr, 0, 0, 0, 0, nullptr);
     if (bpp == 8 || bpp == 16)
         boot_note_primary_present();
     ++g_presents;

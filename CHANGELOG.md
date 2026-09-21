@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Initialize settings-page input in the smoke host on its first presented frame,
+  matching the app so automated F10 and native Options checks can open the page.
+
 - Update held on-screen stick knobs independently of their bases and touch
   zones. Stick motion now reaches the presenter without rebuilding the cached
   control backgrounds.
