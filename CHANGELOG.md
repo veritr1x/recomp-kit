@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Update held on-screen stick knobs independently of their bases and touch
+  zones. Stick motion now reaches the presenter without rebuilding the cached
+  control backgrounds.
+
 - Keep touch and mouse coordinates in the game's logical resolution when
   Direct3D 9 renders at a higher resolution. Supersampling no longer moves
   clicks and cursors beyond the game's window.

@@ -27,6 +27,8 @@
 #include "test_frame_builder.h"
 #include "../page_overlay.h"
 #include "../performance_overlay.h"
+#include "../controls/overlay.h"
+#include "../controls/router.h"
 #include "../../runtime/frame_deadline.h"
 #include "../audio_capture.h"
 #include "../midi.h"
@@ -9263,6 +9265,86 @@ static void test_pointer_reaches_scrolling_edges() {
     test_scene_width = 0;
     memcpy(gm_ptr(base), saved, sizeof saved);
 }
+// Match the host's revision-gated publication, then check the actual GPU
+// output: dragging moves only the knob, keeping the base and touch zone put.
+static void test_native_stick_motion_pixels() {
+    struct Sink : controls::ControlsSink {
+        void key(int, bool) override {}
+        void action(const std::string &) override {}
+        void switch_layout(const std::string &) override {}
+        void group_visibility_changed() override {}
+        void tap() override {}
+    } sink;
+    auto device = gpu::create_default_device();
+    CHECK(device != nullptr);
+    if (!device)
+        return;
+    constexpr int w = 640, h = 480;
+    gpu::Texture target = device->create_texture(
+        {w, h, gpu::Format::RGBA8, gpu::UsageRenderTarget | gpu::UsageSampled | gpu::UsageCpu, 1});
+    const controls::Screen screen{w, h, 1.0, {0, 0, w, h}, {}};
+    for (bool floating : {false, true}) {
+        controls::Layout layout;
+        controls::Control stick;
+        stick.kind = controls::Kind::Stick;
+        stick.anchor = controls::Anchor::TopLeft;
+        stick.x = 100;
+        stick.y = 100;
+        stick.w = stick.h = 280;
+        stick.radius = 70;
+        stick.floating = floating;
+        controls::Group group;
+        group.controls.push_back(stick);
+        layout.groups.push_back(group);
+        controls::Router router;
+        router.set_layout(&layout, sink);
+        router.set_screen(screen);
+        CHECK(router.finger_down(1, 240, 240, 0, sink));
+        controls::ControlsView published;
+        controls::Overlay overlay;
+        auto render = [&] {
+            const auto next = controls::make_view(layout, router, screen, 1.0);
+            if (next.revision != published.revision)
+                published = next;
+            std::vector<uint8_t> pixels(w * h * 4, 40);
+            device->upload(target, {0, 0, w, h}, pixels.data(), w * 4);
+            auto cb = device->begin();
+            overlay.draw(device.get(), cb, target, w, h, published);
+            device->commit(cb);
+            device->wait(cb);
+            CHECK(device->status(cb) == gpu::CommandStatus::Completed);
+            device->readback(target, {0, 0, w, h}, pixels.data(), w * 4);
+            return pixels;
+        };
+        auto before = render();
+        CHECK(router.finger_motion(1, 310, 240, 1, sink));
+        auto after = render();
+        int changed = 0, outside_knobs = 0;
+        // The knob radius is 0.45 * travel. Give antialiasing two pixels;
+        // everything outside the old/new knob bounds must remain identical.
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (y * w + x) * 4;
+                if (memcmp(&before[i], &after[i], 4) == 0)
+                    continue;
+                ++changed;
+                if (y < 206 || y > 274 || x < 206 || x > 344)
+                    ++outside_knobs;
+            }
+        CHECK(changed > 1000);
+        CHECK_EQ(outside_knobs, 0);
+        CHECK(published.controls[0].knob_x == 1.0);
+        CHECK(published.controls[0].base_x == 240);
+        CHECK(published.controls[0].base_y == 240);
+        CHECK_EQ(published.controls[0].rect.x, 100);
+        CHECK_EQ(published.controls[0].rect.y, 100);
+        CHECK(router.finger_up(1, 2, sink));
+        auto released = render();
+        CHECK(released != after);
+    }
+    device->destroy(target);
+}
+
 static void test_native_overlay_pixels() {
     auto device = gpu::create_default_device();
     CHECK(device != nullptr);
@@ -9616,6 +9698,7 @@ int main(int argc, char **argv) {
     test_wide_cursor_bound();
     test_pointer_reaches_scrolling_edges();
     test_native_overlay_pixels();
+    test_native_stick_motion_pixels();
     // Focused headless validation when the sandbox cannot create audio/Metal
     // services. The default suite still runs every test and reports failures.
     if (argc == 2 && !strcmp(argv[1], "--script-only")) {

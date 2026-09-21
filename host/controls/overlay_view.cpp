@@ -177,6 +177,17 @@ ControlsView make_view(const Layout &l, const Router &r, const Screen &s, double
         v.layers[i].revision = hashes[i].h;
         h.num(int64_t(hashes[i].h));
     }
+    // Knobs are separate GPU quads, so motion must publish a fresh view even
+    // though every cached layer raster stays valid. Otherwise controls_host
+    // drops the moved view and the presenter keeps the finger-down position.
+    for (size_t i = 0; i < v.controls.size(); ++i) {
+        const DrawControl &d = v.controls[i];
+        if (d.kind == Kind::Stick && d.pressed) {
+            h.num(int64_t(i));
+            h.real(d.knob_x);
+            h.real(d.knob_y);
+        }
+    }
     v.revision = h.h;
     return v;
 }

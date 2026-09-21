@@ -78,8 +78,9 @@ struct ControlsView {
 // is toggles-only (an auto-hidden layout), only the toggles and no
 // backdrops. Each layer's `revision` is a hash of what Overlay draws in it,
 // so two calls that would draw the same pixels return the same revisions,
-// and a change nothing draws (a plain key's press, a knob's offset) forces
-// no new raster. The view's own `revision` combines them all.
+// and a plain key's press or a separate knob quad's offset forces no new
+// raster. The view's own `revision` combines the layers and held knob
+// positions, so the presenter still receives every visible stick movement.
 ControlsView make_view(const Layout &l, const Router &r, const Screen &s, double opacity);
 
 // The open editor's own view: the layout it is editing (every group, hidden

@@ -2322,7 +2322,7 @@ static void test_hidden_keyboard_does_not_hide_pad_after_switch() {
     }
 }
 
-// A held stick's knob is its own quad, so moving it keeps the revision; a
+// A held stick's knob is its own quad, so moving it keeps the layer revision; a
 // button press, the dpad's hat and a floating base's move are drawn, so
 // they change it. radius_px follows the layout and screen scale.
 static void test_make_view_pad_revision() {
@@ -2353,12 +2353,23 @@ static void test_make_view_pad_revision() {
     const uint64_t idle = v.revision;
 
     CHECK(r.finger_down(1, sr.x + 100, sr.y + 100, 0, rec));
-    const uint64_t held = make_view(l, r, s, 1.0).revision;
+    const ControlsView held_view = make_view(l, r, s, 1.0);
+    const uint64_t held = held_view.revision;
     CHECK(held != idle); // the base moved to the finger and lit
     CHECK(r.finger_motion(1, sr.x + 300, sr.y + 100, 1, rec));
     v = make_view(l, r, s, 1.0);
     CHECK(v.controls[stick].knob_x > 0.5);
-    CHECK(v.revision == held); // only the knob moved
+    CHECK(v.revision != held); // publish the moving knob to the presenter
+    CHECK(v.controls[stick].base_x == held_view.controls[stick].base_x);
+    CHECK(v.controls[stick].base_y == held_view.controls[stick].base_y);
+    CHECK(v.controls[stick].rect.x == sr.x && v.controls[stick].rect.y == sr.y);
+    for (size_t i = 0; i < v.layers.size(); ++i)
+        CHECK(v.layers[i].revision == held_view.layers[i].revision); // reuse every raster
+    const uint64_t moved = v.revision;
+    CHECK(r.finger_motion(1, sr.x + 300, sr.y + 200, 1, rec));
+    v = make_view(l, r, s, 1.0);
+    CHECK(v.revision != moved);                            // vertical motion must publish too
+    CHECK(make_view(l, r, s, 1.0).revision == v.revision); // stationary: no new view
     CHECK(r.finger_up(1, 2, rec));
     CHECK(make_view(l, r, s, 1.0).revision == idle);
 
