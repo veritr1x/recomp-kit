@@ -586,7 +586,8 @@ void host_pump(uint64_t now) {
         g_enabled = enabled;
         g_router.set_enabled(enabled, g_sink);
     }
-    // An auto-hidden layout keeps only its toggles, so the player can switch.
+    // An auto-hidden layout keeps only layout-switch toggles; group HIDE/KEYS
+    // tabs disappear with the controls they would otherwise toggle.
     const bool shown =
         enabled && layout_wanted(g_content, !(g_keyboard_absent || forced), g_controller_present,
                                  mods_controls_value(CONTROLS_PAD_WITH_CONTROLLER_ROW) != 0, false);

@@ -65,10 +65,10 @@ class Router {
     void set_enabled(bool on, ControlsSink &sink);
     bool enabled() const;
     // true: the active layout is auto-hidden (controls_host.cpp) but its
-    // toggles stay live so the player can switch. finger_down then hits only
-    // Toggle controls (no gaps, no other kinds), make_view draws only the
-    // toggles, and turning it on releases every finger held, exactly as
-    // cancel_all() would. The claim area (portrait) is still claimed.
+    // layout-switch toggles stay live so the player can switch. Group toggles,
+    // keys, gaps and the portrait claim area pass through, and make_view draws
+    // only layout switches. Turning it on releases every finger held, exactly
+    // as cancel_all() would, without changing saved group visibility.
     void set_toggles_only(bool on, ControlsSink &sink);
     bool toggles_only() const;
     // True when the finger belongs to the controls (the caller must not give it to TouchMapper).

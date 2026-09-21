@@ -2288,7 +2288,7 @@ static void test_make_view_pad_revision() {
 static void dump_form(const char *dir, Form form, const Screen &s) {
     const int dw = s.dw, dh = s.dh;
     for (const char *name : {"pad", "keys", "pad+keys"}) {
-        for (int held = 0; held < 2; ++held) {
+        for (int held = 0; held < 3; ++held) {
             Layout l;
             std::string err;
             if (!builtin_layout(name, form) || !parse_layout(builtin_layout(name, form), &l, &err))
@@ -2297,7 +2297,9 @@ static void dump_form(const char *dir, Form form, const Screen &s) {
             Rec rec;
             r.set_layout(&l, rec);
             r.set_screen(s);
-            if (held) {
+            if (held == 2) {
+                r.set_toggles_only(true, rec);
+            } else if (held) {
                 // Push the first stick up-right, press the first dpad down
                 // and every other L2/R2/cross.
                 int64_t id = 1;
@@ -2328,7 +2330,8 @@ static void dump_form(const char *dir, Form form, const Screen &s) {
                                d.base_y + d.knob_y * d.radius_px, knob_radius(d.radius_px), true);
             char tail[64];
             snprintf(tail, sizeof tail, ".%s.%dx%d.rgba", form_name(form), dw, dh);
-            std::string file = std::string(dir) + "/" + name + (held ? "-held" : "-idle") + tail;
+            const char *state = held == 2 ? "-auto-hidden" : held ? "-held" : "-idle";
+            std::string file = std::string(dir) + "/" + name + state + tail;
             for (char &ch : file)
                 if (ch == '+')
                     ch = '_';
@@ -2592,8 +2595,8 @@ static void test_layout_content() {
     CHECK(layout_content(tabs) == LayoutContent::Keys);
 }
 
-// A hidden layout keeps only its toggles: keys are not hit (the finger goes
-// to the game), a toggle still is, and make_view draws only the toggles.
+// Auto-hide leaves only the layout switch. Keys and their HIDE/KEYS tabs
+// pass through without changing saved visibility; disconnecting restores them.
 static void test_router_toggles_only() {
     Layout l = keys_layout();
     const Screen s = screen(1180, 820, 1.0);
@@ -2620,29 +2623,73 @@ static void test_router_toggles_only() {
     (void)left;
 
     center(l, 2, 0, s, &x, &y);
+    CHECK(!r.finger_down(4, x, y, 20, rec));
+    CHECK(rec.calls.empty());
+    CHECK(l.groups[0].visible && l.groups[1].visible);
+    center(l, 2, 2, s, &x, &y);
     CHECK(r.finger_down(4, x, y, 20, rec));
-    CHECK((rec.calls == std::vector<std::string>{"vis", "tap"}));
+    CHECK((rec.calls == std::vector<std::string>{"sw:next", "tap"}));
     CHECK(r.finger_up(4, 30, rec));
 
     ControlsView v = make_view(l, r, s, 1.0);
-    CHECK(v.controls.size() == 3); // two HIDE tabs and the layout-cycle tab
+    CHECK(v.controls.size() == 1); // only the layout-cycle tab
     CHECK(v.backdrops.empty());
     for (const DrawControl &d : v.controls)
-        CHECK(d.kind == Kind::Toggle);
+        CHECK(d.kind == Kind::Toggle && d.label == "PAD");
 
     // Portrait: the controls strip is not filled behind the lone tabs.
     Screen portrait = s;
     portrait.controls_area = Rect{0, 400, 1180, 420};
     CHECK(make_view(l, r, portrait, 1.0).controls_area.empty());
+    r.set_claim_area(portrait.controls_area);
+    CHECK(!r.finger_down(6, 590, 600, 30, rec));
     r.set_toggles_only(false, rec);
     CHECK(!make_view(l, r, portrait, 1.0).controls_area.empty());
+    CHECK(r.finger_down(6, 590, 600, 30, rec));
+    CHECK(r.finger_up(6, 31, rec));
     r.set_toggles_only(true, rec);
 
     r.set_toggles_only(false, rec);
     center(l, 1, find_key(l, 1, kScanSpace), s, &x, &y);
     CHECK(r.finger_down(5, x, y, 40, rec));
     v = make_view(l, r, s, 1.0);
-    CHECK(v.controls.size() > 2);
+    CHECK(count_kind(v, Kind::Key) == 77);
+    CHECK(count_kind(v, Kind::Toggle) == 3);
+}
+
+// Every built-in form has a usable layout switch while auto-hidden, with
+// neither HIDE nor KEYS tabs for individual keyboard halves left behind.
+static void test_auto_hidden_layouts_keep_only_layout_switches() {
+    for (Form form : {Form::Tablet, Form::PhoneLandscape, Form::PhonePortrait}) {
+        const Screen s = form == Form::Tablet           ? screen(2360, 1640, 2.0)
+                         : form == Form::PhoneLandscape ? screen(2532, 1170, 3.0)
+                                                        : screen(1170, 2532, 3.0);
+        for (const char *name : {"pad", "keys", "pad+keys"}) {
+            Layout l;
+            std::string error;
+            CHECK(parse_layout(builtin_layout(name, form), &l, &error));
+            Router r;
+            Rec rec;
+            r.set_layout(&l, rec);
+            r.set_screen(s);
+            // A previously hidden group remains hidden across auto-hide.
+            l.groups[0].visible = false;
+            const std::string saved = write_layout(l);
+            r.set_toggles_only(true, rec);
+            const ControlsView v = make_view(l, r, s, 1.0);
+            CHECK(v.controls.size() == 1);
+            CHECK(v.backdrops.empty());
+            if (v.controls.size() == 1) {
+                const Rect box = v.controls[0].rect;
+                CHECK(r.finger_down(1, box.x + box.w / 2.0, box.y + box.h / 2.0, 0, rec));
+                CHECK((rec.calls == std::vector<std::string>{"sw:next", "tap"}));
+                CHECK(r.finger_up(1, 1, rec));
+            }
+            r.set_toggles_only(false, rec);
+            CHECK(write_layout(l) == saved);
+            CHECK(make_view(l, r, s, 1.0).controls.size() > 1);
+        }
+    }
 }
 
 // Trigger edges carry the trigger's 0..32767 value, never a signed one: the
@@ -3983,6 +4030,7 @@ int main(int argc, char **argv) {
     test_layout_wanted_truth_table();
     test_layout_content();
     test_router_toggles_only();
+    test_auto_hidden_layouts_keep_only_layout_switches();
     test_vpad_trigger_edges();
     test_rumble_router_controller_refresh();
     test_rumble_router_device_refresh();
