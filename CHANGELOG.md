@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve GPU frame color formats when staging them for display. BGRA
+  backbuffers no longer have red and blue exchanged by an RGBA staging texture,
+  including when a pooled frame switches between GPU and CPU pixel uploads.
+
 - Auto-hidden touch controls no longer leave HIDE/KEYS buttons on screen
   when a hardware keyboard or controller suppresses the layout. The layout
   switch stays available, touches through hidden controls reach the game,

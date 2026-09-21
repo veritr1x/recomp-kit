@@ -1274,16 +1274,20 @@ bool host_present_stage_texture(gpu::Texture src, int w, int h, gpu::CommandBuff
     auto s = active.load();
     if (!s || s->fake || !src || !cb || w <= 0 || h <= 0)
         return false;
+    // A GPU blit copies bytes, not colors. Keep the source format so BGRA
+    // backbuffers are not sampled as RGBA, including when a frame slot is reused.
+    const auto format = s->device->describe(src).format;
     s->acquire(w, h, 0, 0);
     std::lock_guard lock(s->mutex);
     if (s->stop || !s->writing || !s->writing->target)
         return false;
     auto &t = *s->writing->target;
     t.device = s->device;
-    if (!t.pixels || t.pixels_w != w || t.pixels_h != h) {
+    if (!t.pixels || t.pixels_w != w || t.pixels_h != h || t.pixels_format != format) {
         if (t.pixels)
             s->device->destroy(t.pixels);
-        t.pixels = s->texture(w, h);
+        t.pixels = s->texture(w, h, format);
+        t.pixels_format = format;
         t.pixels_w = w;
         t.pixels_h = h;
     }

@@ -5620,6 +5620,52 @@ static void test_presenter_real_offscreen(D3DRenderer *renderer) {
     host_present_stop();
 }
 
+// GPU copies preserve their source byte order, including when a pooled frame
+// switches between Direct3D's BGRA and the CPU/2D paths' RGBA pixels.
+static void test_presenter_gpu_color_order(D3DRenderer *) {
+    host_present_start_offscreen(2, 2);
+    const uint8_t rgba[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 207, 193, 51, 255};
+    uint8_t bgra[16];
+    for (int i = 0; i < 4; ++i) {
+        bgra[i * 4] = rgba[i * 4 + 2];
+        bgra[i * 4 + 1] = rgba[i * 4 + 1];
+        bgra[i * 4 + 2] = rgba[i * 4];
+        bgra[i * 4 + 3] = 255;
+    }
+    // Four frames per path exercise every slot, then reuse them at the same
+    // dimensions with a different format (a resize alone cannot catch this).
+    for (uint64_t id = 1; id <= 16; ++id) {
+        const unsigned path = unsigned((id - 1) / 4);
+        gpu::Texture source{};
+        if (path == 3) {
+            host_present_stage_rgba(rgba, 2, 2);
+        } else {
+            const auto format = path == 1 ? gpu::Format::RGBA8 : gpu::Format::BGRA8;
+            source = g_gpu->create_texture({2, 2, format, gpu::UsageSampled | gpu::UsageCpu});
+            CHECK(bool(source));
+            CHECK(g_gpu->upload(source, {0, 0, 2, 2}, path == 1 ? rgba : bgra, 8));
+            auto cb = g_gpu->begin();
+            CHECK(host_present_stage_texture(source, 2, 2, cb));
+            g_gpu->commit(cb);
+            g_gpu->wait(cb);
+        }
+        const uint64_t before = host_present_unique_completed();
+        host_present_test_seal(id, HOST_SCREEN_MENU, false);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (host_present_unique_completed() == before &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK_EQ(host_present_unique_completed(), before + 1);
+        uint8_t shown[16]{};
+        CHECK(host_present_test_read_rgba(shown, sizeof shown));
+        for (int i = 0; i < 16; ++i)
+            CHECK_EQ(shown[i], rgba[i]);
+        if (source)
+            g_gpu->destroy(source);
+    }
+    host_present_stop();
+}
+
 // The Direct3D 11 hardware path's host side on the real device: a texture
 // drawn a texel a pixel into a cleared target, then blended; read back, and
 // published through the presenter as a window frame.
@@ -9634,6 +9680,7 @@ int main(int argc, char **argv) {
             void (*fn)(D3DRenderer *);
         } gpu[] = {
             {"offscreen presenter", test_presenter_real_offscreen},
+            {"presenter GPU color order", test_presenter_gpu_color_order},
             {"Direct3D 11 hardware path", test_gpu2d_pixels},
             {"presenter world and overlay", test_presenter_incremental_world_and_overlay},
             {"wide scene clipping", test_wide_scene_pixels},
