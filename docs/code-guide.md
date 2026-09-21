@@ -74,3 +74,13 @@ Major function comments describe these contracts where they are implemented.
 Keep them synchronized when changing behavior. Prefer a focused regression in
 that module's tests over copying a large gameplay scenario for a small helper.
 See [Testing](testing.md) for the available suites and their limits.
+
+Games whose mouse cursor does not use the default guest layout can implement
+`recomp_pointer_place` from `runtime/native_seam.h` in their native sources.
+The host calls it for absolute touch placement with compositor-mapped logical
+coordinates and canvas dimensions, while holding the guest scheduler baton.
+Return zero when no recognized cursor is live. A successful adapter owns the
+cursor write and any game-cached deltas; `dinput_discard_mouse_motion` can clear
+already sampled X/Y for its mouse interface. The host then clears unsampled
+X/Y. Neither operation releases buttons or consumes the wheel. Physical mouse
+motion and games without an adapter retain their existing paths.

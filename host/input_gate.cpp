@@ -5,6 +5,7 @@
 #include "../runtime/win32.h"
 #include "../runtime/guest.h"
 #include "../runtime/display_seam.h"
+#include "../runtime/native_seam.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -986,6 +987,18 @@ extern "C" void host_input_pointer_correction(int32_t *dx, int32_t *dy) {
 bool host_gate_pointer_place(int32_t x, int32_t y) {
     if (!g_mem)
         return false;
+    const auto mapped = host_gate_hit_test(nullptr, x, y);
+    if (mapped.kind == HitResult::HIT_NONE || mods_page_visible() ||
+        host_gate_motion(mapped.gx, mapped.gy, 0, 0))
+        return false;
+    if (recomp_pointer_place(mapped.gx, mapped.gy, g_layout.guest_w, g_layout.guest_h)) {
+        // The adapter placed the cursor directly; replaying its relative
+        // motion on the next DirectInput read would move it a second time.
+        host_input_discard_motion();
+        g_loop_expect_valid = false;
+        g_pointer_target_valid = false;
+        return true;
+    }
     const auto p = host_guest_pointer_resolve(g_mem, GUEST_SIZE, RECOMP_HOOK_MOUSE_DEVICE_PTR);
     if (p.failure != HostGuestPointer::None)
         return false;

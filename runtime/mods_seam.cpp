@@ -3,6 +3,7 @@
 // mods_seam.cpp - the weak defaults. Each one is what an unmodded build does.
 #include "mods_seam.h"
 #include "display_seam.h"
+#include "native_seam.h"
 
 extern "C" {
 
@@ -15,6 +16,11 @@ __attribute__((weak)) int host_display_screen_size(int *, int *) {
 __attribute__((weak)) int ddraw_add_mode(int, int, int) {
     return 0;
 }
+__attribute__((weak)) int recomp_pointer_place(int32_t, int32_t, int32_t, int32_t) {
+    return 0;
+}
+// Native cursor adapters can also be linked into hosts with no input devices.
+__attribute__((weak)) void dinput_discard_mouse_motion(uint32_t) {}
 
 __attribute__((weak)) bool mods_load_all(void) {
     return true;

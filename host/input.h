@@ -58,6 +58,8 @@ void host_input_button(int button, bool down);
 // relative motion DirectInput reports, which is not the difference between
 // two clamped positions and so is passed through separately.
 void host_input_motion(int32_t x, int32_t y, int32_t dx, int32_t dy);
+// Absolute touch placement has consumed X/Y motion, but not buttons or wheel.
+void host_input_discard_motion();
 void host_input_wheel(int32_t dz);
 // The window lost the focus: every key and button is released, because a key
 // that goes up while another application has the focus is never seen here and

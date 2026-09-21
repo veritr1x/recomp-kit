@@ -5,6 +5,7 @@
  */
 #pragma once
 #include <stddef.h>
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +26,18 @@ int recomp_readable_path(const char *guest_path, char *out, size_t out_len);
 
 /* Offer a DirectDraw display mode, as the host does for its own modes. */
 int ddraw_add_mode(int w, int h, int bpp);
+
+/* Optional game adapter for absolute touch placement. Coordinates and canvas
+ * size are logical game pixels after the compositor's mapping. Called only
+ * with the guest scheduler baton. Return non-zero only after placing a live
+ * cursor; zero retains the host's existing fallback. Physical mouse motion
+ * does not call this adapter. */
+int recomp_pointer_place(int32_t x, int32_t y, int32_t width, int32_t height);
+
+/* Discard already sampled X/Y motion for a DirectInput mouse after absolute
+ * placement. The argument is its guest interface address. Buttons, wheel and
+ * keyboard input are retained. Requires the guest scheduler baton. */
+void dinput_discard_mouse_motion(uint32_t device);
 
 #ifdef __cplusplus
 }

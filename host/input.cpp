@@ -517,6 +517,10 @@ void host_input_motion(int32_t x, int32_t y, int32_t dx, int32_t dy) {
     notify_input_changed();
 }
 
+void host_input_discard_motion() {
+    g.dx = g.dy = 0;
+}
+
 void host_input_wheel(int32_t dz) {
     g.dz += dz;
     notify_input_changed();

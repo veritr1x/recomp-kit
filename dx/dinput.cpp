@@ -14,9 +14,11 @@
 #include "host_api.h"
 #include "../runtime/memory.h"
 #include "../runtime/win32.h"
+#include "../runtime/native_seam.h"
 
 #include <string.h>
 #include <iterator>
+#include <algorithm>
 #include "../platform/os.h"
 
 #define IID_BYTES(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                         \
@@ -1055,6 +1057,23 @@ const ImportShim g_dinput_exports[] = {
 };
 
 } // namespace
+
+extern "C" void dinput_discard_mouse_motion(uint32_t device) {
+    ComObj *mouse = device ? com_this(device) : nullptr;
+    if (!mouse || mouse->kind != K_DIDEVICE || mouse->dev_type != DIDEVTYPE_MOUSE)
+        return;
+    // A keyboard poll may already have drained the host's motion into this
+    // shared accumulator; a mouse Poll may also have queued it on the device.
+    g_host_in.acc_dx = g_host_in.acc_dy = 0;
+    mouse->last_x = mouse->last_y = 0;
+    auto &events = mouse->events;
+    events.erase(std::remove_if(events.begin(), events.end(),
+                                [](uint32_t event) {
+                                    return event_ofs(event) == DIMOFS_X ||
+                                           event_ofs(event) == DIMOFS_Y;
+                                }),
+                 events.end());
+}
 
 // Called by the host after it has fed new mouse or keyboard state through
 // host_input_state. Signals every device that registered a notification event,

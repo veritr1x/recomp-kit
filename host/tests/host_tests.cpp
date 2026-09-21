@@ -1,6 +1,7 @@
 #include "game_config.h"
 #include "../texture_pack.h"
 #include "../../runtime/display_seam.h"
+#include "../../runtime/native_seam.h"
 #include "../../dx/passes.h"
 // host_tests.mm - headless tests for the macOS host.
 //
@@ -8266,6 +8267,56 @@ static void test_t9_guest_pointer_resolution() {
 // A layout rescale must never leave the virtual pointer off the frame, and an
 // off-frame pointer must not be corrected from: both produced a target at the
 // bottom-right corner, which is what the user saw as the cursor snapping away.
+static bool native_place_enabled;
+static int native_place_calls, native_place_x, native_place_y, native_place_w, native_place_h;
+extern "C" int recomp_pointer_place(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!native_place_enabled)
+        return 0;
+    ++native_place_calls;
+    native_place_x = x;
+    native_place_y = y;
+    native_place_w = w;
+    native_place_h = h;
+    return 1;
+}
+
+static void test_native_touch_placement() {
+    host_gate_reset();
+    host_input_reset();
+    host_pointer_set_mode(1280, 720);
+    host_gate_fallback_layout(2560, 1600); // 80-pixel top/bottom letterbox
+    native_place_enabled = true;
+    native_place_calls = 0;
+    host_input_motion(900, 180, 300, -50);
+    host_input_button(0, true);
+    host_input_key(0x00, true); // A
+    host_input_wheel(120);
+    CHECK(host_gate_pointer_place(1800, 440));
+    CHECK_EQ(native_place_calls, 1);
+    CHECK_EQ(native_place_x, 900);
+    CHECK_EQ(native_place_y, 180);
+    CHECK_EQ(native_place_w, 1280);
+    CHECK_EQ(native_place_h, 720);
+    HostInputState state{};
+    host_input_state(&state);
+    CHECK_EQ(state.mouse_dx, 0);
+    CHECK_EQ(state.mouse_dy, 0);
+    CHECK_EQ(state.mouse_dz, 120);
+    CHECK_EQ(state.mouse_buttons[0], 0x80);
+    CHECK_EQ(state.keys[0x1e], 0x80);
+    g_page_draws = true;
+    CHECK(!host_gate_pointer_place(300, 300));
+    g_page_draws = false;
+    CHECK(!host_gate_pointer_place(-100, 300));
+    CHECK_EQ(native_place_calls, 1);
+    HitResult hit;
+    host_gate_window_motion(1600, 600, 0, 0, &hit);
+    CHECK_EQ(native_place_calls, 1); // Physical motion stays relative.
+    native_place_enabled = false;
+    host_gate_reset();
+    host_input_reset();
+}
+
 static void test_t9_pointer_survives_layout_rescale() {
     constexpr uint32_t base = RECOMP_HOOK_MOUSE_DEVICE_PTR;
     uint8_t saved[0x48];
@@ -9787,6 +9838,7 @@ int main(int argc, char **argv) {
         return g_failures ? 1 : 0;
     }
     if (argc == 2 && strcmp(argv[1], "--t9-input") == 0) {
+        test_native_touch_placement();
         test_t9_guest_pointer_resolution();
         test_t9_hits_and_drag();
         test_t9_snapshot_capture_edges_cursor();
@@ -9836,6 +9888,7 @@ int main(int argc, char **argv) {
         {"T9 hits and drag", test_t9_hits_and_drag},
         {"T9 capture edges cursor", test_t9_snapshot_capture_edges_cursor},
         {"T9 relative and mailbox", test_t9_relative_crossing_and_layout_mailbox},
+        {"native touch placement", test_native_touch_placement},
         {"T9 guest pointer resolution", test_t9_guest_pointer_resolution},
         {"T9 pointer closed loop", test_t9_pointer_closed_loop},
         {"T9 window motion round1", test_t9_window_motion_round1},

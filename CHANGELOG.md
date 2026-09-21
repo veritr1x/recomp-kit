@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Allow native game adapters to place their own cursors at absolute touch
+  positions in logical game pixels. Placement can discard pending DirectInput
+  X/Y movement without losing button, wheel or keyboard input.
+
 - Notify exclusive DirectDraw windows when the display mode is set, including
   a return to the same size after a movie, so their menu presentation bounds
   are refreshed instead of leaving the screen black.
