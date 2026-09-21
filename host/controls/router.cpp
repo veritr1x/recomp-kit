@@ -132,12 +132,14 @@ bool Router::finger_down(int64_t id, double px, double py, uint64_t now_ns, Cont
     if (!enabled_ || !layout_)
         return false;
     Hit h = hit_test(*layout_, screen_, px, py);
-    // A hidden layout's toggles are the only thing left to hit.
+    // Auto-hide leaves only layout switches live. Group toggles cannot show
+    // their keys while hardware keeps the layout hidden, and must pass through.
     if (toggles_only_ && h.group >= 0 &&
-        (h.gap || layout_->groups[h.group].controls[h.control].kind != Kind::Toggle))
+        (h.gap || layout_->groups[h.group].controls[h.control].kind != Kind::Toggle ||
+         group_named(*layout_, layout_->groups[h.group].controls[h.control].target) >= 0))
         h = Hit();
     if (h.group < 0) {
-        if (!claim_area_.contains(px, py))
+        if (toggles_only_ || !claim_area_.contains(px, py))
             return false; // the game's own area
         fingers_[id] = Owned{-1, -1, true};
         return true; // the controls area: claimed, and does nothing

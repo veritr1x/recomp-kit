@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Auto-hidden touch controls no longer leave HIDE/KEYS buttons on screen
+  when a hardware keyboard or controller suppresses the layout. The layout
+  switch stays available, touches through hidden controls reach the game,
+  and disconnecting restores the player's saved keyboard visibility.
+
 - On-screen controls replace the split keypad. Every game now starts with a
   PlayStation-styled gamepad as well as the keyboard: two sticks, a dpad,
   ✕○□△, shoulders and triggers, start and select, drawn over the game. A
