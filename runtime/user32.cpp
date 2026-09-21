@@ -452,13 +452,13 @@ void u_UpdateWindow(X86 *c) {
 // SetWindowPos's body, shared with the runtime's own callers: DXGI sizes a
 // fullscreen swap chain's output window the way Windows does, through here.
 void set_window_pos(X86 *c, Window *w, uint32_t after, int32_t x, int32_t y, int32_t cx, int32_t cy,
-                    uint32_t flags) {
+                    uint32_t flags, bool refresh_size = false) {
     if (!(flags & 4)) // SWP_NOZORDER
         reorder_window(w->hwnd, after);
     // A WM_SIZE handler may set the same size while arranging children.
     // Only actual changes notify it again, or paint is starved forever.
     bool moved = !(flags & 0x0002) && (w->x != x || w->y != y);
-    bool sized = !(flags & 0x0001) && (w->w != cx || w->h != cy);
+    bool sized = !(flags & 0x0001) && (refresh_size || w->w != cx || w->h != cy);
     if (moved) {
         w->x = x;
         w->y = y;
@@ -1491,6 +1491,19 @@ void u_wvsprintfA(X86 *c) {
 }
 
 } // namespace user32
+
+void win32_refresh_display_window(X86 *c, uint32_t hwnd, uint32_t w, uint32_t h, uint32_t bpp) {
+    auto *win = user32::find_window(hwnd);
+    if (!win || hwnd == user32::desktop_handle)
+        return;
+    // Exclusive DirectDraw transitions notify the window even when a movie
+    // restores the same resolution. Its WM_SIZE handler may have discarded
+    // the old presentation rectangle. Ordinary SetWindowPos still suppresses
+    // unchanged sizes, so layout calls made by that handler cannot recurse.
+    user32::set_window_pos(c, win, 0, 0, 0, int32_t(w), int32_t(h),
+                           0x54 /* NOZORDER|NOACTIVATE|SHOWWINDOW */, true);
+    host_dispatch_to_wndproc(c, hwnd, 0x7e /* WM_DISPLAYCHANGE */, bpp, (h << 16) | (w & 0xffff));
+}
 
 // A display taken over by a fullscreen swap chain has one window on it.
 // Windows sizes that window to the mode, and gives its bounds back when the

@@ -4636,6 +4636,8 @@ void set_display_mode(X86 *c, uint32_t w, uint32_t h, uint32_t bpp) {
     LOGV("ddraw: display mode %ux%ux%u", w, h, bpp);
     ddraw_note_mode_impl(w, h, bpp);
     host_set_display_mode((int)w, (int)h, (int)bpp);
+    if ((dd->coop_level & 0x11 /* DDSCL_EXCLUSIVE|DDSCL_FULLSCREEN */) == 0x11)
+        win32_refresh_display_window(c, dd->hwnd, w, h, bpp);
     com_ret(c, DD_OK);
 }
 

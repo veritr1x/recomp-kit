@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Notify exclusive DirectDraw windows when the display mode is set, including
+  a return to the same size after a movie, so their menu presentation bounds
+  are refreshed instead of leaving the screen black.
+
 - Find hash-pinned auxiliary DLLs in their configured installation subfolders
   after moving a game directory to a mobile device or another computer.
 

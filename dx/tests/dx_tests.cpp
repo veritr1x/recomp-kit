@@ -5522,6 +5522,69 @@ static void test_enum_display_modes() {
     call_shim(tramp("USER32.dll", "ReleaseDC"), {0, hdc});
 }
 
+static std::vector<uint32_t> g_ddraw_mode_messages;
+static uint32_t g_ddraw_mode_width, g_ddraw_mode_height, g_ddraw_mode_depth;
+static void ddraw_mode_wndproc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
+    if (msg == 0x47 || msg == 5 || msg == 0x7e)
+        g_ddraw_mode_messages.push_back(msg);
+    if (msg == 5) {
+        // Games recompute their presentation rectangle from these metrics in
+        // WM_SIZE, including when a movie returns to the same display mode.
+        g_ddraw_mode_width = guest_call(c, tramp("USER32.dll", "GetSystemMetrics"), 0);
+        g_ddraw_mode_height = guest_call(c, tramp("USER32.dll", "GetSystemMetrics"), 1);
+        CHECK_EQ(lp, g_ddraw_mode_width | (g_ddraw_mode_height << 16));
+        // An unchanged layout request from WM_SIZE must not recurse.
+        uint32_t args[] = {hwnd, 0, 0, 0, g_ddraw_mode_width, g_ddraw_mode_height, 0x14};
+        guest_call(c, tramp("USER32.dll", "SetWindowPos"), args, 7);
+    }
+    if (msg == 0x7e)
+        g_ddraw_mode_depth = wp;
+    set_eax(c, guest_call(c, tramp("USER32.dll", "DefWindowProcA"), hwnd, msg, wp, lp));
+}
+
+static void test_exclusive_ddraw_notifies_window_mode() {
+    cpu_reset();
+    reset_ddraw_for_test();
+    uint32_t wc = sc(0x200), name = sc(0x280), rect = sc(0x240);
+    gm_zero(wc, 40);
+    wr32(wc + 4, imports_alloc_trampoline("TEST", "ddraw_mode_wndproc", ddraw_mode_wndproc, 4));
+    gm_put_str(name, "DirectDrawModeTarget", 32);
+    wr32(wc + 36, name);
+    CHECK(call_shim(tramp("USER32.dll", "RegisterClassA"), {wc}) != 0);
+    uint32_t hwnd = call_shim(tramp("USER32.dll", "CreateWindowExA"),
+                              {0, name, name, 0x80000000u, 20, 30, 320, 240, 0, 0, 0, 0});
+    CHECK(hwnd != 0);
+    call_shim(tramp("DDRAW.dll", "DirectDrawCreate"), {0, sc(0), 0});
+    uint32_t dd = rd32(sc(0));
+    CHECK_EQ(call_method(dd, DD_SetCooperativeLevel, {hwnd, 0x11}), DD_OK);
+    for (int repeat = 0; repeat != 2; ++repeat) {
+        g_ddraw_mode_messages.clear();
+        g_ddraw_mode_width = g_ddraw_mode_height = g_ddraw_mode_depth = 0;
+        CHECK_EQ(call_method(dd, DD_SetDisplayMode, {640, 480, 16}), DD_OK);
+        CHECK(g_ddraw_mode_messages == std::vector<uint32_t>({0x47, 5, 0x7e}));
+        CHECK_EQ(g_ddraw_mode_width, 640u);
+        CHECK_EQ(g_ddraw_mode_height, 480u);
+        CHECK_EQ(g_ddraw_mode_depth, 16u);
+        call_shim(tramp("USER32.dll", "GetWindowRect"), {hwnd, rect});
+        CHECK_EQ(rd32(rect), 0u);
+        CHECK_EQ(rd32(rect + 4), 0u);
+        CHECK_EQ(rd32(rect + 8), 640u);
+        CHECK_EQ(rd32(rect + 12), 480u);
+    }
+    g_ddraw_mode_messages.clear();
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {123, 456, 16}), DDERR_INVALIDPARAMS);
+    CHECK(g_ddraw_mode_messages.empty());
+    CHECK_EQ(call_method(dd, DD_SetCooperativeLevel, {hwnd, 8 /* NORMAL */}), DD_OK);
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {800, 600, 16}), DD_OK);
+    CHECK(g_ddraw_mode_messages.empty());
+    call_shim(tramp("USER32.dll", "GetWindowRect"), {hwnd, rect});
+    CHECK_EQ(rd32(rect + 8), 640u);
+    CHECK_EQ(rd32(rect + 12), 480u);
+    CHECK_EQ(call_method(dd, DD_Release, {}), 0u);
+    call_shim(tramp("USER32.dll", "DestroyWindow"), {hwnd});
+}
+
 // Releasing the DirectDraw object that set the mode, or RestoreDisplayMode,
 // puts the desktop back: the screen metrics return to the fallback until the
 // next SetDisplayMode. A game that changes resolution by releasing and
@@ -12635,6 +12698,7 @@ int main() {
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},
+        {"exclusive DirectDraw window mode", test_exclusive_ddraw_notifies_window_mode},
         {"release restores desktop", test_release_restores_desktop_mode},
         {"configurable modes", test_configurable_display_modes},
         {"Classic probe surfaces", test_classic_probe_surface_creation},
