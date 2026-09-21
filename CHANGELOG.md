@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep tablet keyboard halves and their KEYS tabs inside the system safe area,
+  including the combined pad-and-keys layout. Controls tracing now records
+  touch routing and keyboard press/release events for device diagnostics.
+
 - Windows cross-builds enable FFmpeg movie and file-backed music decoding,
   use the POSIX host's shell/make with llvm-mingw tools, and bundle the media DLLs.
   CI cross-builds the Windows app and decodes a generated Ogg track under Wine.

@@ -8,12 +8,12 @@ namespace {
 // The split on-screen keyboard. Pinned to host/keypad_layout.cpp's geometry
 // (a fixed 8x5 grid of 32/36/40pt keys, 4pt gap, bottom-corner halves, with
 // a HIDE/KEYS tab above each) by controls_tests.cpp's legacy oracle. The
-// PAD tab (the next layout) sits at the bottom centre, leaving the top of
-// the screen, where games keep their menus, to the game.
+// PAD tab (the next layout) sits at the bottom centre of the safe area;
+// collapsed KEYS tabs must stay above the system gesture strip on tablets.
 const char *kKeysTablet = R"JSON({
   "version": 1,
   "name": "keys",
-  "safe_inset": false,
+  "safe_inset": true,
   "groups": [
     {
       "id": "left",

@@ -142,6 +142,8 @@ void apply_hidden_bits(Layout &l, uint32_t bits) {
 class HostSink : public ControlsSink {
   public:
     void key(int scancode, bool down) override {
+        if (trace())
+            fprintf(stderr, "[controls] key %d %s\n", scancode, down ? "down" : "up");
         if (g_hooks.key)
             g_hooks.key(scancode, down);
     }
@@ -436,7 +438,15 @@ bool host_finger_down(int64_t id, double px, double py, uint64_t now) {
         g_editor.finger_down(id, px, py);
         return true;
     }
-    return g_router.finger_down(id, px, py, now, g_sink);
+    const bool claimed = g_router.finger_down(id, px, py, now, g_sink);
+    if (trace())
+        fprintf(
+            stderr,
+            "[controls] touch %.1f,%.1f %s layout %s hidden %x drawable %dx%d safe %d,%d %dx%d\n",
+            px, py, claimed ? "claimed" : "passed", g_loaded_name.c_str(), hidden_bits(g_layout),
+            g_screen.dw, g_screen.dh, g_screen.safe.x, g_screen.safe.y, g_screen.safe.w,
+            g_screen.safe.h);
+    return claimed;
 }
 
 bool host_finger_motion(int64_t id, double px, double py, uint64_t now) {
