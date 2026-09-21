@@ -2264,6 +2264,24 @@ static void test_a_hidden_group_survives_a_rotation() {
     CHECK(hidden_bits_for(land, 0x1) == 0x1 && hidden_bits_for(port, 0x1) == 0x1);
 }
 
+// Hiding the keyboard must not hide the sticks/buttons after cycling to pad:
+// the saved visibility bits are shared by layouts within each form factor.
+static void test_hidden_keyboard_does_not_hide_pad_after_switch() {
+    for (const Form form : {Form::Tablet, Form::PhoneLandscape, Form::PhonePortrait}) {
+        for (const char *name : {"keys", "pad+keys"}) {
+            Layout keyboard, pad;
+            std::string error;
+            CHECK(parse_layout(builtin_layout(name, form), &keyboard, &error));
+            CHECK(parse_layout(builtin_layout("pad", form), &pad, &error));
+            const uint32_t saved = toggle_reachable_bits(keyboard);
+            CHECK(saved != 0);
+            CHECK(hidden_bits_for(pad, saved) == 0);
+            // Cycling back still restores the player's hidden keyboard halves.
+            CHECK(hidden_bits_for(keyboard, saved) == saved);
+        }
+    }
+}
+
 // A held stick's knob is its own quad, so moving it keeps the revision; a
 // button press, the dpad's hat and a floating base's move are drawn, so
 // they change it. radius_px follows the layout and screen scale.
@@ -4062,6 +4080,7 @@ int main(int argc, char **argv) {
     test_phone_builtin_layouts_fit_and_do_not_overlap();
     test_hidden_bits_are_clamped_to_the_group_count();
     test_a_hidden_group_survives_a_rotation();
+    test_hidden_keyboard_does_not_hide_pad_after_switch();
     test_make_view_pad_revision();
     test_layer_revisions_are_per_group();
     test_small_key_label_fits();
