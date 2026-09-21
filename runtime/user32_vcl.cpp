@@ -1533,3 +1533,11 @@ void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y) {
     }
     user32::mouse_input.push_back({msg, mk, x, y, host_millis()});
 }
+
+void host_post_client_mouse_message(uint32_t hwnd, uint32_t msg, uint32_t mk, int32_t x,
+                                    int32_t y) {
+    int32_t origin_x = 0, origin_y = 0;
+    user32::client_origin(hwnd, &origin_x, &origin_y);
+    host_post_mouse_message(msg, mk, int32_t(uint32_t(x) + uint32_t(origin_x)),
+                            int32_t(uint32_t(y) + uint32_t(origin_y)));
+}

@@ -343,6 +343,8 @@ void host_note_cadence(const char *kind);
 void host_post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam);
 // Queue host mouse input in virtual-screen coordinates, on the guest baton.
 void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y);
+// The same routed event, starting in a specific window's client pixels.
+void host_post_client_mouse_message(uint32_t hwnd, uint32_t msg, uint32_t mk, int32_t x, int32_t y);
 // Post a keyboard message to the window that has the focus, which is where
 // Windows sends one. Not the same as host_main_window: in a VCL application
 // that is the invisible application window.

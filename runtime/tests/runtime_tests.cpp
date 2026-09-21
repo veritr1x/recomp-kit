@@ -5921,6 +5921,20 @@ static void test_host_mouse_routing() {
     check(activations == 1, "release does not activate again");
     uint32_t child = window(0, 0x50000000, 10, 12, top);
     take(0x200, 2, 125, 150, child, 15, 18);
+    // The game's rendered frame supplies client points, unlike the virtual
+    // desktop events above. Pumping a message must not undo the cursor's
+    // conversion to screen pixels or offset the routed click a second time.
+    for (uint32_t message : {0x200u, 0x201u, 0x202u}) {
+        host_set_client_cursor_pos(top, 25, 30);
+        host_post_client_mouse_message(top, message, 0, 25, 30);
+        check(call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}) == 1 &&
+                  rd32(msg) == child && rd32(msg + 12) == ((18u << 16) | 15u) &&
+                  rd32(msg + 20) == 125 && rd32(msg + 24) == 150,
+              "host client mouse message reaches child at the matching point");
+        call_import(&c, "USER32.dll", "GetCursorPos", {s + 0x300});
+        check(rd32(s + 0x300) == 125 && rd32(s + 0x304) == 150,
+              "mouse routing preserves the converted screen cursor position");
+    }
     host_set_key_state(0x10, true);
     host_set_key_state(0x11, true);
     host_post_mouse_message(0x200, 0, 125, 150);

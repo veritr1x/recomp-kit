@@ -51,7 +51,8 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         return;
     }
     if (msg >= 0x0200 && msg <= 0x0209) {
-        host_post_mouse_message(msg, wparam, int16_t(lparam), int16_t(lparam >> 16));
+        host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
+                                       int16_t(lparam >> 16));
         return;
     }
     uint32_t hwnd = host_main_window();
