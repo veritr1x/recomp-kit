@@ -28,6 +28,8 @@
 #include "script.h"
 #include "script_touch.h"
 #include "controls/vpad.h"
+#include "controls/binding.h"
+#include "sdl/keymap.h"
 #include "smoke_dumpat.h"
 #include "landmark.h"
 #include "fixture_view.h"
@@ -813,7 +815,19 @@ void deliver_touch_actions(const std::vector<TouchAction> &actions) {
     for (const TouchAction &a : actions) {
         const int x = (int)std::lround(a.x), y = (int)std::lround(a.y);
         host_gate_fallback_layout(g_touch_drawable_w, g_touch_drawable_h);
-        if (a.kind == TouchAction::Motion) {
+        if (a.kind == TouchAction::Key) {
+            const uint16_t code = host_keycode_from_scancode(a.scancode);
+            if (code == 0xffff || host_gate_key(code, a.down))
+                continue;
+            const HostKeyMapping m = host_key_mapping(code);
+            host_input_key(code, a.down);
+            post(a.down ? WM_KEYDOWN_ : WM_KEYUP_, m.vk,
+                 host_key_lparam(m, a.down, false, !a.down));
+            printf("[smoke-pad-key] scancode %d %s\n", a.scancode, a.down ? "down" : "up");
+        } else if (a.kind == TouchAction::Wheel) {
+            if (!host_gate_wheel(a.wheel * 120))
+                host_input_wheel(a.wheel * 120);
+        } else if (a.kind == TouchAction::Motion) {
             HitResult hit;
             if (host_gate_window_motion(x, y, 0, 0, &hit)) {
                 g_pointer_x = hit.gx;
@@ -859,6 +873,33 @@ void deliver_touch_actions(const std::vector<TouchAction> &actions) {
                  make_lparam(hit.gx, hit.gy));
         }
     }
+}
+
+// Drive the production mapped binding every heartbeat, including held cursor
+// sticks. The pad script feeds the same merged state as the touch router.
+void tick_pad_binding() {
+#if RECOMP_CONTROLS_PAD == 1
+    static controls::Binding binding;
+    static const bool initialized = [&] {
+        controls::MappedTable table;
+        std::string error;
+        if (!controls::parse_mapped(RECOMP_CONTROLS_MAPPED, &table, &error)) {
+            fprintf(stderr, "[smoke-pad] bad binding: %s\n", error.c_str());
+            exit(2);
+        }
+        binding.set_table(table);
+        return true;
+    }();
+    (void)initialized;
+    binding.set_bounds(g_touch_drawable_w, g_touch_drawable_h);
+    std::vector<TouchAction> actions;
+    std::vector<std::string> names;
+    binding.tick(controls::vpad().state(), uint64_t(boot_guest_millis()) * 1000000ull, &actions,
+                 &names);
+    deliver_touch_actions(actions);
+    for (const auto &name : names)
+        fprintf(stderr, "[smoke-pad] host action not available headlessly: %s\n", name.c_str());
+#endif
 }
 
 void start_touch(const HostScriptStep &step) {
@@ -1394,6 +1435,7 @@ void run_step(const HostScriptStep &step) {
             *axes[index - 17] = step.x / 32767.0f;
         }
         controls::vpad().set_source(controls::kPadSourceTouch, pad);
+        tick_pad_binding();
         printf("[smoke-pad] control %d value %d packet %u\n", index, step.x,
                controls::vpad().packet());
         break;
@@ -1637,6 +1679,7 @@ void tick() {
         g_script_started = true;
         g_script_start_ms = boot_guest_millis();
     }
+    tick_pad_binding();
     if (g_touch.active()) {
         std::vector<TouchAction> actions;
         g_touch.tick(uint64_t(boot_guest_millis()) * 1000000ull, g_presents, &actions);

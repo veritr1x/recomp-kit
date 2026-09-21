@@ -219,7 +219,7 @@ if(TARGET recomp_gen)
 
   pop_host(pop_smoke GEN UI_LAYER
     SOURCES ${HOST}/smoke_main.cpp ${HOST}/script.cpp ${HOST}/input.cpp ${HOST}/input_gate.cpp
-            ${HOST}/input_touch.cpp ${HOST}/controls/vpad_host_api.cpp
+            ${HOST}/input_touch.cpp ${HOST}/controls/vpad_host_api.cpp ${HOST}/sdl/keymap.cpp
             ${HOST}/page_overlay.cpp ${POP_PRESENT_SOURCES} ${HOST}/audio_math.cpp
     LIBS ${POP_CORE_LIBS}
     FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})

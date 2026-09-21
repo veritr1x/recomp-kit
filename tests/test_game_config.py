@@ -224,6 +224,10 @@ class LoadTests(unittest.TestCase):
                 game_config.load(game)
 
             # The header.
+            (game / "game.toml").write_text(
+                base + '\n[controls.mapped]\nleft_stick = "horizontal_arrows"\n')
+            self.assertIn("left_stick=horizontal_arrows",
+                          gen_game_config.render_header(game_config.load(game)))
             (game / "game.toml").write_text(base)
             header = gen_game_config.render_header(game_config.load(game))
             self.assertIn("#define RECOMP_CONTROLS_PAD 1", header)

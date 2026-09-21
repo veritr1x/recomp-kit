@@ -27,7 +27,7 @@ SETTINGS_ROW_ALIASES = {"keypad": "controls"}
 # [controls] default_layout and the on-screen layout picker's choices.
 CONTROLS_LAYOUTS = ("pad", "keys", "pad+keys", "hidden")
 # [controls.mapped] left_stick/right_stick/dpad modes.
-STICK_MODES = ("cursor", "arrows", "wasd", "scroll", "wheel", "none")
+STICK_MODES = ("cursor", "arrows", "horizontal_arrows", "wasd", "scroll", "wheel", "none")
 # [controls.native] buttons: the pad button names a physical button maps to.
 PAD_BUTTONS = ("cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3",
                "select", "start", "ps")

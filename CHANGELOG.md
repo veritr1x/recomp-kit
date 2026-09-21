@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Mapped pads support horizontal-only arrow sticks for steering without
+  accidental throttle or braking. Smoke pad scripts exercise the production
+  mapped binding as well as the native controller adapters.
+
 - Convert host mouse and touch positions from client to screen coordinates
   for GetCursorPos and MSG.pt, fixing click offsets in games whose window
   starts away from the desktop origin.

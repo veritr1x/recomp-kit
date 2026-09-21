@@ -28,7 +28,7 @@
 //                            left click world x/z/altitude through the current
 //                            projection; fail if unavailable or outside the view.
 //   key ESCAPE down           by DirectInput scan-code name
-//   pad cross down            virtual pad button (or up); uses the native APIs
+//   pad cross down            virtual pad button (or up); native APIs or mapped binding
 //   pad left_x -32767         stick axis -32767..32767 (+y down)
 //   pad right_trigger 32767   trigger axis 0..32767
 //   dump menu                 write a frame and a scene dump named for this

@@ -65,6 +65,8 @@ bool stick_mode_from_name(const std::string &s, StickMode *out) {
         *out = StickMode::Cursor;
     else if (s == "arrows")
         *out = StickMode::Arrows;
+    else if (s == "horizontal_arrows")
+        *out = StickMode::HorizontalArrows;
     else if (s == "wasd")
         *out = StickMode::Wasd;
     else if (s == "scroll")
@@ -84,6 +86,8 @@ const char *stick_mode_name(StickMode m) {
         return "cursor";
     case StickMode::Arrows:
         return "arrows";
+    case StickMode::HorizontalArrows:
+        return "horizontal_arrows";
     case StickMode::Wasd:
         return "wasd";
     case StickMode::Scroll:
@@ -488,10 +492,12 @@ void Binding::apply_stick(int index, float vx, float vy, double dt, std::vector<
         break;
     }
     case StickMode::Arrows:
+    case StickMode::HorizontalArrows:
     case StickMode::Wasd: {
         const bool wasd = mode == StickMode::Wasd;
         update_axis(index, false, vx, wasd, out);
-        update_axis(index, true, vy, wasd, out);
+        // A steering stick must not also press throttle/brake on diagonals.
+        update_axis(index, true, mode == StickMode::HorizontalArrows ? 0 : vy, wasd, out);
         break;
     }
     case StickMode::Scroll: {

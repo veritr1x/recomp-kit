@@ -17,7 +17,7 @@
 
 namespace controls {
 
-enum class StickMode { Cursor, Arrows, Wasd, Scroll, Wheel, None };
+enum class StickMode { Cursor, Arrows, HorizontalArrows, Wasd, Scroll, Wheel, None };
 
 // What a pad button (or, via a stick/dpad key, a synthesized press) does to
 // the game: nothing, a key, a mouse button, a wheel notch, or a host action.

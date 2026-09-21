@@ -1642,6 +1642,46 @@ static void test_binding_arrows_stick() {
     CHECK(out.size() == 1 && out[0].scancode == kScanUp && out[0].down);
 }
 
+// A racing diagonal steers without overriding separately held face buttons.
+static void test_binding_horizontal_arrows() {
+    MappedTable table;
+    std::string error;
+    CHECK(
+        parse_mapped("left_stick=horizontal_arrows;cross=key:Up;square=key:Down", &table, &error));
+    MappedTable copy;
+    CHECK(parse_mapped(write_mapped(table), &copy, &error));
+    CHECK(copy.left == StickMode::HorizontalArrows);
+    Binding binding;
+    binding.set_table(copy);
+    PadState pad;
+    std::vector<TouchAction> out;
+    std::vector<std::string> actions;
+    pad.ly = -1;
+    binding.tick(pad, 0, &out, &actions);
+    CHECK(out.empty()); // vertical motion cannot accelerate
+    pad.buttons = uint16_t(1u << int(PadButton::Cross));
+    binding.tick(pad, 1, &out, &actions);
+    CHECK(out.size() == 1 && out[0].scancode == kScanUp && out[0].down);
+    out.clear();
+    pad.lx = -1;
+    pad.ly = 1;
+    binding.tick(pad, 2, &out, &actions);
+    CHECK(out.size() == 1 && out[0].scancode == kScanLeft && out[0].down);
+    out.clear();
+    pad.lx = 0;
+    binding.tick(pad, 3, &out, &actions);
+    CHECK(out.size() == 1 && out[0].scancode == kScanLeft && !out[0].down);
+    out.clear();
+    pad.buttons = uint16_t(1u << int(PadButton::Square));
+    binding.tick(pad, 4, &out, &actions);
+    CHECK(out.size() == 2 && out[0].scancode == kScanUp && !out[0].down &&
+          out[1].scancode == kScanDown && out[1].down);
+    out.clear();
+    pad = {};
+    binding.tick(pad, 5, &out, &actions);
+    CHECK(out.size() == 1 && out[0].scancode == kScanDown && !out[0].down);
+}
+
 // l1 = wheel_up: one Wheel(+1) per press, nothing on release.
 static void test_binding_wheel_button() {
     MappedTable t;
@@ -4061,6 +4101,7 @@ int main(int argc, char **argv) {
     test_binding_button_mouse();
     test_binding_cursor_stick();
     test_binding_arrows_stick();
+    test_binding_horizontal_arrows();
     test_binding_wheel_button();
     test_binding_action_button();
     test_binding_scroll_stick();

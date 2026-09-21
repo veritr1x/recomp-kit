@@ -839,7 +839,8 @@ void Editor::bind_items() {
         break;
     case Kind::Stick:
         if (!native_)
-            for (const char *m : {"cursor", "arrows", "wasd", "scroll", "wheel", "none"})
+            for (const char *m :
+                 {"cursor", "arrows", "horizontal_arrows", "wasd", "scroll", "wheel", "none"})
                 add_item(&items, m, m);
         break;
     case Kind::Dpad:
