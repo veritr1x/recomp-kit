@@ -57,6 +57,7 @@ struct Window {
 
 struct Msg {
     uint32_t hwnd, message, wparam, lparam, time, ptx, pty;
+    uint32_t thread = 0; // explicit target for windowless messages
 };
 
 std::map<std::string, WndClass> &classes();
@@ -77,7 +78,8 @@ extern uint32_t g_main_hwnd, g_cursor;
 extern int32_t g_cursor_x, g_cursor_y;
 extern uint8_t g_key_state[256];
 extern bool (*g_message_waiter)();
-extern Msg last_message;
+Msg &last_message();
+bool queued_message_pending();
 constexpr uint32_t desktop_handle = 0x00020000;
 void pump_window_timers();
 // Whether some visible window has an update region a paint would answer.

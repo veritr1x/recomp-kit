@@ -1036,6 +1036,7 @@ void lock_rect8(X86 *c, ComIface iface) {
 }
 
 void device_destroy(ComObj *dev) {
+    d3d9_device_destroy(dev);
     auto found = devices().find(dev->id);
     if (found == devices().end())
         return;

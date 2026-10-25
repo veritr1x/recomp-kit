@@ -192,6 +192,68 @@ void os_vm_release(void *p, size_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
+void *os_guest_arena_reserve(size_t bytes) {
+    if (sizeof(size_t) < 8 || bytes == 0 || bytes > UINT64_C(0xffff0000))
+        return nullptr;
+    void *p = VirtualAlloc(nullptr, (size_t)UINT64_C(0x100010000), MEM_RESERVE, PAGE_NOACCESS);
+    if (!p)
+        return nullptr;
+    if (!VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE)) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return p;
+}
+
+void os_guest_arena_release(void *p, size_t bytes) {
+    os_vm_release(p, bytes);
+}
+void os_thread_prefer_user_initiated(void) {}
+
+int os_realpath(const char *path, char *out, size_t cap) {
+    HANDLE file =
+        CreateFileW(widen(path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return -1;
+    wchar_t wide[32768];
+    const DWORD n =
+        GetFinalPathNameByHandleW(file, wide, 32768, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(file);
+    if (!n || n >= 32768)
+        return -1;
+    std::string value = narrow(wide);
+    if (value.rfind("\\\\?\\UNC\\", 0) == 0)
+        value = "//" + value.substr(8);
+    else if (value.rfind("\\\\?\\", 0) == 0)
+        value.erase(0, 4);
+    for (char &c : value)
+        if (c == '\\')
+            c = '/';
+    while (value.size() > 3 && value.back() == '/')
+        value.pop_back();
+    return out ? copy_out(value, out, cap) : -1;
+}
+
+int os_path_is_absolute(const char *path) {
+    if (!path || !path[0])
+        return 0;
+    if ((path[0] == '\\' || path[0] == '/') && path[1] == path[0])
+        return 1;
+    return ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+           path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
+
+int os_path_is_within(const char *root, const char *path) {
+    char base[4096], target[4096];
+    if (os_realpath(root, base, sizeof base) != 0 || os_realpath(path, target, sizeof target) != 0)
+        return 0;
+    size_t n = strlen(base);
+    while (n && base[n - 1] == '/')
+        --n;
+    return _strnicmp(base, target, n) == 0 && (target[n] == '/' || target[n] == '\0');
+}
+
 void *os_dlopen(const char *path) {
     HMODULE m = LoadLibraryW(widen(path).c_str());
     if (!m)
@@ -526,6 +588,11 @@ static LONG WINAPI fault_filter(EXCEPTION_POINTERS *info) {
 
 int os_install_fault_handlers(OsFaultFn fn) {
     g_fault_fn = fn;
+    // Our stderr diagnostics own fault reporting. UCRT abort() otherwise
+    // invokes Windows Error Reporting, whose dialog can park a headless child
+    // indefinitely before os_wait receives its termination status.
+    SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     SetUnhandledExceptionFilter(fault_filter);
     return 1;
 }
@@ -547,6 +614,9 @@ int os_localtime(int64_t seconds, struct tm *out) {
 int os_gmtime(int64_t seconds, struct tm *out) {
     __time64_t t = (__time64_t)seconds;
     return _gmtime64_s(out, &t) == 0 ? 0 : -1;
+}
+int64_t os_mktime(struct tm *inout) {
+    return _mktime64(inout);
 }
 
 uint64_t os_monotonic_ns(void) {

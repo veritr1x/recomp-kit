@@ -18,6 +18,7 @@ HOST_D9_DEFAULT void host_d9_buffer_upload(uint32_t, uint32_t, uint32_t, const u
                                            uint32_t) {}
 HOST_D9_DEFAULT void host_d9_buffer_drop(uint32_t) {}
 HOST_D9_DEFAULT void host_d9_draw(const HostD9Draw *) {}
+HOST_D9_DEFAULT void host_d9_shader_created(const uint8_t *, uint32_t, uint64_t, int) {}
 HOST_D9_DEFAULT void host_d9_clear(const HostD9Target *, const int32_t[4], uint32_t,
                                    const int32_t *, uint32_t, uint32_t, float, uint32_t) {}
 HOST_D9_DEFAULT void host_d9_stretch(HostD9Surface, const int32_t[4], HostD9Surface,

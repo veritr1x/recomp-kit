@@ -49,7 +49,9 @@ struct LoaderModule {
     std::string name, path;
     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
     bool attached = false;
+    bool attaching = false, detaching = false, pinned = false;
     uint32_t load_refs = 0;
+    std::vector<std::string> dependencies, owned_dependencies;
     std::vector<uint8_t> initial_image;
     std::vector<SectionInfo> sections;
 };
@@ -64,6 +66,15 @@ uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal);
 // True inside the main image or any auxiliary module.
 bool loader_in_image(uint32_t addr);
 const std::string &loader_exe_path();
+// Attach statically imported mapped DLLs before EXE TLS callbacks and entry.
+bool win32_attach_static_modules(X86 *c);
+#ifdef POPM_TESTING
+void loader_test_reset_modules();
+bool loader_test_map_module(const char *name, const char *path, const char *sha256, uint32_t base,
+                            uint32_t size);
+bool loader_test_bind_modules();
+LoaderModule &loader_test_main_module();
+#endif
 // IAT slots patched: trampolines for code imports, guest storage for data ones.
 uint32_t loader_iat_patched();
 uint32_t loader_iat_data_imports();

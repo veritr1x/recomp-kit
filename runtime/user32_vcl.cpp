@@ -653,7 +653,7 @@ void wait_message(X86 *c) {
     for (;;) {
         pump_once(c);
         pump_mouse_input(c);
-        if (!queue().empty() || paint_pending() || !g_message_waiter)
+        if (queued_message_pending() || paint_pending() || !g_message_waiter)
             break;
         if (!host_guest_yield())
             guest_sleep_ms(1);
@@ -690,7 +690,7 @@ void message_wait(X86 *c, bool ex) {
         set_eax(c, result);
         return;
     }
-    if (!queue().empty()) {
+    if (queued_message_pending()) {
         set_eax(c, n);
         return;
     }

@@ -21,7 +21,7 @@ jobs:
       - name: Install pinned contributor tools
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install -r requirements-dev.txt
+          .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
       - name: Test source tooling without game files
         run: .venv/bin/python tools/test.py
       - name: Check native code formatting
@@ -36,7 +36,7 @@ jobs:
       - name: Install CMake and Ninja
         run: |
           python3 -m venv .ci
-          .ci/bin/python -m pip install cmake==4.1.2 ninja==1.13.0
+          .ci/bin/python -m pip install --require-hashes --only-binary=:all: -r tools/requirements-build.lock
           echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
       - name: Install the pinned Android NDK
         run: |
@@ -59,7 +59,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential glslc ffmpeg wine64 wine xvfb
           python3 -m venv .ci
-          .ci/bin/python -m pip install cmake==4.1.2 ninja==1.13.0
+          .ci/bin/python -m pip install --require-hashes --only-binary=:all: -r tools/requirements-build.lock
           echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
       - name: Install the pinned llvm-mingw UCRT toolchain
         run: |
@@ -91,8 +91,16 @@ jobs:
           done
           ffmpeg -v error -f lavfi -i sine=frequency=440:duration=1 -ar 44100 -ac 2 \
             -c:a libvorbis "$RUNNER_TEMP/media-check/tone.ogg"
+          ffmpeg -v error -f lavfi -i testsrc2=size=32x32:rate=10:duration=3 \
+            -f lavfi -i sine=frequency=440:duration=3 -c:v msmpeg4v3 -q:v 2 \
+            -c:a libmp3lame -b:a 128k -ar 44100 -ac 2 -shortest \
+            "$RUNNER_TEMP/media-check/bink-planes.avi"
           export WINEPREFIX="$RUNNER_TEMP/media-wine"
           cd "$RUNNER_TEMP/media-check"
+          # TEST_AUDIO selects the binary's audio-only mode, so run the full
+          # movie/plane/seek suite separately before the Ogg decoder check.
+          RECOMP_TEST_BINK_CONTAINER="Z:$RUNNER_TEMP/media-check/bink-planes.avi,0" \
+            xvfb-run -a wine ./dx_tests.exe
           RECOMP_TEST_AUDIO=tone.ogg xvfb-run -a wine ./dx_tests.exe
 
   native-compile:
@@ -150,7 +158,7 @@ jobs:
         run: |
           python3 -m venv .ci
           if [ -d .ci/Scripts ]; then BIN=.ci/Scripts; else BIN=.ci/bin; fi
-          "$BIN/python" -m pip install cmake==4.1.2 ninja==1.13.0
+          "$BIN/python" -m pip install --require-hashes --only-binary=:all: -r tools/requirements-build.lock
           if [ "$RUNNER_OS" = Windows ]; then
             cygpath -w "$PWD/$BIN" >> "$GITHUB_PATH"
           else
@@ -158,13 +166,13 @@ jobs:
           fi
       - name: Configure
         if: runner.os != 'Windows'
-        run: cmake --preset ${{ matrix.preset }}
+        run: python -c "from tools import build; build.configure('${{ matrix.preset }}')"
       - name: MSYS2's make for the FFmpeg build (Windows)
         if: runner.os == 'Windows'
         run: C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed make diffutils
       - name: Configure with video (Windows)
         if: runner.os == 'Windows'
-        run: cmake --preset ${{ matrix.preset }} -DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe
+        run: python -c "from tools import build; build.configure('${{ matrix.preset }}', ['-DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe'])"
       - name: Build every test binary this platform has
         if: matrix.preset != 'ios-stub'
         run: cmake --build --preset ${{ matrix.preset }} --target check_binaries

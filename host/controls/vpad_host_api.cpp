@@ -20,6 +20,12 @@ int host_pad_mode(void) {
 int host_pad_native_apis(void) {
     return (RECOMP_CONTROLS_DINPUT ? 1 : 0) | (RECOMP_CONTROLS_XINPUT ? 2 : 0);
 }
+int host_pad_attached_only(void) {
+    return RECOMP_CONTROLS_NATIVE_ATTACHED_ONLY;
+}
+int host_pad_attached(void) {
+    return controls::vpad().controller_connected();
+}
 
 // The merged pad, scaled to the wire format. The packet is read before the
 // state: a change between the two reads then pairs the new state with the

@@ -318,7 +318,8 @@ int match_format_object(uint32_t guid_addr, uint32_t type, const std::vector<boo
 // Pure helpers
 // ===========================================================================
 bool joy_served() {
-    return host_pad_mode() == 2 && (host_pad_native_apis() & 1) != 0;
+    return host_pad_mode() == 2 && (host_pad_native_apis() & 1) != 0 &&
+           (!host_pad_attached_only() || host_pad_attached());
 }
 
 bool joy_guid(const uint8_t *guid16) {

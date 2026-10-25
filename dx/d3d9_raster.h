@@ -36,6 +36,8 @@ struct D9DrawCall {
 // Draws into `target` (a 32-bit surface object) with the device's pipeline.
 void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &declaration,
                     const D9DrawCall &call);
+bool d9_raster_clear(ComObj *device, ComObj *target, uint32_t count, uint32_t guest_rects,
+                     uint32_t flags, uint32_t color, float depth, uint32_t stencil);
 
 // A texture's pixels changed; any decoded copy of it is stale.
 void d9_raster_invalidate(uint32_t surface_id);

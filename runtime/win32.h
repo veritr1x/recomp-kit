@@ -34,7 +34,12 @@ void win32_forget_scrollbars(uint32_t hwnd);
 // directory that backs the guest root RECOMP_GUEST_ROOT (the directory holding the
 // loaded EXE).
 void win32_init(const std::string &game_dir);
+// Explicit layout for hosts/tests that select an installation at runtime.
+// The first argument is the loaded EXE's host directory; a suffix mismatch
+// falls back to the legacy root-at-EXE layout.
+void win32_init_layout(const std::string &exe_folder, const std::string &exe_dir);
 const std::string &win32_game_dir();
+std::string win32_executable_guest_path();
 // Guest spelling shared by shell folder APIs; creation uses the write overlay.
 std::string shell_folder_guest_path(uint32_t csidl, bool create);
 
@@ -157,6 +162,9 @@ bool sched_is_guest_thread();
 // run_entry needs this: every other guest thread is registered by the
 // scheduler when it starts.
 void sched_set_guest_thread(bool yes);
+// Import checkpoints retain a short time slice; translated back edges use
+// recomp_backedge_poll for immediate, budgeted handoffs.
+void sched_checkpoint();
 // True when this thread is the one the scheduler is currently letting run,
 // which is the only state in which the dispatch tables may be changed.
 //
@@ -390,6 +398,12 @@ bool host_messages_pending();
 // Blocks the calling guest thread for `ms` and lets the other guest threads
 // run. GetMessageA uses it so waiting for a message is a real wait.
 void guest_sleep_ms(uint32_t ms);
+// Runtime-owned cooperative workers bypass CreateThread's diagnostic sync/skip
+// modes. Creation/inspection/close require the guest baton; event signalling
+// from a host thread uses guest_event_signal_from_host below.
+uint32_t guest_runtime_thread_create(uint32_t start, uint32_t param);
+bool guest_runtime_thread_alive(uint32_t handle);
+bool win32_close_handle(uint32_t handle);
 // WaitForMultipleObjects for the calling guest thread: WAIT_OBJECT_0 + i,
 // WAIT_ABANDONED_0 + i, WAIT_TIMEOUT (0x102) or WAIT_FAILED. A zero timeout
 // answers from the current state, taking what it reports as Windows does.
@@ -465,6 +479,7 @@ bool host_window_visible(uint32_t hwnd);
 // ---------------------------------------------------------------------------
 X86 *guest_current_context();
 uint32_t guest_current_thread_id();
+bool guest_thread_exists(uint32_t id);
 bool host_cursor_visible();
 bool host_cursor_clip(int32_t out[4]);
 
@@ -525,10 +540,16 @@ void host_midi_close(void);
 }
 
 // ---------------------------------------------------------------------------
-// WINMM multimedia timers: the host fires due callbacks between frames, on the
-// main thread, through the guest callback registered by timeSetEvent.
+// WINMM multimedia timers: by default the message pump fires callbacks. With
+// [system] mm_timers="thread", a cooperative runtime worker owns callbacks;
+// this pump still drives host frame services, without firing a timer twice.
 // ---------------------------------------------------------------------------
 void host_pump_timers(X86 *c);
+// Stop is safe from a host thread before driving shutdown. Reset requires
+// every worker to have stopped and runs before the handle registry is reset.
+void host_stop_mm_timer_thread();
+void host_reset_mm_timers();
+void host_mm_timer_thread_for_test(bool enabled);
 
 // ---------------------------------------------------------------------------
 // Registry: backed by build/recomp/registry.json (path overridable with

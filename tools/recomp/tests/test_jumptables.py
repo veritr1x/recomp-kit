@@ -144,7 +144,7 @@ def test_indirect_jump_through_a_structure_field_is_not_a_table(operand):
     # runtime dispatch. This does not turn the operand into a decoded table.
     assert "switch (t_)" in source
     for addr in sorted(fn.addrs):
-        assert "case %s: goto L_%08x;" % (T.hexlit(addr), addr) in source
+        assert "case %s: RECOMP_BACKEDGE(c); goto L_%08x;" % (T.hexlit(addr), addr) in source
     assert "default: break;" in source
     assert tr.table_sites == {}
     assert tr.jumptables == {}
@@ -232,3 +232,95 @@ def test_negated_index_after_a_guard_reads_downwards():
     entries[1] = GARBAGE
     targets, _ = decode(lines, table(entries))
     assert targets == [FN + 0x20 + 0x10 * k for k in range(8)]
+
+
+def test_bounded_table_recovers_targets_before_the_entry():
+    insns = T.parse_listing_text(
+        "%08x  RET\n%08x  CMP EAX,0x0\n%08x  JA 0x%08x\n"
+        "%08x  JMP dword ptr [EAX*0x4 + 0x%x]\n%08x  RET\n" %
+        (FN-0x100,FN,FN+3,FN+0x40,FN+5,TABLE,FN+0x40))
+    target = FN-0x80
+    fn = T.Function(FN,"backward",0x100,insns)
+    image = FakeImage([i.addr for i in insns]+[target],{TABLE:target})
+    fn.measure(image)
+    tr = T.Translator(image,{FN},Opts())
+    tr.prepare(fn)
+    assert target in tr.unlisted_targets
+    assert tr.jumptables[(FN,FN+5)] == [target]
+
+
+def test_detached_case_within_listed_extent_exceeds_64k():
+    target = FN + 0x18000
+    insns = T.parse_listing_text(
+        "%08x  CMP EAX,0\n%08x  JA 0x%08x\n"
+        "%08x  JMP dword ptr [EAX*4 + 0x%x]\n%08x  RET\n" %
+        (FN, FN+3, FN+0x19000, FN+5, TABLE, FN+0x19000))
+    image = FakeImage([i.addr for i in insns] + [target], {TABLE: target})
+    fn = T.Function(FN, "detached", 0x19001, insns)
+    fn.measure(image)
+    tr = T.Translator(image, {FN}, Opts())
+    tr.prepare(fn)
+    assert tr.jumptables[(FN, FN+5)] == [target]
+    assert target in tr.unlisted_targets
+
+
+@pytest.mark.parametrize("mutation", [None, "slot", "frame", "esp", "call", "incoming"])
+def test_byte_index_bound_through_stable_frame_slot(mutation):
+    byte_base = TABLE + 0x100
+    frame = "ESP" if mutation == "esp" else "EBP"
+    lines = [(0, "CMP dword ptr [%s + -0x4],0x2" % frame),
+             (4, "JA 0x%08x" % (FN+0x40))]
+    extra = {"slot": "MOV dword ptr [EBP + -0x4],EAX", "frame": "INC EBP",
+             "call": "CALL EDI"}.get(mutation)
+    if extra:
+        lines.append((6, extra))
+    lines += [(10, "MOV ECX,dword ptr [%s + -0x4]" % frame),
+              (14, "MOVZX EAX,byte ptr [ECX + 0x%x]" % byte_base),
+              (21, "JMP dword ptr [EAX*4 + 0x%x]" % TABLE),
+              (0x30, "RET"), (0x40, "RET")]
+    if mutation == "incoming":
+        lines.append((0x50, "JMP 0x%08x" % (FN+10)))
+    insns = T.parse_listing_text("\n".join("%08x  %s" % (FN+off, text) for off, text in lines))
+    image = FakeImage([i.addr for i in insns], {TABLE:FN+0x30, TABLE+4:GARBAGE,
+                                              TABLE+8:FN+0x40})
+    image.rd8 = lambda addr: {byte_base:0, byte_base+1:2, byte_base+2:0}.get(addr)
+    fn = T.Function(FN, "frame_slot", 0x60, insns)
+    fn.measure(image)
+    tr = T.Translator(image, {FN}, Opts())
+    tr.prepare(fn)
+    got = tr.jumptables.get((FN, FN+21))
+    assert got == ([FN+0x30,FN+0x40,FN+0x30] if mutation is None else [FN+0x30])
+
+
+def test_branch_into_register_guard_invalidates_bound():
+    lines = [(0,"JMP 0x%08x" % (FN+8)), (3,"CMP EAX,0x1"),
+             (6,"JA 0x%08x" % (FN+0x40)),
+             (8,"JMP dword ptr [EAX*4 + 0x%x]" % TABLE), (0x40,"RET")]
+    _, tr = decode(lines, table({0: FN+0x40, 1:GARBAGE}))
+    assert tr.stats["_jmp_table_bounded"] == 0
+
+
+@pytest.mark.parametrize("clobber", [False, True])
+def test_byte_index_bound_through_lea(clobber):
+    byte_base = TABLE+0x100
+    lines = [(0,"LEA EAX,dword ptr [ECX + -0x5]")]
+    if clobber:
+        lines.append((3,"INC ECX"))
+    lines += [(4,"CMP EAX,0x2"),(7,"JA 0x%08x" % (FN+0x40)),
+              (9,"MOVZX EAX,byte ptr [ECX + 0x%x]" % byte_base),
+              (16,"JMP dword ptr [EAX*0x4 + 0x%x]" % TABLE),
+              (0x20,"RET"),(0x30,"RET"),(0x40,"RET")]
+    insns = T.parse_listing_text("\n".join("%08x  %s" % (FN+off,text) for off,text in lines))
+    fn = T.Function(FN,"lea_guard",0x100,insns)
+    image = FakeImage([i.addr for i in insns],table({0:GARBAGE,1:FN+0x20,3:FN+0x30}))
+    image.rd8 = lambda address: {byte_base+5:1,byte_base+6:3,byte_base+7:1}.get(address)
+    fn.measure(image)
+    tr = T.Translator(image,{FN},Opts())
+    tr.prepare(fn)
+    targets = tr.jumptables.get((FN,FN+16))
+    if clobber:
+        assert targets is None
+    else:
+        assert targets == [FN+0x20,FN+0x30,FN+0x20]
+        assert (byte_base+5,byte_base+8) in tr.table_ranges
+        tr.prepare(fn,strict=True)

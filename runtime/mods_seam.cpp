@@ -25,6 +25,7 @@ __attribute__((weak)) void dinput_discard_mouse_motion(uint32_t) {}
 __attribute__((weak)) bool mods_load_all(void) {
     return true;
 }
+__attribute__((weak)) void mods_overlay_reset(void) {}
 __attribute__((weak)) void mods_shutdown(void) {}
 __attribute__((weak)) void mods_shutdown_request(void) {}
 // True: with no module there is nothing to tear down, so a host

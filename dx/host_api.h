@@ -325,6 +325,10 @@ typedef struct HostPadEvent {
 int host_pad_mode(void);
 /* Bit 0: serve DirectInput joystick; bit 1: serve XInput. Weak default: 0. */
 int host_pad_native_apis(void);
+/* Only enumerate a physical native pad when requested by the game config.
+ * Weak defaults: policy off, no physical controller attached. */
+int host_pad_attached_only(void);
+int host_pad_attached(void);
 /* The merged pad. Returns a packet number that changes with the state. Weak
  * default: 0, zeroed. */
 uint32_t host_pad_state(HostPadState *out);

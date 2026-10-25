@@ -56,6 +56,7 @@
 
 #include "../gpu/fake/fake_device.h"
 #include "../gpu/gpu_factory.h"
+#include "../gpu/d3d9_warm.h"
 #include "../../dx/host_d9.h"
 #include "../../dx/d3d9_msl.h"
 #include "../../dx/d3d9_shader.h"
@@ -541,6 +542,29 @@ static void test_mouse_move_reaches_the_guest() {
 static void test_script_parsing() {
     HostScriptStep steps[64];
     char err[256];
+
+    // Windows checkouts and text writers produce CRLF; the same script must
+    // retain its steps, timestamps and strict token checks on every host.
+    HostScriptStep lf_steps[64], crlf_steps[64];
+    const int lf_count =
+        host_script_parse("# comment\nwait 25\nkey RETURN down\n\nmove 10 20\nkey RETURN up\n",
+                          lf_steps, 64, err, sizeof err);
+    const int crlf_count = host_script_parse(
+        "# comment\r\nwait 25\r\nkey RETURN down\r\n\r\nmove 10 20\r\nkey RETURN up\r\n",
+        crlf_steps, 64, err, sizeof err);
+    CHECK_EQ(lf_count, 3);
+    CHECK_EQ(crlf_count, lf_count);
+    if (crlf_count == lf_count)
+        CHECK(memcmp(lf_steps, crlf_steps, lf_count * sizeof(HostScriptStep)) == 0);
+    CHECK_EQ(host_script_parse("wait 5\r", steps, 64, err, sizeof err), 0);
+    CHECK_EQ(host_script_parse("\r\n\r", steps, 64, err, sizeof err), 0);
+    CHECK_EQ(host_script_parse("wait 5\r\nwait 1\r2\r\n", steps, 64, err, sizeof err), -1);
+    CHECK(strstr(err, "line 2") != nullptr);
+    CHECK_EQ(
+        host_script_parse((std::string(511, '#') + "\r\n").c_str(), steps, 64, err, sizeof err), 0);
+    CHECK_EQ(
+        host_script_parse((std::string(512, '#') + "\r\n").c_str(), steps, 64, err, sizeof err),
+        -1);
 
     CHECK_EQ(host_script_parse("tap 24 8\nwait 2000\ntap 510 90\n", steps, 64, err, sizeof err), 2);
     CHECK_EQ(steps[0].op, HOST_SCRIPT_TAP);
@@ -1173,7 +1197,9 @@ static void test_controls_layouts_resource() {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/controls-resource-XXXXXX", os_temp_dir());
     CHECK(os_mkdtemp(dir) == 0);
-    const std::string root = dir;
+    std::string root = dir;
+    // Resource paths use forward slashes on Windows as well.
+    std::replace(root.begin(), root.end(), '\\', '/');
     os_mkdir((root + "/build").c_str());
     FILE *f = fopen((root + "/game.toml").c_str(), "wb");
     CHECK(f != nullptr);
@@ -9723,6 +9749,164 @@ static void test_d3d8_fixed_gpu() {
     host_d9_texture_drop(RT);
 }
 
+static void test_d3d9_instancing_gpu() {
+    const uint32_t RT = 90200, GEOMETRY = 90201, OFFSETS = 90202, COLORS = 90203, INDICES = 90204;
+    HostD9TextureDesc texture{RT, HOST_D9_TEX_2D, 8, 8, 1, 21, HOST_D9_USAGE_RENDERTARGET};
+    host_d9_texture_define(&texture);
+    const float vertices[6][4] = {{-1, 1, 0.5f, 1}, {0, 1, 0.5f, 1},  {-1, -1, 0.5f, 1},
+                                  {0, 1, 0.5f, 1},  {0, -1, 0.5f, 1}, {-1, -1, 0.5f, 1}};
+    const float offsets[2][4] = {{0, 0, 0, 0}, {1, 0, 0, 0}};
+    const uint32_t colors[] = {0xffff0000, 0xff00ff00, 0xff00ff00, 0xffffff00};
+    const uint16_t indices[] = {0, 1, 2, 3, 4, 5};
+    host_d9_buffer_upload(GEOMETRY, sizeof vertices, 0, (const uint8_t *)vertices, sizeof vertices);
+    host_d9_buffer_upload(OFFSETS, sizeof offsets, 0, (const uint8_t *)offsets, sizeof offsets);
+    host_d9_buffer_upload(COLORS, sizeof colors, 0, (const uint8_t *)colors, sizeof colors);
+    host_d9_buffer_upload(INDICES, sizeof indices, 0, (const uint8_t *)indices, sizeof indices);
+    const auto vs =
+        d9_words({0xfffe0200, 0x0200001f, 0x80000000, 0x900f0000, 0x0200001f, 0x80000005,
+                  0x900f0001, 0x0200001f, 0x8000000a, 0x900f0002, 0x03000002, 0xc00f0000,
+                  0x90e40000, 0x90e40001, 0x02000001, 0xd00f0000, 0x90e40002, 0xffff});
+    const auto ps = d9_words({0xffff0101, 1, 0x800f0000, 0x90e40000, 0xffff});
+    uint8_t decl[32] = {0, 0, 0, 0, 3, 0, 0,  0, 1,    0, 0, 0, 3,  0, 5, 0,
+                        7, 0, 0, 0, 4, 0, 10, 0, 0xff, 0, 0, 0, 17, 0, 0, 0};
+    D9Pipeline state;
+    state.rs[7] = 0;
+    state.rs[22] = 1;
+    HostD9Draw d{};
+    d.target.color[0] = {RT, 0, 0};
+    d.viewport[2] = d.viewport[3] = 8;
+    d.depth_range[1] = 1;
+    d.vs = vs.data();
+    d.vs_size = uint32_t(vs.size());
+    d.ps = ps.data();
+    d.ps_size = uint32_t(ps.size());
+    d.decl = decl;
+    d.decl_size = sizeof decl;
+    d.index_buffer = INDICES;
+    d.index_size = 2;
+    d.primitive = 4;
+    d.primitive_count = 2;
+    d.stream[0] = {GEOMETRY, 0, 16, HOST_D9_STREAM_INDEXED | 2};
+    d.stream[1] = {OFFSETS, 0, 16, HOST_D9_STREAM_INSTANCE | 1};
+    d.stream[7] = {COLORS, 0, 4, HOST_D9_STREAM_INSTANCE | 1};
+    d.render_state = state.rs;
+    d.render_state_set = (const uint8_t *)state.rs_set;
+    d.sampler_state = &state.sampler_state[0][0];
+    d.instance_count = 2;
+    for (uint32_t stream : {1u, 6u}) {
+        decl[8] = uint8_t(stream);
+        d.stream[1] = {};
+        d.stream[6] = {};
+        d.stream[stream] = {OFFSETS, 0, 16, HOST_D9_STREAM_INSTANCE | 1};
+        host_d9_clear(&d.target, d.viewport, 0, nullptr, 1, 0xff000000, 1, 0);
+        host_d9_draw(&d);
+        uint8_t left[4], right[4];
+        d9_pixel(RT, 1, 2, left);
+        d9_pixel(RT, 6, 2, right);
+        CHECK_EQ(left[2], 255);
+        CHECK_EQ(left[1], 0);
+        CHECK_EQ(right[2], 0);
+        CHECK_EQ(right[1], 255);
+        d.stream[stream].frequency = HOST_D9_STREAM_INSTANCE | 2;
+        d.stream[0].frequency = HOST_D9_STREAM_INDEXED | 4;
+        d.instance_count = 4;
+        host_d9_clear(&d.target, d.viewport, 0, nullptr, 1, 0xff000000, 1, 0);
+        host_d9_draw(&d);
+        d9_pixel(RT, 1, 2, left);
+        d9_pixel(RT, 6, 2, right);
+        if (!std::strcmp(gpu::default_backend_name(), "metal")) {
+            CHECK_EQ(left[1], 255);
+            CHECK_EQ(right[2], 255);
+            CHECK_EQ(right[1], 255);
+        } else {
+            CHECK_EQ(left[2], 0);
+            CHECK_EQ(left[1], 0);
+            CHECK_EQ(right[2], 0);
+            CHECK_EQ(right[1], 0);
+        }
+        d.instance_count = 2;
+        d.stream[0].frequency = HOST_D9_STREAM_INDEXED | 2;
+    }
+    for (uint32_t id : {GEOMETRY, OFFSETS, COLORS, INDICES})
+        host_d9_buffer_drop(id);
+    host_d9_texture_drop(RT);
+}
+
+static void test_d3d9_sm3_gpu() {
+    const uint32_t RT = 90210;
+    HostD9TextureDesc texture{RT, HOST_D9_TEX_2D, 8, 8, 1, 21, HOST_D9_USAGE_RENDERTARGET};
+    host_d9_texture_define(&texture);
+    const auto vs = d9_words({0xfffe0200, 0x0200001f, 0x80000000, 0x900f0000, 0x0200001f,
+                              0x80000005, 0x900f0001, 0x02000001, 0xc00f0000, 0x90e40000,
+                              0x02000001, 0xe00f0000, 0x90e40001, 0xffff});
+    const auto derivatives = d9_words({0xffff0200, 0x0200001f, 0x80000005, 0xb00f0000, 0x0200005b,
+                                       0x800f0000, 0xb0e40000, 0x0200005c, 0x800f0001, 0xb0e40000,
+                                       0x02000001, 0x80010800, 0x80000000, 0x02000001, 0x80020800,
+                                       0x80550001, 0x02000001, 0x800c0800, 0xa0e40000, 0xffff});
+    const auto misc =
+        d9_words({0xffff0300, 0x0200001f, 0x80000000, 0x90031000, 0x0200001f, 0x80000000,
+                  0x90011001, 0x03000005, 0x800f0800, 0x90e41000, 0xa0e40000, 0x02000001,
+                  0x80040800, 0x90001001, 0x02000001, 0x80080800, 0xa0ff0000, 0xffff});
+    const uint8_t decl[24] = {0, 0, 0, 0, 2,    0, 0, 0, 0,  0, 12, 0,
+                              1, 0, 5, 0, 0xff, 0, 0, 0, 17, 0, 0,  0};
+    float vertices[3][5] = {{-1, 1, 0.5f, 0, 0}, {3, 1, 0.5f, 2, 0}, {-1, -3, 0.5f, 0, 2}};
+    D9Pipeline state;
+    state.rs[7] = 0;
+    state.rs[22] = 1;
+    float constants[4] = {0, 0, 0, 1};
+    HostD9Draw d{};
+    d.target.color[0] = {RT, 0, 0};
+    d.viewport[2] = d.viewport[3] = 8;
+    d.depth_range[1] = 1;
+    d.vs = vs.data();
+    d.vs_size = uint32_t(vs.size());
+    d.ps = derivatives.data();
+    d.ps_size = uint32_t(derivatives.size());
+    d.decl = decl;
+    d.decl_size = sizeof decl;
+    d.stream[0].stride = sizeof vertices[0];
+    d.inline_vertices = (const uint8_t *)vertices;
+    d.inline_bytes = sizeof vertices;
+    d.primitive = 4;
+    d.primitive_count = 1;
+    d.pconst = constants;
+    d.pconst_count = 1;
+    d.render_state = state.rs;
+    d.render_state_set = (const uint8_t *)state.rs_set;
+    d.sampler_state = &state.sampler_state[0][0];
+    host_d9_clear(&d.target, d.viewport, 0, nullptr, 1, 0xff000000, 1, 0);
+    host_d9_draw(&d);
+    uint8_t pixel[4];
+    d9_pixel(RT, 3, 3, pixel);
+    CHECK(std::abs(int(pixel[2]) - 32) <= 1);
+    CHECK(std::abs(int(pixel[1]) - 32) <= 1);
+    CHECK_EQ(pixel[0], 0);
+    CHECK_EQ(pixel[3], 255);
+    d.ps = misc.data();
+    d.ps_size = uint32_t(misc.size());
+    constants[0] = constants[1] = 1.0f / 8;
+    host_d9_clear(&d.target, d.viewport, 0, nullptr, 1, 0xff000000, 1, 0);
+    host_d9_draw(&d);
+    d9_pixel(RT, 3, 3, pixel);
+    if (!std::strcmp(gpu::default_backend_name(), "metal")) {
+        CHECK(std::abs(int(pixel[2]) - 96) <= 1);
+        CHECK(std::abs(int(pixel[1]) - 96) <= 1);
+        CHECK_EQ(pixel[0], 255);
+        CHECK_EQ(pixel[3], 255);
+        for (unsigned k = 0; k < 5; ++k)
+            std::swap(vertices[1][k], vertices[2][k]);
+        host_d9_clear(&d.target, d.viewport, 0, nullptr, 1, 0xff000000, 1, 0);
+        host_d9_draw(&d);
+        d9_pixel(RT, 3, 3, pixel);
+        CHECK_EQ(pixel[0], 0);
+    } else {
+        CHECK_EQ(pixel[2], 0);
+        CHECK_EQ(pixel[1], 0);
+        CHECK_EQ(pixel[0], 0);
+    }
+    host_d9_texture_drop(RT);
+}
+
 static void test_d3d9_gpu_renderer() {
     const uint32_t RT = 90001, DEPTH = 90002;
     HostD9TextureDesc rt{RT, HOST_D9_TEX_2D, 8, 8, 1, 21, HOST_D9_USAGE_RENDERTARGET};
@@ -9987,14 +10171,48 @@ int main(int argc, char **argv) {
         return g_failures ? 1 : 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--d3d9-gpu")) {
+        char warm_dir[512];
+        snprintf(warm_dir, sizeof warm_dir, "%s/recomp-warm-XXXXXX", os_temp_dir());
+        CHECK(os_mkdtemp(warm_dir) == 0);
+        os_setenv("RECOMP_PROFILE_DIR", warm_dir);
+        os_setenv("RECOMP_D3D9_WARM", "1");
         g_gpu = gpu::create_default_device();
         if (!g_gpu || !host_d9_use_device_for_test(g_gpu.get())) {
             printf("no Metal device: Direct3D 9 GPU test did not run\n");
             return 2;
         }
-        test_d3d9_gpu_renderer();
-        test_d3d9_ps11_texm3x2();
-        test_d3d8_fixed_gpu();
+        auto render = [] {
+            test_d3d9_gpu_renderer();
+            test_d3d9_ps11_texm3x2();
+            test_d3d8_fixed_gpu();
+            test_d3d9_instancing_gpu();
+            test_d3d9_sm3_gpu();
+        };
+        render();
+        host_d9_use_device_for_test(nullptr); // join warm work and flush all hints
+        if (!strcmp(gpu::default_backend_name(), "metal")) {
+            d9warm::Hints hints(warm_dir);
+            hints.load();
+            CHECK(!hints.shaders().empty() && !hints.pipelines().empty());
+            for (auto hint : hints.pipelines()) {
+                std::swap(hint.vertex, hint.pixel); // valid line, wrong live shader roles
+                hints.remember(hint);
+                std::swap(hint.vertex, hint.pixel);
+                hint.colors[0] = 8191; // parsed, but never sent to Metal as a pixel format
+                hints.remember(hint);
+            }
+            CHECK(hints.flush());
+            CHECK(host_d9_use_device_for_test(g_gpu.get()));
+            render(); // same pixels with saved pipelines and irrelevant stale work
+            host_d9_use_device_for_test(nullptr);
+            os_setenv("RECOMP_D3D9_WARM", "0");
+            CHECK(host_d9_use_device_for_test(g_gpu.get()));
+            render();
+            host_d9_use_device_for_test(nullptr);
+        }
+        os_unsetenv("RECOMP_D3D9_WARM");
+        os_unsetenv("RECOMP_PROFILE_DIR");
+        std::filesystem::remove_all(warm_dir);
         printf("d3d9 GPU: %d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;
     }

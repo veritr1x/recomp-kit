@@ -1,5 +1,6 @@
 // x86 registration-chain dispatch and host checkpoints for Delphi frames.
 #include "seh.h"
+#include "msvc_eh.h"
 #include "imports.h"
 #include "memory.h"
 #include "mods_seam.h"
@@ -175,7 +176,9 @@ uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
     LOGV("SEH handler: registration=%08x handler=%08x flags=%08x", reg, handler,
          rd32(d->record + 4));
     uint32_t args[] = {d->record, reg, d->context, 0};
+    recomp_msvc_seh_enter(c);
     uint32_t disposition = guest_call(c, handler, args, 4);
+    recomp_msvc_seh_leave(c);
     if (disposition == 0) {
         LOGW("ExceptionContinueExecution requested; not supported (record=%08x code=%08x "
              "registration=%08x handler=%08x)",
@@ -192,6 +195,12 @@ uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
 } // namespace
 
 extern "C" {
+
+void recomp_seh_capture_context(X86 *c, uint32_t context) {
+    if (!context || !gm_valid(context, CONTEXT_BYTES))
+        invalid_chain(c, 0, context, "invalid context output");
+    fill_context(c, context);
+}
 
 // Inspection only: do not repair or dereference an invalid link. Retain the
 // last valid boundary so one message bounds the first corrupting guest code.
@@ -354,6 +363,7 @@ void recomp_seh_intercept(X86 *c, uint32_t target) {
     }
     mods_hooks_unwind_to_esp(reg);
     sched_atomic_unwind_to_esp(reg);
+    recomp_msvc_unwind_to_esp(c, reg);
     recomp_profile_truncate(landing->profile_depth);
     recomp_callback_truncate(landing->callback_depth);
     state.landing = landing;
@@ -383,6 +393,7 @@ void recomp_seh_land(X86 *c) {
 }
 
 void recomp_seh_callback_leave(X86 *c, uint32_t depth) {
+    recomp_msvc_callback_leave(c, depth);
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
         if (f->cpu != c)
@@ -402,6 +413,7 @@ void recomp_seh_callback_leave(X86 *c, uint32_t depth) {
 }
 
 void recomp_seh_reset(X86 *c) {
+    recomp_msvc_reset(c);
     if (c)
         state.diagnostics.erase(c);
     else

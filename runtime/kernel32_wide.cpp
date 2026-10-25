@@ -15,6 +15,149 @@
 #include <cctype>
 
 namespace {
+void computer_name(X86 *c, bool wide) {
+    const uint32_t out = arg(c, 0), size = arg(c, 1);
+    if (!size || !gm_valid(size, 4)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    const char *name = "RECOMP";
+    if (!out || rd32(size) < 7) {
+        wr32(size, 7);
+        set_last_error(111);
+        set_eax(c, 0);
+        return;
+    }
+    if (!gm_valid(out, wide ? 14 : 7)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    if (wide)
+        gm_put_wstr(out, name, 7);
+    else
+        gm_put_str(out, name, 7);
+    wr32(size, 6);
+    set_eax(c, 1);
+}
+void k_GetComputerNameA(X86 *c) {
+    computer_name(c, false);
+}
+void k_GetComputerNameW(X86 *c) {
+    computer_name(c, true);
+}
+void temp_path(X86 *c, bool wide) {
+    const std::string path = RECOMP_GUEST_ROOT "\\Temp\\";
+    const uint32_t cap = arg(c, 0), out = arg(c, 1), need = uint32_t(path.size()) + 1;
+    if (!out || cap < need) {
+        set_eax(c, need);
+        return;
+    }
+    if (!gm_valid(out, need * (wide ? 2 : 1))) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, wide ? gm_put_wstr(out, path, cap) : gm_put_str(out, path.c_str(), cap));
+}
+void k_GetTempPathA(X86 *c) {
+    temp_path(c, false);
+}
+void k_GetTempPathW(X86 *c) {
+    temp_path(c, true);
+}
+
+void command_line_to_argv(X86 *c) {
+    const uint32_t input = arg(c, 0), count = arg(c, 1);
+    if (!input || !gm_valid(input, 2) || !count || !gm_valid(count, 4)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    const std::string text = gm_wstr(input);
+    std::vector<std::string> args;
+    auto space = [](char ch) { return ch == ' ' || ch == '\t'; };
+    size_t i = 0;
+    if (text.empty())
+        args.push_back(win32_executable_guest_path());
+    else {
+        // argv[0] is a filename: quotes delimit the initial filename only;
+        // backslashes are literal there. Subsequent arguments use shell32's
+        // quote-run rules, which differ from the CRT's doubled-quote parser.
+        if (text[0] == '"') {
+            const size_t end = text.find('"', 1);
+            args.push_back(text.substr(1, end == std::string::npos ? end : end - 1));
+            i = end == std::string::npos ? text.size() : end + 1;
+        } else {
+            while (i < text.size() && !space(text[i]))
+                ++i;
+            args.push_back(text.substr(0, i));
+        }
+        while (i < text.size()) {
+            while (i < text.size() && space(text[i]))
+                ++i;
+            if (i == text.size())
+                break;
+            std::string arg;
+            bool quoted = false;
+            while (i < text.size() && (quoted || !space(text[i]))) {
+                size_t slashes = 0;
+                while (i < text.size() && text[i] == '\\') {
+                    ++slashes;
+                    ++i;
+                }
+                if (i < text.size() && text[i] == '"') {
+                    arg.append(slashes / 2, '\\');
+                    if (slashes & 1) {
+                        arg += '"';
+                        ++i;
+                    } else {
+                        unsigned quotes = quoted ? 1u : 0u;
+                        while (i < text.size() && text[i] == '"') {
+                            ++i;
+                            if (++quotes == 3) {
+                                arg += '"';
+                                quotes = 0;
+                            }
+                        }
+                        quoted = quotes == 1;
+                    }
+                } else {
+                    arg.append(slashes, '\\');
+                    if (i < text.size() && (quoted || !space(text[i])))
+                        arg += text[i++];
+                }
+            }
+            args.push_back(std::move(arg));
+        }
+    }
+    uint64_t bytes = uint64_t(args.size() + 1) * 4;
+    for (const auto &arg : args) {
+        for (unsigned char ch : arg)
+            if ((ch & 0xc0) != 0x80)
+                bytes += ch >= 0xf0 ? 4 : 2;
+        bytes += 2;
+    }
+    if (bytes > UINT32_MAX) {
+        set_last_error(8);
+        set_eax(c, 0);
+        return;
+    }
+    const uint32_t block = heap_alloc(uint32_t(bytes), true);
+    if (!block) {
+        set_last_error(8);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t at = block + uint32_t(args.size() + 1) * 4;
+    for (uint32_t n = 0; n < args.size(); ++n) {
+        wr32(block + n * 4, at);
+        at += (gm_put_wstr(at, args[n], (uint32_t(bytes) - (at - block)) / 2) + 1) * 2;
+    }
+    wr32(count, uint32_t(args.size()));
+    set_eax(c, block);
+}
 // gm_wstr produces valid UTF-8. Count UTF-16 units, including surrogate pairs.
 uint32_t wide_units(const std::string &s) {
     uint32_t n = 0;
@@ -78,7 +221,10 @@ void k_GetFullPathNameW(X86 *c) {
     if (pfile) {
         size_t slash = full.find_last_of('\\');
         wr32(pfile,
-             buf + (slash == std::string::npos ? 0 : 2 * wide_units(full.substr(0, slash + 1))));
+             !full.empty() && full.back() == '\\'
+                 ? 0
+                 : buf + (slash == std::string::npos ? 0
+                                                     : 2 * wide_units(full.substr(0, slash + 1))));
     }
     set_eax(c, n);
 }
@@ -606,6 +752,57 @@ void k_GetCommandLineW(X86 *c) {
 void k_GetStartupInfoW(X86 *c) {
     startup_info(c);
 }
+void k_GetEnvironmentVariableW(X86 *c) {
+    const std::string name = gm_wstr(arg(c, 0));
+    const uint32_t out = arg(c, 1), cap = arg(c, 2), block = win32_environment_block_w();
+    if (!block) {
+        set_last_error(8);
+        set_eax(c, 0);
+        return;
+    }
+    const uint32_t units = heap_size(block) / 2;
+    uint32_t pos = 0;
+    while (pos < units && rd16(block + pos * 2)) {
+        const uint32_t start = pos;
+        uint32_t equals = UINT32_MAX;
+        while (pos < units && rd16(block + pos * 2)) {
+            if (equals == UINT32_MAX && rd16(block + pos * 2) == '=')
+                equals = pos;
+            ++pos;
+        }
+        if (pos == units) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        if (equals != UINT32_MAX &&
+            os_strcasecmp(gm_wstr(block + start * 2, equals - start).c_str(), name.c_str()) == 0) {
+            const uint32_t count = pos - equals - 1;
+            if (!out || cap <= count) {
+                set_eax(c, count + 1);
+                return;
+            }
+            if (!gm_valid(out, (count + 1) * 2)) {
+                set_last_error(87);
+                set_eax(c, 0);
+                return;
+            }
+            std::memmove(gm_ptr(out), gm_ptr(block + (equals + 1) * 2), (count + 1) * 2);
+            set_eax(c, count);
+            return;
+        }
+        ++pos;
+    }
+    set_last_error(203);
+    set_eax(c, 0);
+}
+void k_SetEnvironmentVariableW(X86 *c) {
+    const auto name = gm_wstr(arg(c, 0)), value = arg(c, 1) ? gm_wstr(arg(c, 1)) : std::string();
+    const bool ok = win32_set_environment(name, arg(c, 1) ? &value : nullptr);
+    if (!ok)
+        set_last_error(87);
+    set_eax(c, ok ? 1 : 0);
+}
 void k_VerifyVersionInfoW(X86 *c) {
     uint32_t p = arg(c, 0), types = arg(c, 1);
     uint64_t mask = (uint64_t)arg(c, 2) | ((uint64_t)arg(c, 3) << 32);
@@ -900,6 +1097,11 @@ void k_EnumResourceNamesW(X86 *c) {
 }
 
 static const ImportShim g_kernel32_wide[] = {
+    {"KERNEL32.dll", "GetComputerNameA", 2, k_GetComputerNameA},
+    {"KERNEL32.dll", "GetComputerNameW", 2, k_GetComputerNameW},
+    {"KERNEL32.dll", "GetTempPathA", 2, k_GetTempPathA},
+    {"KERNEL32.dll", "GetTempPathW", 2, k_GetTempPathW},
+    {"SHELL32.dll", "CommandLineToArgvW", 2, command_line_to_argv},
     {"KERNEL32.dll", "FindResourceW", 3, k_FindResourceW},
     {"KERNEL32.dll", "LoadResource", 2, k_LoadResource},
     {"KERNEL32.dll", "LockResource", 1, k_LockResource},
@@ -908,6 +1110,8 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "EnumResourceNamesW", 4, k_EnumResourceNamesW},
 
     {"KERNEL32.dll", "GetCommandLineW", 0, k_GetCommandLineW},
+    {"KERNEL32.dll", "GetEnvironmentVariableW", 3, k_GetEnvironmentVariableW},
+    {"KERNEL32.dll", "SetEnvironmentVariableW", 2, k_SetEnvironmentVariableW},
     {"KERNEL32.dll", "GetStartupInfoW", 1, k_GetStartupInfoW},
     {"KERNEL32.dll", "VerifyVersionInfoW", 4, k_VerifyVersionInfoW},
     {"KERNEL32.dll", "VerSetConditionMask", 4, k_VerSetConditionMask},
@@ -978,6 +1182,9 @@ static const ImportShim g_kernel32_wide[] = {
 
 void kernel32_wide_register() {
     imports_register(g_kernel32_wide, sizeof g_kernel32_wide / sizeof g_kernel32_wide[0]);
+}
+void get_command_line_w(X86 *c) {
+    k_GetCommandLineW(c);
 }
 
 void kernel32_wide_reset() {

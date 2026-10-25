@@ -1422,6 +1422,8 @@ void run_step(const HostScriptStep &step) {
     }
     case HOST_SCRIPT_PAD: {
         static controls::PadState pad;
+        // Scripted pad input stands in for an attached physical controller.
+        controls::vpad().set_controller_connected(true);
         const int index = step.button;
         if (index < 13) {
             const uint16_t bit = uint16_t(1u << index);

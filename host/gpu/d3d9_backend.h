@@ -13,11 +13,15 @@
 #include "gpu.h"
 
 #include <cstdint>
+namespace d9sh {
+struct Program;
+}
 
 class D9Backend {
   public:
     virtual ~D9Backend() = default;
     virtual const char *name() const = 0;
+    virtual void shader_created(uint64_t, const d9sh::Program &) {}
 
     virtual void define(const HostD9TextureDesc &d) = 0;
     virtual void drop(uint32_t id) = 0;

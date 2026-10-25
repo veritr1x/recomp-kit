@@ -92,6 +92,7 @@ D9Backend *backend() {
 }
 
 enum class Op : uint8_t {
+    ShaderCreated,
     Draw,
     Clear,
     Stretch,
@@ -108,6 +109,8 @@ enum class Op : uint8_t {
 
 struct Command {
     Op op;
+    uint64_t shader_key = 0;
+    const d9sh::Program *program = nullptr; // immutable process-lifetime decode cache
     uint32_t a = 0, b = 0, c = 0, d = 0;
     size_t at = 0;       // payload offset in the batch's bytes
     size_t state_at = 0; // a draw's sampler and render states, in the bytes
@@ -315,6 +318,9 @@ class RenderThread {
         for (Command &cmd : b.commands) {
             const uint8_t *base = b.bytes.data();
             switch (cmd.op) {
+            case Op::ShaderCreated:
+                r_->shader_created(cmd.shader_key, *cmd.program);
+                break;
             case Op::Draw: {
                 HostD9Draw &d = cmd.draw;
                 size_t at = cmd.at;
@@ -447,6 +453,19 @@ void RenderThread::execute_pooled(Batch &b) {
 
 int host_d9_active(void) {
     return backend() != nullptr;
+}
+void host_d9_shader_created(const uint8_t *bytes, uint32_t size, uint64_t key, int pixel) {
+    RenderThread *t = render_thread();
+    if (!t || !bytes || !size)
+        return;
+    const auto &program = d9sh::program_for_key(key, bytes, size);
+    if (!program.ok || program.pixel != bool(pixel))
+        return;
+    Command c{Op::ShaderCreated};
+    c.shader_key = key;
+    c.program = &program;
+    t->batch().commands.push_back(c);
+    t->submitted();
 }
 void host_d9_texture_define(const HostD9TextureDesc *desc) {
     RenderThread *t = render_thread();
@@ -588,6 +607,9 @@ void host_d9_query_drop(uint32_t id) {
 }
 
 bool host_d9_use_device_for_test(gpu::Device *device) {
+    if (g_test_backend)
+        if (RenderThread *t = render_thread())
+            t->sync([] {});
     delete g_test_backend;
     g_test_backend = make_backend(device);
     return g_test_backend != nullptr;

@@ -5,6 +5,8 @@
 import os
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(ROOT, "tools/recomp"))
@@ -13,6 +15,33 @@ import translate as T  # noqa: E402
 from test_translate_insns import NoImage, Opts  # noqa: E402
 
 HALT, FN = 0x00401000, 0x00401100
+
+
+@pytest.mark.parametrize("name", ["ExitProcess", "ExitThread", "FatalExit", "FatalAppExitA"])
+def test_import_slot_ends_recovery_and_emission(name):
+    from test_translate_driver import synthetic_image
+    slot = 0x401800
+    image = synthetic_image({FN:b"\xff\x15" + slot.to_bytes(4,"little") + b"\x90\xc3"})
+    image.iat_names = {slot:name}
+    insns = image.recover(FN, set())
+    assert [ins.mnem for ins in insns] == ["CALL"]
+    fn = T.Function(FN, "exit_wrapper", 6, insns)
+    fn.measure(image)
+    tr = T.Translator(image, {FN}, Opts())
+    tr.prepare(fn)
+    assert tr.never_returns(insns[0])
+    text = "\n".join(tr.translate(fn))
+    assert "recomp_unknown_call(c, 0x401106u); return;" in text
+    assert "fall-through past" not in text
+
+
+@pytest.mark.parametrize("name", ["RaiseException", "TerminateProcess", "OrdinaryImport"])
+def test_imports_that_can_return_keep_their_successor(name):
+    from test_translate_driver import synthetic_image
+    slot = 0x401800
+    image = synthetic_image({FN:b"\xff\x15" + slot.to_bytes(4,"little") + b"\x90\xc3"})
+    image.iat_names = {slot:name}
+    assert [ins.mnem for ins in image.recover(FN,set())] == ["CALL","NOP","RET"]
 
 
 def translate(listing, entries=()):

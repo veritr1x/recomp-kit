@@ -1,0 +1,5 @@
+cmake==4.1.2
+ninja==1.13.0
+# Native integration tests generate C with the production translator.
+capstone==5.0.9
+tomli==2.2.1; python_version < "3.11"

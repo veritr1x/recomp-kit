@@ -14,6 +14,7 @@ namespace launcher {
 // build (spec_from_config); built by hand in the tests.
 struct Spec {
     std::string title, store_url, executable, sha256;
+    std::string exe_dir; // relative to the game root, empty for root-level EXEs
     std::vector<std::string> required_dirs, exclude, install_names, gog_ids, steam_ids;
     uint64_t min_free_bytes = 0;
 };
@@ -24,7 +25,7 @@ const char *state_name(State s);
 
 struct Status {
     State state = State::NotFound;
-    std::string root;                 // the folder holding the executable ("" when not found)
+    std::string root;                 // game root, above exe_dir ("" when not found)
     std::string exe;                  // its path as found on disk
     std::string digest;               // its SHA-256 when it was hashed
     std::vector<std::string> missing; // required folders not present

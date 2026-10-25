@@ -2,6 +2,7 @@
 // owns: cache keys, the D3DFORMAT table, CPU-side pixel conversion and DXT
 // decoding, and the D3D state enumerations spelled as numbers.
 #pragma once
+#include "render_scale.h"
 #include <cstdint>
 #include <cstring>
 #include <vector>

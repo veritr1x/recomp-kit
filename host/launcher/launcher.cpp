@@ -1,5 +1,6 @@
 // launcher.cpp - see launcher.h.
 #include "launcher.h"
+#include "../../runtime/guest_layout.h"
 
 #include "../../platform/os.h"
 #include "../../third_party/miniz/miniz.h"
@@ -126,22 +127,47 @@ std::string find_name(const std::string &dir, const std::string &name) {
     return folded;
 }
 
+// Resolve each configured component without case; return the actual EXE path.
+static std::string executable_at(const Spec &spec, const std::string &root) {
+    std::string folder = root;
+    std::istringstream components(guest_layout::slashes(spec.exe_dir));
+    std::string component;
+    while (std::getline(components, component, '/')) {
+        const std::string found = find_name(folder, component);
+        if (found.empty())
+            return "";
+        folder = join(folder, found);
+        if (!is_dir(folder))
+            return "";
+    }
+    const std::string name = find_name(folder, spec.executable);
+    return name.empty() || !is_file(join(folder, name)) ? "" : join(folder, name);
+}
+
 std::string find_root(const Spec &spec, const std::string &picked) {
     const std::string path = normalize(picked);
     if (path.empty())
         return "";
-    if (is_file(path))
-        return same_name(base_of(path), spec.executable) ? parent_of(path) : "";
+    if (is_file(path)) {
+        std::string root;
+        return same_name(base_of(path), spec.executable) &&
+                       guest_layout::root_from_exe(parent_of(path), spec.exe_dir, &root)
+                   ? root
+                   : "";
+    }
     if (!is_dir(path))
         return "";
+    std::string selected_root;
+    if (!spec.exe_dir.empty() && guest_layout::root_from_exe(path, spec.exe_dir, &selected_root) &&
+        !executable_at(spec, selected_root).empty())
+        return selected_root;
     // Breadth first, so the shallowest copy wins: an install often carries
     // backups or tools folders beside the real one.
     std::vector<std::string> level{path};
     for (int depth = 0; depth <= 2 && !level.empty(); ++depth) {
         std::vector<std::string> next;
         for (const std::string &dir : level) {
-            const std::string name = find_name(dir, spec.executable);
-            if (!name.empty() && is_file(join(dir, name)))
+            if (!executable_at(spec, dir).empty())
                 return dir;
             if (depth < 2)
                 for (const std::string &child : children(dir))
@@ -170,11 +196,11 @@ const char *state_name(State s) {
 Status check(const Spec &spec, const std::string &root_in, const std::string &cache_file) {
     Status s;
     const std::string root = normalize(root_in);
-    const std::string exe_name = root.empty() ? "" : find_name(root, spec.executable);
-    if (exe_name.empty() || !is_file(join(root, exe_name)))
+    const std::string exe = root.empty() ? "" : executable_at(spec, root);
+    if (exe.empty())
         return s;
     s.root = root;
-    s.exe = join(root, exe_name);
+    s.exe = exe;
     for (const std::string &dir : spec.required_dirs) {
         const std::string name = find_name(root, dir);
         if (name.empty() || !is_dir(join(root, name)))
@@ -628,8 +654,15 @@ ImportOutcome import_game(const Spec &spec, Source &source, const std::string &d
     for (const Entry &e : all) {
         if (e.is_dir || junk(e.relative) || !same_name(base_of(e.relative), spec.executable))
             continue;
+        std::string candidate_root;
+        if (!guest_layout::root_from_exe(parent_of(e.relative), spec.exe_dir, &candidate_root))
+            continue;
         const size_t depth = size_t(std::count(e.relative.begin(), e.relative.end(), '/'));
-        if (depth < exe_depth && depth <= 3) {
+        const size_t suffix_depth =
+            spec.exe_dir.empty()
+                ? 0
+                : 1 + size_t(std::count(spec.exe_dir.begin(), spec.exe_dir.end(), '/'));
+        if (depth < exe_depth && depth <= 3 + suffix_depth) {
             exe = &e;
             exe_depth = depth;
         }
@@ -639,7 +672,8 @@ ImportOutcome import_game(const Spec &spec, Source &source, const std::string &d
         out.error = "no " + spec.executable + " in the chosen files";
         return out;
     }
-    const std::string base = parent_of(exe->relative);
+    std::string base;
+    guest_layout::root_from_exe(parent_of(exe->relative), spec.exe_dir, &base);
     const std::string prefix = base.empty() ? "" : base + "/";
     // The source's entry, and its path under dest.
     struct File {
@@ -662,7 +696,7 @@ ImportOutcome import_game(const Spec &spec, Source &source, const std::string &d
         if (e.is_dir)
             dirs.push_back(relative);
         else {
-            if (same_name(relative, spec.executable))
+            if (&e == exe)
                 exe_relative = relative;
             files.push_back({e, relative});
         }
@@ -960,8 +994,7 @@ std::vector<std::string> detect_under(const Spec &spec, const std::vector<std::s
         if (!is_dir(base))
             continue;
         // The base itself may be the game (a registry or Steam path).
-        const std::string exe = find_name(base, spec.executable);
-        if (!exe.empty() && is_file(join(base, exe))) {
+        if (!executable_at(spec, base).empty()) {
             add(base);
             continue;
         }
@@ -980,8 +1013,7 @@ std::vector<std::string> detect_under(const Spec &spec, const std::vector<std::s
             if (named)
                 add(find_root(spec, dir));
             else {
-                const std::string e = find_name(dir, spec.executable);
-                if (!e.empty() && is_file(join(dir, e)))
+                if (!executable_at(spec, dir).empty())
                     add(dir);
             }
         }

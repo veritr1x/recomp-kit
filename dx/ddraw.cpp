@@ -17,6 +17,7 @@
 #include "dx.h"
 #include "host_api.h"
 #include "ddraw.h"
+#include "game_config.h"
 #include "../runtime/memory.h"
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
@@ -4675,9 +4676,9 @@ void DD_WaitForVerticalBlank(X86 *c) {
 void DD_GetAvailableVidMem(X86 *c) {
     uint32_t total = arg(c, 2), free_ = arg(c, 3);
     if (total && gm_valid(total, 4))
-        wr32(total, 32u * 1024 * 1024);
+        wr32(total, RECOMP_ADAPTER_VIDEO_MEMORY_MB * 1024u * 1024u);
     if (free_ && gm_valid(free_, 4))
-        wr32(free_, 24u * 1024 * 1024);
+        wr32(free_, uint32_t(uint64_t(RECOMP_ADAPTER_VIDEO_MEMORY_MB) * 1024 * 1024 * 3 / 4));
     com_ret(c, DD_OK);
 }
 

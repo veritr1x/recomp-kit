@@ -24,6 +24,7 @@ const Spec &spec_from_config() {
         s.title = RECOMP_LAUNCHER_TITLE;
         s.store_url = RECOMP_LAUNCHER_STORE_URL;
         s.executable = RECOMP_EXECUTABLE;
+        s.exe_dir = RECOMP_EXE_DIR;
         s.sha256 = RECOMP_EXE_SHA256;
         s.required_dirs = strings(required);
         s.exclude = strings(exclude);

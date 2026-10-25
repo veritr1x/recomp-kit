@@ -140,7 +140,7 @@ class IosPlatform final : public launcher::Platform {
             "or the Files app, then open the app again.";
         const fs::path bundled = fs::path(bundle_dir()) / "game";
         std::error_code ec;
-        if (fs::is_regular_file(bundled / RECOMP_EXECUTABLE, ec))
+        if (fs::is_regular_file(bundled / RECOMP_EXE_DIR / RECOMP_EXECUTABLE, ec))
             i.auto_import = bundled.string();
         return i;
     }

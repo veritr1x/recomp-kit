@@ -72,6 +72,8 @@ class X86(C.Structure):
         ("fs_base", C.c_uint32),
         ("xmm", (C.c_uint32 * 4) * 8),
         ("mm", C.c_uint64 * 8),
+        ("mxcsr_xor", C.c_uint32),
+        ("backedge_count", C.c_uint32),
     ]
 
 
@@ -249,6 +251,18 @@ def sse_scalar_setup(rng):
                     (SCRATCH + 0x100, b"\x00" * 0x100)]}
 
 
+def check_mxcsr_at(offset, rc=0):
+    def check(native, emu):
+        a = struct.unpack("<I", native[offset:offset+4])[0]
+        b = struct.unpack("<I", emu[offset:offset+4])[0]
+        # Unicorn does not report conversion exception status in MXCSR.
+        # Compare every other bit; native vector_tests pins invalid/precision
+        # status independently against the SDM's specified results.
+        assert a & ~0x3f == b & ~0x3f
+        assert (a >> 13) & 3 == rc
+    return check
+
+
 CASES = [
     # A listing that misdecodes data as code can produce the port string
     # forms. A user-mode guest never reaches one, so what matters is that the
@@ -382,7 +396,8 @@ CASES = [
                                struct.pack("<d", rng.uniform(-1e6, 1e6))
                                + struct.pack("<q", 0)
                                + struct.pack("<i", rng.randrange(-100000, 100000))),
-                              (SCRATCH + 0x100, b"\x00" * 0x40)]}),
+                              (SCRATCH + 0x100, b"\x00" * 0x40)]},
+         ignore=((SCRATCH+0x118,4),), check=check_mxcsr_at(SCRATCH+0x118)),
     Case("Port string forms store the port read and advance", 0x0D02D000,
          [(0, "INSD ES:EDI,DX"), (1, "INSD.REP ES:EDI,DX"), (3, "OUTSD ESI,DX"),
           (4, "RET")],
@@ -686,6 +701,99 @@ def translate_case(case):
     assert "FN(" not in text, "synthetic cases must not call anything"
     return text
 
+
+# SSE1 and x87 forms used unconditionally by later games. The instruction
+# bytes are independent inputs: decode them with the production decoder, then
+# compare generated native execution with Unicorn.
+def _sse_setup(rng, positive=False, special=False):
+    choices = [0.0625, 0.25, 1, 4, 16, 64] if positive else [-8, -4, -1, -0.0, 0.5, 1, 2, 4, 8]
+    values = [rng.choice(choices) for _ in range(8)]
+    if special:
+        values = [rng.choice(choices + [float("nan"), float("inf"), -float("inf")]) for _ in range(8)]
+    return {"regs": dict(rand_regs(rng), ESI=SCRATCH+0x300, EDI=SCRATCH+0x100),
+            "mem": [(SCRATCH+0x300, struct.pack("<8f", *values))]}
+
+
+def _decoded_case(name, code, setup, **kwargs):
+    import capstone
+    addr = CODE_BASE + 0x100
+    while any(addr < c.addr + len(c.code) and c.addr < addr + 0x100 for c in CASES):
+        addr += 0x100
+    decoder = T.Image.__new__(T.Image)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md.detail = True
+    raw = bytes.fromhex(code)
+    lines = []
+    for ci in md.disasm(raw, addr):
+        ins = decoder.to_insn(ci)
+        lines.append((ins.addr-addr, ins.mnem + (" " + ",".join(ins.ops) if ins.ops else "")))
+    assert sum(ci.size for ci in md.disasm(raw, addr)) == len(raw)
+    return Case(name, addr, lines, code, setup, **kwargs)
+
+
+for _name, _op in (("ADDPS","58"),("SUBPS","5c"),("MULPS","59"),("DIVPS","5e"),
+                    ("MINPS","5d"),("MAXPS","5f")):
+    CASES.append(_decoded_case(_name + " register alias", "0f1006 0f104e10 0f"+_op+"c1 0f1107 c3",
+                              lambda rng, special=_name in ("MINPS","MAXPS"): _sse_setup(rng,special=special)))
+for _name, _prefix, _op in (("SQRTPS","","51"),("RSQRTPS","","52"),("RCPPS","","53"),
+                             ("RSQRTSS","f3","52"),("RCPSS","f3","53")):
+    CASES.append(_decoded_case(_name, "0f1006 0f104e10 "+_prefix+"0f"+_op+"c1 0f1107 c3",
+                              lambda rng: _sse_setup(rng,positive=True)))
+for _name, _op in (("MOVHLPS","12"),("MOVLHPS","16")):
+    CASES.append(_decoded_case(_name, "0f1006 0f104e10 0f"+_op+"c1 0f1107 c3", _sse_setup))
+CASES.append(_decoded_case("MOVMSKPS", "0f1006 0f50c0 8907 c3", _sse_setup))
+for _suffix, _prefix in (("PS",""),("SS","f3"),("PD","66"),("SD","f2")):
+    for _predicate in range(8):
+        CASES.append(_decoded_case("CMP"+_suffix+" predicate "+str(_predicate),
+                                  "0f1006 0f104e10 "+_prefix+"0fc2c1%02x 0f1107 c3" % _predicate,
+                                  lambda rng: _sse_setup(rng,special=True)))
+for _name, _prefix, _op in (("MINSS","f3","5d"),("MAXSS","f3","5f"),
+                             ("MINSD","f2","5d"),("MAXSD","f2","5f")):
+    CASES.append(_decoded_case(_name + " ordered and unordered", "0f1006 0f104e10 "+_prefix+"0f"+_op+"c1 0f1107 c3",
+                              lambda rng: _sse_setup(rng,special=True)))
+
+
+def _convert_setup(rng, single, rc):
+    value = rng.choice([-2147483648.0,2147483648.0,float("nan"),float("inf"),-float("inf"),
+                        1.5,-1.5,2.5,-2.5,0.49])
+    data = struct.pack("<f" if single else "<d", value)
+    data += bytes(0x20-len(data)) + struct.pack("<I",0x1f80 | rc << 13)
+    return {"regs": dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+            "mem": [(SCRATCH+0x300,data)]}
+
+
+for _single, _prefix in ((True,"f3"),(False,"f2")):
+    for _trunc, _op in ((True,"2c"),(False,"2d")):
+        for _rc in range(4):
+            for _memory in (False,True):
+                CASES.append(_decoded_case("SSE int conversion %s %s rc%d %s" % (_single,_trunc,_rc,_memory),
+                    "0fae5620 0f1006 "+_prefix+"0f"+_op+("06" if _memory else "c0")+" 8907 0fae5f04 c3",
+                    lambda rng,single=_single,rc=_rc: _convert_setup(rng,single,rc),
+                    ignore=((SCRATCH+0x104,4),),check=check_mxcsr_at(SCRATCH+0x104,_rc)))
+for _name, _op in (("CVTPS2PI","2d"),("CVTTPS2PI","2c")):
+    CASES.append(_decoded_case(_name, "0f1006 0f"+_op+"c0 0f7f07 0f77 c3", _sse_setup))
+CASES.append(_decoded_case("CVTPI2PS preserves upper lanes", "0f1006 0f6f4610 0f2ac0 0f1107 0f77 c3",
+                          lambda rng: {"regs":dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+                                       "mem":[(SCRATCH+0x300,bytes(16)+struct.pack("<ii",rng.randrange(-100000,100000),rng.randrange(-100000,100000)))]}))
+for _name, _op in (("FCMOVB","dac1"),("FCMOVE","dac9"),("FCMOVBE","dad1"),("FCMOVU","dad9"),
+                    ("FCMOVNB","dbc1"),("FCMOVNE","dbc9"),("FCMOVNBE","dbd1"),("FCMOVNU","dbd9")):
+    CASES.append(_decoded_case(_name + " consumes live flags", "dd06 dd4608 39d0 "+_op+" dd1f ddd8 c3",
+                              lambda rng: {"regs":dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+                                           "mem":[(SCRATCH+0x300,struct.pack("<dd",2.5,-3.5))]}))
+for _name, _op in (("FCOMPI","dff1"),("FUCOMPI","dfe9")):
+    CASES.append(_decoded_case(_name, "dd06 dd4608 "+_op+" 9c58 8907 ddd8 c3",
+                              lambda rng: {"regs":dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+                                           "mem":[(SCRATCH+0x300,struct.pack("<dd",rng.choice([2.5,-3.5]),2.5))]}))
+for _name, _op in (("FFREE","ddc1"),("FFREEP","dfc1")):
+    CASES.append(_decoded_case(_name + " tags and TOP", "dd06 dd4608 "+_op+" d937 0fb74708 894720 dfe0 66894724 c3",
+                              lambda rng: {"regs":dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+                                           "mem":[(SCRATCH+0x300,struct.pack("<dd",2.5,3.5))]},
+                              ignore=((SCRATCH+0x100,28),)))
+for _bits, _op in ((16,"df0f"),(32,"db0f"),(64,"dd0f")):
+    CASES.append(_decoded_case("FISTTP%d ignores RC" % _bits, "d96e10 dd06 "+_op+" c3",
+                              lambda rng: {"regs":dict(rand_regs(rng),ESI=SCRATCH+0x300,EDI=SCRATCH+0x100),
+                                           "mem":[(SCRATCH+0x300,struct.pack("<d",rng.choice([1.5,-1.5,2.5,-2.5]))+bytes(8)+struct.pack("<H",0x0b7f))]}))
+CASES.append(_decoded_case("SAL slash-six alias", "d1f0 c3", lambda rng: {"regs":rand_regs(rng)}))
 
 # ------------------------------------------------------------------ build --
 

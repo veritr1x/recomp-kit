@@ -21,6 +21,7 @@
 #include "../../present.h"
 #include "../d3d9_backend.h"
 #include "../d3d9_common.h"
+#include "../d3d9_warm.h"
 
 #include <atomic>
 #include <cmath>
@@ -324,13 +325,38 @@ struct QuadIn {
     float color[4];
 };
 
+struct WarmFunction {
+    id<MTLFunction> value = nil;
+};
+struct WarmPipeline {
+    id<MTLRenderPipelineState> value = nil;
+};
+
 class Renderer final : public D9Backend {
+    struct VDesc {
+        MTLVertexDescriptor *desc = nil;
+        float ascale[16][4] = {};
+        uint32_t streams = 0;
+        bool zero = false;
+    };
+
   public:
     const char *name() const override {
         return "Metal";
     }
     explicit Renderer(gpu::MetalDevice *device)
         : device_(device), mtl_(device->native()), queue_(device->native_queue()) {
+        if (warm_enabled_) {
+            warm_pool_ = std::make_unique<d9warm::Pool>(2);
+            warm_hints_.load();
+            for (const auto &hint : warm_hints_.shaders())
+                shader_hints_[{hint.code, hint.pixel}].push_back(hint);
+            for (const auto &hint : warm_hints_.pipelines()) {
+                pipeline_hints_[hint.vertex].push_back(hint);
+                pipeline_hints_[hint.pixel].push_back(hint);
+            }
+            save_hints();
+        }
         bc_ = false;
         if (@available(macOS 11.0, iOS 16.4, *))
             bc_ = mtl_.supportsBCTextureCompression;
@@ -351,12 +377,89 @@ class Renderer final : public D9Backend {
         memset(zero_.contents, 0, 64);
     }
 
+    ~Renderer() override {
+        // Workers may own device objects and reference the caches below.
+        // Join before any member (including the Metal device) is released.
+        if (warm_pool_)
+            warm_pool_->stop();
+        if (warm_enabled_)
+            warm_hints_.flush();
+        flush();
+        wait(); // completion handlers still refer to this renderer's counters
+        for (auto &[id, texture] : textures_) {
+            (void)id;
+            if (texture.imported)
+                device_->destroy(texture.imported);
+        }
+    }
+
+    void shader_created(uint64_t key, const d9sh::Program &program) override {
+        if (!warm_enabled_ || !program.ok)
+            return;
+        if (!programs_.emplace(std::make_pair(key, program.pixel), &program).second)
+            return;
+        queue_function(key, program, {});
+        auto shader = shader_hints_.find({key, program.pixel});
+        if (shader != shader_hints_.end())
+            for (const auto &hint : shader->second)
+                queue_function(key, program, variant_from_key(hint.variant));
+        auto pipelines = pipeline_hints_.find(key);
+        if (pipelines == pipeline_hints_.end())
+            return;
+        for (const auto &hint : pipelines->second) {
+            if (!valid_hint(hint))
+                continue;
+            auto vs = programs_.find({hint.vertex, false});
+            auto ps = programs_.find({hint.pixel, true});
+            if (vs == programs_.end() || ps == programs_.end())
+                continue;
+            const auto *vp = vs->second;
+            const auto *pp = ps->second;
+            warm_pipelines_.enqueue(*warm_pool_, hint.line(), [this, hint, vp, pp] {
+                return compile_pipeline(hint, *vp, *pp);
+            });
+        }
+    }
+
     bool ok() const {
         return utility_ != nil;
+    }
+    bool valid_hint(const d9warm::PipelineHint &hint) const {
+        if (![mtl_ supportsTextureSampleCount:hint.samples])
+            return false;
+        if (hint.depth && hint.depth != MTLPixelFormatDepth32Float_Stencil8)
+            return false;
+        for (uint32_t color : hint.colors) {
+            switch (MTLPixelFormat(color)) {
+            case MTLPixelFormatInvalid:
+            case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatA8Unorm:
+            case MTLPixelFormatRGBA16Unorm:
+            case MTLPixelFormatR16Float:
+            case MTLPixelFormatRGBA16Float:
+            case MTLPixelFormatR32Float:
+            case MTLPixelFormatRGBA32Float:
+                break;
+            default:
+                return false;
+            }
+        }
+        for (uint32_t stride : hint.strides)
+            if (stride > 2048)
+                return false;
+        for (size_t i = 0; i + 8 < hint.declaration.size(); i += 8) {
+            const auto *e = hint.declaration.data() + i;
+            const uint32_t stream = e[0] | uint32_t(e[1]) << 8;
+            const uint32_t offset = e[2] | uint32_t(e[3]) << 8;
+            if (stream >= 8 || offset > 2047 || e[4] > 16 || e[5] || e[6] > 13 || e[7] > 15)
+                return false;
+        }
+        return true;
     }
 
     // ---- textures ------------------------------------------------------
     void define(const HostD9TextureDesc &d) override {
+        ++frame_textures_;
         end_pass();
         Tex &t = textures_[d.id];
         if (t.imported)
@@ -380,11 +483,11 @@ class Renderer final : public D9Backend {
         // Render targets and depth buffers render at the chosen scale; the
         // guest keeps seeing its own sizes.
         bool target = (d.usage & (HOST_D9_USAGE_RENDERTARGET | HOST_D9_USAGE_DEPTH)) || depth;
-        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D) {
-            // The first target is the back buffer; its height is what the
-            // scale is measured against from then on.
+        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D &&
+            set_render_scale_base(d.height, base_rows_)) {
+            // Ignore small bookkeeping targets when choosing the initial
+            // rendering size. Present can update it from a real back buffer.
             scale_chosen_ = true;
-            base_rows_ = d.height;
             const float want = wanted_scale();
             if (want > 0)
                 scale_ = want;
@@ -448,6 +551,7 @@ class Renderer final : public D9Backend {
 
     void upload(uint32_t id, uint32_t face, uint32_t level, const uint8_t *bytes,
                 uint32_t pitch) override {
+        ++frame_uploads_;
         auto it = textures_.find(id);
         if (it == textures_.end() || !it->second.texture || !bytes)
             return;
@@ -559,6 +663,7 @@ class Renderer final : public D9Backend {
     // ---- buffers --------------------------------------------------------
     void buffer_upload(uint32_t id, uint32_t total, uint32_t offset, const uint8_t *bytes,
                        uint32_t size) override {
+        ++frame_uploads_;
         Buf &b = buffers_[id];
         if (offset + size > total || !bytes)
             return;
@@ -637,6 +742,8 @@ class Renderer final : public D9Backend {
                         d.label ? d.label : "no label");
             return;
         }
+        shader_created(vs_key, vp);
+        shader_created(ps_key, pp);
         d9msl::PixelVariant variant;
         Tex *bound[16];
         for (uint32_t s = 0; s < 16; ++s) {
@@ -664,15 +771,25 @@ class Renderer final : public D9Backend {
         for (auto &a : ascale)
             for (float &x : a)
                 x = 1.0f;
-        uint64_t vkey =
-            mix(mix((uint64_t)d.decl_id << 32 | d.decl_size, vs_key), fnv(d.decl, d.decl_size));
+        uint64_t vkey = mix(mix(d.decl_size, vs_key), fnv(d.decl, d.decl_size));
         {
             uint64_t strides = 0;
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < 8; ++i) {
                 strides = strides * 1099511628211ull + d.stream[i].stride;
+                strides =
+                    mix(strides, uint64_t(d.stream[i].frequency & HOST_D9_STREAM_INSTANCE) << 32 |
+                                     host_d9_stream_rate(d.stream[i].frequency));
+            }
             vkey = mix(vkey, strides);
         }
-        MTLVertexDescriptor *vdesc = vertex_descriptor(d, vp, vkey, ascale);
+        (void)vertex_descriptor(d, vp, vkey, ascale);
+        for (uint32_t stream = 0; stream < 8; ++stream)
+            if ((stream_mask_ >> stream & 1) &&
+                !(d.stream[stream].frequency & HOST_D9_STREAM_INSTANCE) &&
+                host_d9_stream_rate(d.stream[stream].frequency) > 1) {
+                skip("software vertex-frequency division is unsupported");
+                return;
+            }
 
         // Pipeline.
         uint64_t key = mix(mix(vs_key, ps_key), variant.key());
@@ -688,15 +805,16 @@ class Renderer final : public D9Backend {
         key = mix(key, df);
         bool blend = rs[27] != 0;
         uint32_t cw[4] = {rs[168], rs[190], rs[191], rs[192]};
-        uint64_t bkey =
-            blend ? (1ull | (uint64_t)rs[19] << 1 | (uint64_t)rs[20] << 5 | (uint64_t)rs[171] << 9 |
-                     (uint64_t)(rs[206] != 0) << 13 | (uint64_t)rs[207] << 14 |
-                     (uint64_t)rs[208] << 18 | (uint64_t)rs[209] << 22)
-                  : 0;
+        uint64_t bkey = blend ? (1ull | (uint64_t)rs[19] << 1 | (uint64_t)rs[20] << 5 |
+                                 (uint64_t)rs[171] << 9 | (uint64_t)(rs[206] != 0) << 13 |
+                                 (rs[206] ? (uint64_t)rs[207] << 14 | (uint64_t)rs[208] << 18 |
+                                                (uint64_t)rs[209] << 22
+                                          : 0))
+                              : 0;
         key = mix(key, bkey);
         key = mix(key, (uint64_t)cw[0] | (uint64_t)cw[1] << 4 | (uint64_t)cw[2] << 8 |
                            (uint64_t)cw[3] << 12);
-        id<MTLRenderPipelineState> pso = pipeline(key, vfn, ffn, vdesc, cf, df, blend, rs, cw);
+        id<MTLRenderPipelineState> pso = pipeline(key, d, vp, pp, variant, cf, df);
         if (!pso) {
             skip("no pipeline");
             return;
@@ -1063,6 +1181,15 @@ class Renderer final : public D9Backend {
         for (auto &s : skips_)
             fprintf(stderr, ", %s %llu", s.first.c_str(), (unsigned long long)s.second);
         fprintf(stderr, "\n");
+        fprintf(
+            stderr,
+            "d3d9 metal: warm %llu builds, %llu takeovers, %llu waits, %llu abandoned, compile "
+            "%.2f ms\n",
+            (unsigned long long)(warm_functions_.stats.builds + warm_pipelines_.stats.builds),
+            (unsigned long long)(warm_functions_.stats.takeovers + warm_pipelines_.stats.takeovers),
+            (unsigned long long)(warm_functions_.stats.waits + warm_pipelines_.stats.waits),
+            (unsigned long long)(warm_functions_.stats.abandoned + warm_pipelines_.stats.abandoned),
+            compile_us_.load() / 1000.0);
     }
 
     void clear(const HostD9Target &target, const int32_t vp[4], uint32_t count,
@@ -1221,7 +1348,7 @@ class Renderer final : public D9Backend {
             return;
         }
         Tex &t = it->second;
-        base_rows_ = t.desc.height;
+        set_render_scale_base(t.desc.height, base_rows_);
         w = (uint32_t)t.texture.width;
         h = (uint32_t)t.texture.height;
         keep_presented(t, w, h);
@@ -1241,6 +1368,7 @@ class Renderer final : public D9Backend {
             device_->commit(cb);
         }
         ++presents_;
+        profile_frame();
         if (presents_ % 300 == 1)
             report();
         follow_drawable();
@@ -1542,7 +1670,9 @@ class Renderer final : public D9Backend {
         {
             const double t0 = CACurrentMediaTime();
             dispatch_semaphore_wait(frames_, DISPATCH_TIME_FOREVER);
-            gpu_wait_s_ += CACurrentMediaTime() - t0;
+            const double waited = CACurrentMediaTime() - t0;
+            gpu_wait_s_ += waited;
+            frame_gpu_wait_s_ += waited;
         }
         cmd_ = [queue_ commandBuffer];
         ++serial_;
@@ -1577,7 +1707,9 @@ class Renderer final : public D9Backend {
         if (last_) {
             const double t0 = CACurrentMediaTime();
             [last_ waitUntilCompleted];
-            gpu_wait_s_ += CACurrentMediaTime() - t0;
+            const double waited = CACurrentMediaTime() - t0;
+            gpu_wait_s_ += waited;
+            frame_gpu_wait_s_ += waited;
             last_ = nil;
         }
         in_flight_ = false;
@@ -1623,12 +1755,18 @@ class Renderer final : public D9Backend {
     }
 
     // ---- shaders --------------------------------------------------------
-    id<MTLFunction> function(uint64_t code_key, const d9sh::Program &p,
-                             const d9msl::PixelVariant &v, bool pixel) {
+    id<MTLFunction> build_function(uint64_t code_key, const d9sh::Program &p,
+                                   const d9msl::PixelVariant &v, bool pixel) {
+        const double started = CACurrentMediaTime();
+        struct Count {
+            Renderer *owner;
+            double start;
+            ~Count() {
+                ++owner->compile_count_;
+                owner->compile_us_ += uint64_t((CACurrentMediaTime() - start) * 1e6);
+            }
+        } count{this, started};
         uint64_t key = mix(code_key, pixel ? v.key() + 1 : 0);
-        auto it = functions_.find(key);
-        if (it != functions_.end())
-            return it->second;
         std::string src, why;
         bool ok =
             pixel ? d9msl::pixel_source(p, v, &src, &why) : d9msl::vertex_source(p, &src, &why);
@@ -1656,14 +1794,62 @@ class Renderer final : public D9Backend {
                 fprintf(stderr, "d3d9 metal: a %s shader failed to compile: %s\n",
                         pixel ? "pixel" : "vertex", error.localizedDescription.UTF8String);
         } else {
-            char key_text[64];
-            snprintf(key_text, sizeof key_text, "d3d9.metal.untranslated.%llx",
-                     (unsigned long long)key);
-            log_once(key_text, "d3d9 metal: a %s shader is not translated: %s",
-                     pixel ? "pixel" : "vertex", why.c_str());
+            // The once cache already limits this to one report per variant.
+            // Runtime log_once belongs to the cooperative guest thread.
+            fprintf(stderr, "d3d9 metal: a %s shader is not translated: %s\n",
+                    pixel ? "pixel" : "vertex", why.c_str());
         }
-        functions_[key] = fn;
         return fn;
+    }
+
+    static d9msl::PixelVariant variant_from_key(uint64_t key) {
+        d9msl::PixelVariant v;
+        v.projected_mask = uint16_t(key);
+        v.cube_mask = uint16_t(key >> 16);
+        v.depth_mask = uint16_t(key >> 32);
+        v.alpha_mask = uint16_t(key >> 48);
+        return v;
+    }
+    auto function_builder(uint64_t code, const d9sh::Program &p, d9msl::PixelVariant v) {
+        return [this, code, &p, v] {
+            @autoreleasepool {
+                auto result = std::make_shared<WarmFunction>();
+                result->value = build_function(code, p, v, p.pixel);
+                return result;
+            }
+        };
+    }
+    void queue_function(uint64_t code, const d9sh::Program &p, d9msl::PixelVariant v) {
+        d9warm::ShaderHint hint{code, p.pixel ? v.key() : 0, p.pixel};
+        warm_functions_.enqueue(*warm_pool_, hint.line(), function_builder(code, p, v));
+    }
+    id<MTLFunction> shared_function(uint64_t code, const d9sh::Program &p, d9msl::PixelVariant v) {
+        d9warm::ShaderHint hint{code, p.pixel ? v.key() : 0, p.pixel};
+        auto value = warm_functions_.get(hint.line(), function_builder(code, p, v));
+        return value ? (*value)->value : nil;
+    }
+    id<MTLFunction> function(uint64_t code, const d9sh::Program &p, d9msl::PixelVariant v,
+                             bool pixel) {
+        const uint64_t key = mix(code, pixel ? v.key() + 1 : 0);
+        auto found = functions_.find(key);
+        if (found != functions_.end())
+            return found->second;
+        if (warm_enabled_) {
+            warm_hints_.remember(d9warm::ShaderHint{code, pixel ? v.key() : 0, pixel});
+            save_hints();
+        }
+        id<MTLFunction> result = shared_function(code, p, v);
+        functions_[key] = result;
+        return result;
+    }
+    void save_hints() {
+        if (!warm_pool_ || flush_queued_.exchange(true))
+            return;
+        if (!warm_pool_->submit([this] {
+                flush_queued_ = false;
+                warm_hints_.flush();
+            }))
+            flush_queued_ = false;
     }
 
     MTLVertexDescriptor *vertex_descriptor(const HostD9Draw &d, const d9sh::Program &vp,
@@ -1675,6 +1861,14 @@ class Renderer final : public D9Backend {
             vdesc_needs_zero_ = it->second.zero;
             return it->second.desc;
         }
+        const VDesc v = make_vertex_descriptor(d, vp);
+        memcpy(ascale, v.ascale, sizeof v.ascale);
+        stream_mask_ = v.streams;
+        vdesc_needs_zero_ = v.zero;
+        vdescs_[key] = v;
+        return v.desc;
+    }
+    VDesc make_vertex_descriptor(const HostD9Draw &d, const d9sh::Program &vp) {
         VDesc v;
         MTLVertexDescriptor *desc = [MTLVertexDescriptor vertexDescriptor];
         uint32_t streams = 0;
@@ -1720,7 +1914,10 @@ class Renderer final : public D9Backend {
                 continue;
             uint32_t stride = d.stream[s].stride ? d.stream[s].stride : stream_end[s];
             desc.layouts[s].stride = std::max(stride, stream_end[s]);
-            desc.layouts[s].stepFunction = MTLVertexStepFunctionPerVertex;
+            desc.layouts[s].stepFunction = (d.stream[s].frequency & HOST_D9_STREAM_INSTANCE)
+                                               ? MTLVertexStepFunctionPerInstance
+                                               : MTLVertexStepFunctionPerVertex;
+            desc.layouts[s].stepRate = host_d9_stream_rate(d.stream[s].frequency);
         }
         if (zero) {
             desc.layouts[8].stride = 16;
@@ -1734,23 +1931,82 @@ class Renderer final : public D9Backend {
             for (int k = 0; k < 4; ++k)
                 if (v.ascale[r][k] == 0.0f)
                     v.ascale[r][k] = 1.0f;
-        memcpy(ascale, v.ascale, sizeof v.ascale);
-        stream_mask_ = streams;
-        vdesc_needs_zero_ = zero;
-        vdescs_[key] = v;
-        return desc;
+        return v;
     }
 
-    id<MTLRenderPipelineState> pipeline(uint64_t key, id<MTLFunction> vfn, id<MTLFunction> ffn,
-                                        MTLVertexDescriptor *vdesc, const MTLPixelFormat cf[4],
-                                        MTLPixelFormat df, bool blend, const uint32_t *rs,
-                                        const uint32_t cw[4]) {
+    std::shared_ptr<WarmPipeline> compile_pipeline(const d9warm::PipelineHint &hint,
+                                                   const d9sh::Program &vp,
+                                                   const d9sh::Program &pp) {
+        @autoreleasepool {
+            auto result = std::make_shared<WarmPipeline>();
+            id<MTLFunction> vfn = shared_function(hint.vertex, vp, {});
+            id<MTLFunction> ffn = shared_function(hint.pixel, pp, variant_from_key(hint.variant));
+            if (!vfn || !ffn)
+                return result;
+            HostD9Draw draw{};
+            draw.decl = hint.declaration.data();
+            draw.decl_size = uint32_t(hint.declaration.size());
+            for (unsigned i = 0; i < 8; ++i) {
+                draw.stream[i].stride = hint.strides[i];
+                draw.stream[i].frequency = hint.frequencies[i];
+            }
+            const VDesc desc = make_vertex_descriptor(draw, vp);
+            MTLPixelFormat colors[4];
+            uint32_t rs[256] = {}, cw[4];
+            const unsigned indices[] = {27, 19, 20, 171, 206, 207, 208, 209};
+            for (unsigned i = 0; i < 8; ++i)
+                rs[indices[i]] = hint.states[i];
+            for (unsigned i = 0; i < 4; ++i) {
+                colors[i] = MTLPixelFormat(hint.colors[i]);
+                cw[i] = hint.states[i + 8];
+            }
+            result->value = build_pipeline(vfn, ffn, desc.desc, colors, MTLPixelFormat(hint.depth),
+                                           rs[27] != 0, rs, cw, hint.samples);
+            return result;
+        }
+    }
+    id<MTLRenderPipelineState> pipeline(uint64_t key, const HostD9Draw &d, const d9sh::Program &vp,
+                                        const d9sh::Program &pp, const d9msl::PixelVariant &variant,
+                                        const MTLPixelFormat cf[4], MTLPixelFormat df) {
         key = mix(key, 0x5a3f0000ull + pass_samples_);
-        auto it = pipelines_.find(key);
-        if (it != pipelines_.end())
-            return it->second;
+        auto found = pipelines_.find(key);
+        if (found != pipelines_.end())
+            return found->second;
+        d9warm::PipelineHint hint;
+        hint.vertex = d.vs_key ? d.vs_key : d9sh::code_key(d.vs, d.vs_size);
+        hint.pixel = d.ps_key ? d.ps_key : d9sh::code_key(d.ps, d.ps_size);
+        hint.variant = variant.key();
+        hint.samples = pass_samples_;
+        hint.depth = uint32_t(df);
+        for (unsigned i = 0; i < 4; ++i)
+            hint.colors[i] = uint32_t(cf[i]);
+        for (unsigned i = 0; i < 8; ++i) {
+            hint.strides[i] = d.stream[i].stride;
+            hint.frequencies[i] = d.stream[i].frequency;
+        }
+        const unsigned indices[] = {27, 19, 20, 171, 206, 207, 208, 209, 168, 190, 191, 192};
+        for (unsigned i = 0; i < 12; ++i)
+            hint.states[i] = d.render_state[indices[i]];
+        hint.declaration.assign(d.decl, d.decl + d.decl_size);
+        hint = hint.canonical();
+        if (warm_enabled_) {
+            warm_hints_.remember(hint);
+            save_hints();
+        }
+        auto value = warm_pipelines_.get(
+            hint.line(), [this, hint, &vp, &pp] { return compile_pipeline(hint, vp, pp); });
+        id<MTLRenderPipelineState> result = value ? (*value)->value : nil;
+        pipelines_[key] = result;
+        return result;
+    }
+    id<MTLRenderPipelineState> build_pipeline(id<MTLFunction> vfn, id<MTLFunction> ffn,
+                                              MTLVertexDescriptor *vdesc,
+                                              const MTLPixelFormat cf[4], MTLPixelFormat df,
+                                              bool blend, const uint32_t *rs, const uint32_t cw[4],
+                                              uint32_t samples) {
+        const double started = CACurrentMediaTime();
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-        pd.rasterSampleCount = std::max<uint32_t>(pass_samples_, 1);
+        pd.rasterSampleCount = std::max<uint32_t>(samples, 1);
         pd.vertexFunction = vfn;
         pd.fragmentFunction = ffn;
         pd.vertexDescriptor = vdesc;
@@ -1804,7 +2060,8 @@ class Renderer final : public D9Backend {
         if (!pso)
             fprintf(stderr, "d3d9 metal: pipeline failed: %s\n",
                     error.localizedDescription.UTF8String);
-        pipelines_[key] = pso;
+        ++compile_count_;
+        compile_us_ += uint64_t((CACurrentMediaTime() - started) * 1e6);
         return pso;
     }
 
@@ -2008,6 +2265,7 @@ class Renderer final : public D9Backend {
     }
 
     void encode_primitives(const HostD9Draw &d) {
+        const uint32_t instances = d.instance_count ? d.instance_count : 1;
         MTLPrimitiveType type;
         uint32_t count = d.primitive_count;
         bool fan = false;
@@ -2042,7 +2300,10 @@ class Renderer final : public D9Backend {
             return;
         bool indexed = d.index_buffer || d.inline_indices;
         if (!indexed && !fan) {
-            [enc_ drawPrimitives:type vertexStart:d.start vertexCount:count];
+            [enc_ drawPrimitives:type
+                     vertexStart:d.start
+                     vertexCount:count
+                   instanceCount:instances];
             return;
         }
         MTLIndexType itype = d.index_size == 4 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
@@ -2060,7 +2321,7 @@ class Renderer final : public D9Backend {
                                   indexType:itype
                                 indexBuffer:b->second.buffer
                           indexBufferOffset:d.start * isize
-                              instanceCount:1
+                              instanceCount:instances
                                  baseVertex:d.base_vertex
                                baseInstance:0];
             } else {
@@ -2071,7 +2332,8 @@ class Renderer final : public D9Backend {
                                  indexCount:count
                                   indexType:itype
                                 indexBuffer:b
-                          indexBufferOffset:transient_used_ - ((count * isize + 15) & ~15u)];
+                          indexBufferOffset:transient_used_ - ((count * isize + 15) & ~15u)
+                              instanceCount:instances];
             }
             return;
         }
@@ -2109,7 +2371,8 @@ class Renderer final : public D9Backend {
                          indexCount:list.size()
                           indexType:MTLIndexTypeUInt32
                         indexBuffer:b
-                  indexBufferOffset:off];
+                  indexBufferOffset:off
+                      instanceCount:instances];
     }
 
     void dump(Tex &t, uint32_t w, uint32_t h) {
@@ -2133,13 +2396,40 @@ class Renderer final : public D9Backend {
         host_write_ppm(path, rgb.data(), (int)w, (int)h);
     }
 
-    struct VDesc {
-        MTLVertexDescriptor *desc = nil;
-        float ascale[16][4] = {};
-        uint32_t streams = 0;
-        bool zero = false;
-    };
-
+    bool warm_enabled_ = !(recomp_env("D3D9_WARM") && !strcmp(recomp_env("D3D9_WARM"), "0"));
+    d9warm::Hints warm_hints_{recomp_env("PROFILE_DIR") ? recomp_env("PROFILE_DIR") : ""};
+    d9warm::OnceCache<std::shared_ptr<WarmFunction>> warm_functions_;
+    d9warm::OnceCache<std::shared_ptr<WarmPipeline>> warm_pipelines_;
+    std::unique_ptr<d9warm::Pool> warm_pool_;
+    std::atomic<bool> flush_queued_{false};
+    std::atomic<uint64_t> compile_count_{0}, compile_us_{0};
+    // Diagnostic snapshots belong to the rendering thread. Compile counters
+    // include background work; that work is not necessarily a frame stall.
+    void profile_frame() {
+        const double now = CACurrentMediaTime();
+        const uint64_t count = compile_count_.load(), us = compile_us_.load();
+        if (recomp_env("PROFILE") && frame_time_ && now - frame_time_ > .100)
+            fprintf(stderr,
+                    "d3d9 metal: slow frame %llu %.2f ms: %llu compiles %.2f ms total, GPU wait "
+                    "%.2f ms, %llu textures, %llu uploads, %llu draws\n",
+                    (unsigned long long)presents_, (now - frame_time_) * 1000,
+                    (unsigned long long)(count - frame_compiles_),
+                    (us - frame_compile_us_) / 1000.0, frame_gpu_wait_s_ * 1000,
+                    (unsigned long long)frame_textures_, (unsigned long long)frame_uploads_,
+                    (unsigned long long)(draws_ - frame_draws_));
+        frame_time_ = now;
+        frame_compiles_ = count;
+        frame_compile_us_ = us;
+        frame_draws_ = draws_;
+        frame_gpu_wait_s_ = 0;
+        frame_textures_ = frame_uploads_ = 0;
+    }
+    double frame_time_ = 0, frame_gpu_wait_s_ = 0;
+    uint64_t frame_compiles_ = 0, frame_compile_us_ = 0, frame_draws_ = 0, frame_textures_ = 0,
+             frame_uploads_ = 0;
+    std::map<std::pair<uint64_t, bool>, const d9sh::Program *> programs_;
+    std::map<std::pair<uint64_t, bool>, std::vector<d9warm::ShaderHint>> shader_hints_;
+    std::unordered_map<uint64_t, std::vector<d9warm::PipelineHint>> pipeline_hints_;
     gpu::MetalDevice *device_;
     id<MTLDevice> mtl_;
     id<MTLCommandQueue> queue_;

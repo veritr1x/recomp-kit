@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import game_config  # noqa: E402
 
-PAGE_FILES = ("index.html", "app.js", "core.js", "worker.js")
+PAGE_FILES = ("index.html", "style.css", "app.js", "core.js", "worker.js")
+CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; base-uri 'none'"
 
 
 def game_entry(cfg):
@@ -33,6 +34,7 @@ def game_entry(cfg):
         "id": game["id"],
         "title": launcher["title"],
         "executable": game["executable"],
+        "exeDir": game["exe_dir"],
         "sha256": game["sha256"],
         "requiredDirs": cfg["setup"]["required_dirs"],
         "exclude": cfg["bundle"]["exclude"],
@@ -55,7 +57,7 @@ def build(game_dirs, out):
     return games
 
 
-WEB_BUILD_SUFFIXES = (".js", ".wasm", ".data")
+WEB_BUILD_SUFFIXES = (".js", ".mjs", ".css", ".wasm", ".data")
 
 
 def copy_web_build(game_id, build, out):
@@ -76,6 +78,7 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Security-Policy", CSP)
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 

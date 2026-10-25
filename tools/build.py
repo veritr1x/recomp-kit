@@ -250,8 +250,8 @@ def android_push_game(command, cfg, build_root):
     files staged by an earlier build. The shared stager uses excluded() and
     writes the executable hash to .stamp, just as it does for an iOS bundle.
     """
-    source = cfg["developer_exe_path"].parent
-    executable = cfg["game"]["executable"]
+    source = cfg["developer_game_dir_path"]
+    executable = str(Path(cfg["game"]["exe_dir"]) / cfg["game"]["executable"])
     if not (source / executable).is_file():
         raise FileNotFoundError("Prepare your own game installation with tools/setup.py before --push-game")
     staged = Path(build_root) / "android/game"

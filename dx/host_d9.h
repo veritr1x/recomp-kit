@@ -60,7 +60,16 @@ typedef struct HostD9Target {
 typedef struct HostD9Stream {
     uint32_t buffer; // buffer id, or 0 for the draw's inline vertices
     uint32_t offset, stride;
+    uint32_t frequency; // D3DSTREAMSOURCE_* | divider; zero retains the legacy default 1
 } HostD9Stream;
+
+#define HOST_D9_STREAM_INDEXED 0x40000000u
+#define HOST_D9_STREAM_INSTANCE 0x80000000u
+#define HOST_D9_STREAM_DIVIDER 0x3fffffffu
+static inline uint32_t host_d9_stream_rate(uint32_t frequency) {
+    const uint32_t rate = frequency & HOST_D9_STREAM_DIVIDER;
+    return (frequency & HOST_D9_STREAM_INDEXED) || !rate ? 1 : rate;
+}
 
 typedef struct HostD9Draw {
     HostD9Target target;
@@ -94,6 +103,7 @@ typedef struct HostD9Draw {
     uint32_t primitive_count;
     uint32_t start; // first vertex, or first index when indexed
     int32_t base_vertex;
+    uint32_t instance_count; // zero retains the legacy default of one
 
     uint32_t sampler_texture[16];    // texture ids; 0: none
     const uint32_t *sampler_state;   // 16 x 14, indexed [stage * 14 + D3DSAMPLERSTATETYPE]
@@ -107,6 +117,8 @@ typedef struct HostD9Draw {
 } HostD9Draw;
 
 void host_d9_draw(const HostD9Draw *draw);
+// Accepted, decoded programs only. The host consumes the bytes during this call.
+void host_d9_shader_created(const uint8_t *bytes, uint32_t size, uint64_t key, int pixel);
 
 // D3DCLEAR_TARGET 1, _ZBUFFER 2, _STENCIL 4. Rects are D3DRECTs.
 void host_d9_clear(const HostD9Target *target, const int32_t viewport[4], uint32_t count,

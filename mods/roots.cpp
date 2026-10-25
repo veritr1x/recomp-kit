@@ -13,5 +13,6 @@ ModsRoots mods_roots() {
     std::string core_default = host_resource("mods/core");
     if (core_default.empty())
         core_default = "build/recomp/mods/core";
-    return ModsRoots{core && *core ? core : core_default, user && *user ? user : "mods"};
+    return ModsRoots{core && *core ? core : core_default,
+                     user && os_path_is_absolute(user) ? user : ""};
 }

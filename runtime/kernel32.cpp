@@ -1,6 +1,8 @@
 #include "seh.h"
+#include "crt_internal.h"
 #include "profile.h"
 #include "game_config.h"
+#include "guest_layout.h"
 // kernel32.cpp - KERNEL32 shims: heap, files, modules, TLS, sync objects,
 // time and the string/locale helpers the CRT startup calls.
 //
@@ -66,6 +68,7 @@ namespace {
 std::string g_game_dir =
     std::string(RECOMP_DEVELOPER_EXE).substr(0, std::string(RECOMP_DEVELOPER_EXE).rfind('/'));
 std::string g_cur_dir = RECOMP_GUEST_ROOT;
+static std::string g_guest_exe_dir = RECOMP_GUEST_ROOT;
 uint32_t g_last_error = 0;
 jmp_buf g_exit_jmp;
 bool g_exit_jmp_valid = false;
@@ -75,6 +78,7 @@ uint32_t g_unhandled_filter = 0;
 uint32_t g_cmdline_addr = 0;
 uint32_t g_envblock_addr = 0;
 uint32_t g_envblockw_addr = 0;
+std::map<std::string, std::pair<std::string, std::string>> g_env_overrides;
 bool g_tls_used[TLS_SLOTS] = {false};
 uint32_t g_process_heap = 0;
 
@@ -281,6 +285,9 @@ void win32_invalidate_dir_cache() {
 const std::string &win32_game_dir() {
     return g_game_dir;
 }
+std::string win32_executable_guest_path() {
+    return g_guest_exe_dir + "\\" RECOMP_EXECUTABLE;
+}
 
 // Called with the guest baton held, like the file shims. Reopening this path
 // gives a host service an independent descriptor without exposing the guest's.
@@ -406,7 +413,7 @@ static std::string resolve_in_game_dir(const std::vector<std::string> &norm, boo
             return next;
         return std::string();
     }
-    return host;
+    return os_path_is_within(g_game_dir.c_str(), host.c_str()) ? host : std::string();
 }
 
 std::string win32_host_path_op(const std::string &guest_path, int op) {
@@ -424,12 +431,9 @@ std::string win32_host_path_op(const std::string &guest_path, int op) {
         if (op != WIN32_FILE_READ && op != WIN32_FILE_LIST)
             return std::string();
     }
-    // A destination that does not exist yet is the normal case for both a
-    // rename and a create, so both permit a missing final component. Without
-    // this an unmodded MoveFileA or CopyFileA to a new filename fails, which
-    // is a behaviour change and not one this seam is allowed to make.
-    bool may_create = (op == WIN32_FILE_WRITE || op == WIN32_FILE_RENAME_DST);
-    return resolve_in_game_dir(norm, may_create);
+    if (op != WIN32_FILE_READ && op != WIN32_FILE_LIST)
+        return std::string(); // Mutations require a writable overlay.
+    return resolve_in_game_dir(norm, false);
 }
 
 extern "C" int recomp_writable_path(const char *guest_path, char *out, size_t out_len) {
@@ -539,15 +543,29 @@ uint32_t loader_tls_block_for_thread(uint32_t tls_array) {
 }
 
 void win32_init(const std::string &game_dir) {
+    win32_init_layout(game_dir, RECOMP_EXE_DIR);
+}
+void win32_init_layout(const std::string &game_dir, const std::string &exe_dir) {
+    host_reset_mm_timers();
     kernel32_wide_reset();
-    g_game_dir = game_dir.empty() ? std::string(".") : game_dir;
-    g_cur_dir = RECOMP_GUEST_ROOT;
+    const bool matches =
+        guest_layout::root_from_exe(game_dir.empty() ? "." : game_dir, exe_dir, &g_game_dir);
+    if (g_game_dir.empty())
+        g_game_dir = ".";
+    g_guest_exe_dir = RECOMP_GUEST_ROOT;
+    if (matches && !exe_dir.empty()) {
+        std::string suffix = guest_layout::slashes(exe_dir);
+        std::replace(suffix.begin(), suffix.end(), '/', '\\');
+        g_guest_exe_dir += "\\" + suffix;
+    }
+    g_cur_dir = g_guest_exe_dir;
     g_last_error = 0;
     g_exited = false;
     g_exit_code = 0;
     g_cmdline_addr = 0;
     g_envblock_addr = 0;
     g_envblockw_addr = 0;
+    g_env_overrides.clear();
     for (uint32_t i = 0; i < TLS_SLOTS; ++i)
         g_tls_used[i] = false;
     handles().clear();
@@ -585,12 +603,12 @@ uint32_t attrs_for(const OsStat &st) {
     return a;
 }
 
-bool wildcard_match(const char *pat, const char *str) {
+bool wildcard_match_raw(const char *pat, const char *str) {
     if (*pat == '\0')
         return *str == '\0';
     if (*pat == '*') {
         for (const char *s = str;; ++s) {
-            if (wildcard_match(pat + 1, s))
+            if (wildcard_match_raw(pat + 1, s))
                 return true;
             if (!*s)
                 return false;
@@ -599,7 +617,21 @@ bool wildcard_match(const char *pat, const char *str) {
     if (*str == '\0')
         return false;
     if (*pat == '?' || tolower((unsigned char)*pat) == tolower((unsigned char)*str))
-        return wildcard_match(pat + 1, str + 1);
+        return wildcard_match_raw(pat + 1, str + 1);
+    return false;
+}
+bool wildcard_match(const char *pat, const char *str) {
+    std::string pattern = pat;
+    if (!pattern.empty() && pattern.back() == '.') {
+        pattern.pop_back();
+        return !strchr(str, '.') && wildcard_match_raw(pattern.c_str(), str);
+    }
+    if (wildcard_match_raw(pat, str))
+        return true;
+    if (pattern.size() >= 2 && pattern.compare(pattern.size() - 2, 2, ".*") == 0) {
+        pattern.resize(pattern.size() - 2);
+        return wildcard_match_raw(pattern.c_str(), str);
+    }
     return false;
 }
 
@@ -729,7 +761,7 @@ void k_VirtualAlloc(X86 *c) {
         LOGV("VirtualAlloc: ignoring requested base %08x, no region there", addr);
     }
 
-    uint32_t base = heap_alloc(pages, true, 4096);
+    uint32_t base = heap_alloc(pages, true, 65536);
     if (!base) {
         set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
         set_eax(c, 0);
@@ -925,20 +957,11 @@ void k_GetFileSize(X86 *c) {
 }
 
 void k_CloseHandle(X86 *c) {
-    uint32_t h = arg(c, 0);
-    HObj *o = handle_any(h);
-    if (!o) {
+    if (!win32_close_handle(arg(c, 0))) {
         set_last_error(ERROR_INVALID_HANDLE_);
         set_eax(c, 0);
         return;
     }
-    if (--o->references) {
-        set_eax(c, 1);
-        return;
-    }
-    if ((o->kind == H_FILE || o->kind == H_MAPPING) && o->fd >= 0)
-        os_fd_close(o->fd);
-    handles().erase(h);
     set_eax(c, 1);
 }
 
@@ -1024,11 +1047,13 @@ void k_GetFullPathNameA(X86 *c) {
     std::string name = gm_str(arg(c, 0));
     uint32_t len = arg(c, 1), buf = arg(c, 2), pfile = arg(c, 3);
     std::string full = full_path_named(name);
-    if (buf && len) {
+    if (buf && len > full.size()) {
         uint32_t n = gm_put_str(buf, full.c_str(), len);
         if (pfile) {
             size_t s = full.find_last_of('\\');
-            wr32(pfile, s == std::string::npos ? buf : buf + (uint32_t)s + 1);
+            wr32(pfile, !full.empty() && full.back() == '\\' ? 0
+                        : s == std::string::npos             ? buf
+                                                             : buf + (uint32_t)s + 1);
         }
         set_eax(c, n);
     } else {
@@ -1048,27 +1073,28 @@ void k_GetCurrentDirectoryA(X86 *c) {
 void k_SetCurrentDirectoryA(X86 *c) {
     std::string want = gm_str(arg(c, 0));
     std::string host = win32_host_path(want);
-    if (host.empty()) {
+    OsStat st{};
+    if (host.empty() || os_stat(host.c_str(), &st) != 0 || !st.is_dir) {
         set_last_error(ERROR_PATH_NOT_FOUND_);
         set_eax(c, 0);
         return;
     }
-    if (want.size() >= 2 && want[1] == ':')
-        g_cur_dir = want;
-    else if (!want.empty() && (want[0] == '\\' || want[0] == '/'))
-        g_cur_dir = "C:" + want;
-    else
-        g_cur_dir = g_cur_dir + "\\" + want;
+    g_cur_dir = full_path_named(want);
+    while (g_cur_dir.size() > 3 && g_cur_dir.back() == '\\')
+        g_cur_dir.pop_back();
     set_eax(c, 1);
 }
 
 // Both encodings expose the same guest path, never a host filesystem path.
 std::string module_file_name(uint32_t hmod) {
-    std::string path = RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE;
+    std::string path = g_guest_exe_dir + "\\" RECOMP_EXECUTABLE;
     if (hmod && hmod != IMAGE_BASE) {
+        if (const LoaderModule *mapped = loader_module_containing(hmod))
+            if (mapped->base == hmod)
+                return win32_guest_path(mapped->path);
         for (const auto &kv : modules())
             if (kv.second == hmod) {
-                path = RECOMP_GUEST_ROOT "\\" + kv.first;
+                path = g_guest_exe_dir + "\\" + kv.first;
                 break;
             }
     }
@@ -1152,6 +1178,105 @@ uint32_t call_dll_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
     return result;
 }
 
+bool release_mapped_module(X86 *c, LoaderModule *m);
+
+// Each first attach owns references to its imported mapped DLLs. Back edges
+// in a cyclic import graph do not acquire an extra reference: the outer
+// attach owns that lifetime and will detach the cycle in reverse order.
+bool acquire_mapped_module(X86 *c, LoaderModule *m) {
+    if (m->detaching)
+        return false;
+    if (m->attached) {
+        if (!m->attaching)
+            ++m->load_refs;
+        return true;
+    }
+    if (m->initial_image.size() != m->size)
+        return false;
+    memcpy(g_mem + m->base, m->initial_image.data(), m->initial_image.size());
+    m->attached = m->attaching = true;
+    m->load_refs = 1;
+    m->owned_dependencies.clear();
+    bool ok = true;
+    for (const std::string &name : m->dependencies) {
+        LoaderModule *dep = loader_module_named(name.c_str());
+        if (!dep) {
+            ok = false;
+            break;
+        }
+        if (dep->base == loader_image_base() || dep->attaching)
+            continue;
+        if (!acquire_mapped_module(c, dep)) {
+            ok = false;
+            break;
+        }
+        m->owned_dependencies.push_back(name);
+    }
+    if (ok) {
+        ok = call_dll_entry(c, *m, 1) != 0;
+        if (!ok)
+            call_dll_entry(c, *m, 0);
+    }
+    m->attaching = false;
+    if (!ok) {
+        m->attached = false;
+        m->load_refs = 0;
+        auto dependencies = std::move(m->owned_dependencies);
+        m->owned_dependencies.clear();
+        for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it)
+            release_mapped_module(c, loader_module_named(it->c_str()));
+    }
+    return ok;
+}
+
+bool release_mapped_module(X86 *c, LoaderModule *m) {
+    if (!m || !m->attached || !m->load_refs || m->attaching || m->detaching)
+        return false;
+    if (m->pinned && m->load_refs == 1)
+        return true;
+    if (--m->load_refs)
+        return true;
+    m->detaching = true;
+    call_dll_entry(c, *m, 0);
+    m->attached = m->detaching = false;
+    auto dependencies = std::move(m->owned_dependencies);
+    m->owned_dependencies.clear();
+    for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it)
+        release_mapped_module(c, loader_module_named(it->c_str()));
+    return true;
+}
+
+bool attach_static_modules(X86 *c) {
+    LoaderModule *main = loader_module_named(RECOMP_EXECUTABLE);
+    if (!main)
+        return true;
+    std::vector<LoaderModule *> acquired;
+    for (const auto &name : main->dependencies) {
+        LoaderModule *m = loader_module_named(name.c_str());
+        if (!m || !acquire_mapped_module(c, m)) {
+            for (auto it = acquired.rbegin(); it != acquired.rend(); ++it)
+                release_mapped_module(c, *it);
+            set_last_error(1114);
+            return false;
+        }
+        acquired.push_back(m);
+    }
+    // Pin the complete successfully attached graph, only after the transaction
+    // succeeds so a failure can still unwind every reference it acquired.
+    std::vector<LoaderModule *> pending = acquired;
+    while (!pending.empty()) {
+        LoaderModule *m = pending.back();
+        pending.pop_back();
+        if (m->pinned)
+            continue;
+        m->pinned = true;
+        for (const auto &name : m->dependencies)
+            if (LoaderModule *dep = loader_module_named(name.c_str()))
+                pending.push_back(dep);
+    }
+    return true;
+}
+
 void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     auto it = modules().find(name);
@@ -1166,20 +1291,10 @@ void load_library_named(X86 *c, const std::string &module_name) {
             set_eax(c, m->base);
             return;
         }
-        if (!m->attached) {
-            memcpy(g_mem + m->base, m->initial_image.data(), m->initial_image.size());
-            m->attached = true;
-            m->load_refs = 1;
-            if (!call_dll_entry(c, *m, 1)) { // DLL_PROCESS_ATTACH
-                call_dll_entry(c, *m, 0);    // failed attach still receives detach
-                m->attached = false;
-                m->load_refs = 0;
-                set_last_error(1114); // ERROR_DLL_INIT_FAILED
-                set_eax(c, 0);
-                return;
-            }
-        } else {
-            ++m->load_refs;
+        if (!acquire_mapped_module(c, m)) {
+            set_last_error(1114);
+            set_eax(c, 0);
+            return;
         }
         set_eax(c, m->base);
         return;
@@ -1221,9 +1336,10 @@ void k_FreeLibrary(X86 *c) {
             set_eax(c, 0);
             return;
         }
-        if (--m->load_refs == 0) {
-            call_dll_entry(c, *m, 0); // DLL_PROCESS_DETACH, before discarding globals
-            m->attached = false;
+        if (!release_mapped_module(c, m)) {
+            set_last_error(ERROR_INVALID_HANDLE_);
+            set_eax(c, 0);
+            return;
         }
     }
     // Shim-only libraries have process lifetime and no guest entry point.
@@ -1309,6 +1425,9 @@ void k_GetCommandLineA(X86 *c) {
     get_command_line(c);
 }
 } // namespace
+bool win32_attach_static_modules(X86 *c) {
+    return attach_static_modules(c);
+}
 void win32_reset_command_line_for_test() {
     kernel32_wide_reset_command_line();
     g_cmdline_addr = 0;
@@ -1320,18 +1439,39 @@ namespace {
 
 // The environment block is a run of NUL-terminated strings ended by an extra
 // NUL. GetEnvironmentStringsW must hand back UTF-16, not the ANSI bytes.
-static const char *const k_environment[] = {"PATH=" RECOMP_GUEST_ROOT, "windir=C:\\WINDOWS",
-                                            nullptr};
+static std::vector<std::string> environment() {
+    std::vector<std::string> result = {
+        "PATH=" + g_guest_exe_dir +
+            (g_guest_exe_dir == RECOMP_GUEST_ROOT ? "" : ";" RECOMP_GUEST_ROOT),
+        "windir=C:\\WINDOWS"};
+    for (const auto &[key, entry] : g_env_overrides) {
+        result.erase(std::remove_if(result.begin(), result.end(),
+                                    [&](const std::string &s) {
+                                        return lower(s.substr(0, s.find('='))) == key;
+                                    }),
+                     result.end());
+        if (!entry.second.empty())
+            result.push_back(entry.first + '=' + entry.second);
+    }
+    return result;
+}
 
 void k_GetEnvironmentStrings(X86 *c) {
     if (!g_envblock_addr || !heap_owns(g_envblock_addr)) {
-        uint32_t bytes = 1;
-        for (int i = 0; k_environment[i]; ++i)
-            bytes += (uint32_t)strlen(k_environment[i]) + 1;
-        uint32_t a = heap_alloc(bytes, true);
+        uint64_t bytes = 2;
+        const auto values = environment();
+        for (const auto &value : values)
+            bytes += value.size() + 1;
+        if (bytes > UINT32_MAX) {
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t a = heap_alloc(uint32_t(bytes), true);
         uint32_t at = a;
-        for (int i = 0; a && k_environment[i]; ++i)
-            at += gm_put_str(at, k_environment[i], 0x1000) + 1;
+        if (a)
+            for (const auto &value : values)
+                at += gm_put_str(at, value.c_str(), uint32_t(value.size()) + 1) + 1;
         g_envblock_addr = a;
     }
     set_eax(c, g_envblock_addr);
@@ -1339,20 +1479,22 @@ void k_GetEnvironmentStrings(X86 *c) {
 
 void k_GetEnvironmentStringsW(X86 *c) {
     if (!g_envblockw_addr || !heap_owns(g_envblockw_addr)) {
-        uint32_t chars = 1;
-        for (int i = 0; k_environment[i]; ++i)
-            chars += (uint32_t)strlen(k_environment[i]) + 1;
-        uint32_t a = heap_alloc(chars * 2, true);
-        uint32_t at = a;
-        for (int i = 0; a && k_environment[i]; ++i) {
-            const char *s = k_environment[i];
-            for (uint32_t j = 0; s[j]; ++j) {
-                wr16(at, (uint16_t)(uint8_t)s[j]);
-                at += 2;
-            }
-            wr16(at, 0);
-            at += 2;
+        uint64_t chars = 2;
+        const auto values = environment();
+        for (const auto &value : values)
+            chars += value.size() + 1;
+        if (chars > UINT32_MAX / 2) {
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
+            set_eax(c, 0);
+            return;
         }
+        uint32_t a = heap_alloc(uint32_t(chars * 2), true);
+        uint32_t at = a;
+        if (a)
+            for (const auto &value : values) {
+                at +=
+                    (gm_put_wstr(at, value, uint32_t((uint64_t(a) + chars * 2 - at) / 2)) + 1) * 2;
+            }
         g_envblockw_addr = a;
     }
     set_eax(c, g_envblockw_addr);
@@ -1362,7 +1504,8 @@ void k_FreeEnvironmentStrings(X86 *c) {
     set_eax(c, 1);
 }
 void k_SetEnvironmentVariableA(X86 *c) {
-    set_eax(c, 1);
+    const std::string name = gm_str(arg(c, 0)), value = arg(c, 1) ? gm_str(arg(c, 1)) : "";
+    set_eax(c, win32_set_environment(name, arg(c, 1) ? &value : nullptr) ? 1 : 0);
 }
 
 void k_GetStartupInfoA(X86 *c) {
@@ -1911,6 +2054,8 @@ const uint32_t WAIT_TIMEOUT_ = 0x102;
 enum WaitKind : uint8_t { W_NONE, W_OBJECTS, W_CRITSEC };
 
 struct GuestThread {
+    std::condition_variable_any condition;
+    bool parked_for_work = false; // protected by g_sched_m
     size_t index = 0;
     uint32_t handle = 0; // 0 for the main thread: it has none
     uint32_t id = 1;     // GetCurrentThreadId
@@ -1957,8 +2102,19 @@ std::vector<GuestThread *> &threads() {
 }
 
 std::mutex g_sched_m;
-std::condition_variable_any g_sched_cv;
 size_t g_baton = 0; // index of the thread allowed to run
+void sched_notify_all_locked() {
+    for (GuestThread *thread : threads())
+        thread->condition.notify_one();
+}
+void sched_notify_baton_locked() {
+    if (g_baton < threads().size())
+        threads()[g_baton]->condition.notify_one();
+}
+void sched_notify_object_locked() {
+    if (g_baton < threads().size() && threads()[g_baton]->parked_for_work)
+        threads()[g_baton]->condition.notify_one();
+}
 // Read by the host from the very thread that sets it, so a plain bool is the
 // whole of it: no other thread looks.
 bool g_in_idle_slice = false;
@@ -1999,6 +2155,7 @@ static void (*g_thread_exit_observer)() = nullptr;
 // queued here under the scheduler lock and applied by the next thread to enter
 // the scheduler, which by construction is the baton holder.
 std::vector<uint32_t> g_host_signals;
+std::atomic<bool> g_host_signals_pending{false};
 // ---------------------------------------------------------------------------
 // Idling on the run thread.
 //
@@ -2049,6 +2206,7 @@ GuestThread *cur_thread() {
         m->id = 1;
         m->teb = TEB_BASE;
         m->tls = TLS_BASE;
+        m->tid = os_thread_self();
         threads().push_back(m);
         g_baton = 0;
     }
@@ -2075,6 +2233,15 @@ X86 *guest_current_context() {
 }
 uint32_t guest_current_thread_id() {
     return t_id;
+}
+bool guest_thread_exists(uint32_t id) {
+    std::lock_guard<std::mutex> lock(g_sched_m);
+    if (threads().empty())
+        return id == 1;
+    for (const GuestThread *thread : threads())
+        if (thread->id == id && !thread->finished)
+            return true;
+    return false;
 }
 
 // --------------------------------------------------------------------------
@@ -2199,7 +2366,7 @@ bool sched_in_idle_slice() {
 // it so it re-evaluates. Signalling costs nothing when nobody is parked.
 void sched_input_arrived() {
     g_sched_m.lock();
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -2275,7 +2442,10 @@ void sched_wait_locked(size_t me, double until, double max_slice) {
         return;
     if (wait > 1.0)
         wait = 1.0;
-    g_sched_cv.wait_for(g_sched_m, std::chrono::duration<double>(wait));
+    GuestThread *thread = threads()[me];
+    thread->parked_for_work = g_baton == me;
+    thread->condition.wait_for(g_sched_m, std::chrono::duration<double>(wait));
+    thread->parked_for_work = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2512,6 +2682,7 @@ void apply_host_signals_locked() {
             o->signalled = true;
     }
     g_host_signals.clear();
+    g_host_signals_pending.store(false, std::memory_order_release);
 }
 
 void sched_expire_locked() {
@@ -2553,6 +2724,18 @@ double sched_earliest_deadline_locked() {
         if (best == 0.0 || t->deadline < best)
             best = t->deadline;
     }
+    // An INFINITE wait on an armed timer still has a real wake deadline.
+    // Include timer objects in both wait-any and wait-all descriptors.
+    for (GuestThread *t : threads()) {
+        if (!t->blocked || t->wait_kind != W_OBJECTS)
+            continue;
+        for (uint32_t i = 0; i < t->wait_n; ++i) {
+            HObj *object = handle_any(t->wait_h[i]);
+            if (object && object->timer && object->timer_armed &&
+                (best == 0.0 || object->timer_due < best))
+                best = object->timer_due;
+        }
+    }
     return best;
 }
 
@@ -2580,6 +2763,17 @@ void sched_run_others_locked(size_t me, const char *why) {
             g_baton = me;
             return;
         }
+        // A waiter awakened by a process event must not inspect guest handles
+        // beside the running holder. Wait for ownership before expiring waits
+        // or draining queued host signals.
+        if (g_baton != me) {
+            if (g_baton >= threads().size() || threads()[g_baton]->finished)
+                g_baton = me;
+            else {
+                sched_wait_locked(me, 0.0, HOST_IDLE_BATON_SLICE);
+                continue;
+            }
+        }
         sched_expire_locked();
         if (thread_runnable(threads()[me])) {
             // Runnable is not the same as entitled. Every resume from a wait
@@ -2605,7 +2799,7 @@ void sched_run_others_locked(size_t me, const char *why) {
         if (next != NO_THREAD) {
             g_baton = next;
             record_handoff_locked(me, next, why);
-            g_sched_cv.notify_all();
+            sched_notify_baton_locked();
             // Wait for the baton, then loop: holding it is not the same as
             // being runnable, and a thread that ends hands the baton on
             // without knowing who is eligible. The run thread services the
@@ -2675,7 +2869,7 @@ void sched_handoff_on_exit_locked(size_t me, const char *why) {
         next = 0;
     g_baton = next;
     record_handoff_locked(me, next, why);
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
 }
 
 // Blocks the calling thread until its wait completes or its deadline passes.
@@ -2726,7 +2920,7 @@ bool guest_yield() {
     if (moved) {
         g_baton = next;
         record_handoff_locked(me->index, next, "yield");
-        g_sched_cv.notify_all();
+        sched_notify_baton_locked();
         while (g_baton != me->index)
             sched_wait_locked(me->index, 0.0, HOST_IDLE_BATON_SLICE);
     }
@@ -2780,7 +2974,8 @@ void guest_event_signal_from_host(uint32_t handle) {
         return;
     g_sched_m.lock();
     g_host_signals.push_back(handle);
-    g_sched_cv.notify_all();
+    g_host_signals_pending.store(true, std::memory_order_release);
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -2813,23 +3008,38 @@ void sched_atomic_unwind_to_esp(uint32_t esp) {
         --t_atomic;
 }
 
-void sched_checkpoint() {
-    // Drain first and unconditionally: a guest with no worker threads never
-    // reaches the scheduler proper, and a signal it never applied is a wait
-    // that never ends.
-    if (!g_host_signals.empty()) {
-        g_sched_m.lock();
-        apply_host_signals_locked();
+static void scheduling_checkpoint(bool force) {
+    bool yield = false;
+    g_sched_m.lock();
+    const bool pending = g_host_signals_pending.load(std::memory_order_acquire);
+    if (!sched_holds_baton_locked()) {
+        // Set-up code can drain before any guest entry/worker. A host callback
+        // after entry has no authority over the guest handle table.
+        if (pending && !g_guest_entry_begun && sched_guest_threads_stopped_locked())
+            apply_host_signals_locked();
         g_sched_m.unlock();
+        return;
     }
-    if (threads().size() < 2 || t_atomic)
-        return;
-    GuestThread *me = threads()[t_self];
-    double now = sched_now();
-    if (now - me->last_yield < SCHED_SLICE_SECONDS)
-        return;
-    me->last_yield = now;
-    guest_yield();
+    if (pending)
+        apply_host_signals_locked();
+    if (threads().size() >= 2 && !t_atomic) {
+        GuestThread *me = threads()[t_self];
+        const double now = sched_now();
+        if (force || now - me->last_yield >= SCHED_SLICE_SECONDS) {
+            me->last_yield = now;
+            yield = true;
+        }
+    }
+    g_sched_m.unlock();
+    if (yield)
+        guest_yield();
+}
+void sched_checkpoint() {
+    scheduling_checkpoint(false);
+}
+extern "C" void recomp_backedge_poll() {
+    if (t_is_guest)
+        scheduling_checkpoint(true);
 }
 
 namespace {
@@ -2839,7 +3049,7 @@ namespace {
 // whole timeout.
 void sched_wake_all() {
     g_sched_m.lock();
-    g_sched_cv.notify_all();
+    sched_notify_object_locked();
     g_sched_m.unlock();
 }
 
@@ -2851,7 +3061,7 @@ void pulse_event(HObj *o) {
         if (t->blocked && t->wait_kind == W_OBJECTS)
             sched_satisfy_locked(t);
     o->signalled = false;
-    g_sched_cv.notify_all();
+    sched_notify_object_locked();
     g_sched_m.unlock();
 }
 
@@ -2981,7 +3191,7 @@ void sched_leave_critsec(uint32_t cs) {
     wr32(cs + CS_OFF_LOCK_COUNT, rec ? rec - 1 : 0xffffffffu);
     if (!rec) {
         wr32(cs + CS_OFF_OWNER, 0);
-        g_sched_cv.notify_all();
+        sched_notify_object_locked();
     }
     g_sched_m.unlock();
 }
@@ -3015,6 +3225,7 @@ void thread_run_exit_cleanup(GuestThread *t) {
     recomp_profile_truncate(0);
     if (g_thread_exit_observer)
         g_thread_exit_observer();
+    crt::thread_detach(t->teb);
     // Last, so that mod code running in the unwind or the observer still sees
     // a guest thread holding the baton, which is what it is.
     t_is_guest = false;
@@ -3029,7 +3240,7 @@ void *thread_host_main(void *arg) {
 
     g_sched_m.lock();
     while (g_baton != t->index && !g_exit_requested)
-        g_sched_cv.wait(g_sched_m);
+        t->condition.wait(g_sched_m);
     bool exiting = g_exit_requested;
     g_sched_m.unlock();
     // Created before the exit, first scheduled after it: Windows would never
@@ -3125,7 +3336,7 @@ void publish_process_exit(uint32_t code) {
     g_sched_m.lock();
     g_exit_requested = true;
     g_exit_requested_code = code;
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -3137,7 +3348,7 @@ bool request_process_exit(uint32_t code) {
     g_exit_requested_code = code;
     // Wake anything parked: the main thread may be inside an indefinite wait,
     // and it is the only thread that can perform the exit.
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
     thread_finish_exit_process();
     return true;
@@ -3236,10 +3447,14 @@ bool thread_spawn(uint32_t h) {
         delete t;
         return false;
     }
+    g_sched_m.lock();
     threads().push_back(t);
+    g_sched_m.unlock();
     OsThread *host = os_thread_create(thread_host_main, t, 0);
     if (!host) {
+        g_sched_m.lock();
         threads().pop_back();
+        g_sched_m.unlock();
         if (loader_tls().index != 0xffffffffu)
             heap_free(rd32(t->tls + 4 * loader_tls().index));
         heap_free(t->stack_lo);
@@ -3370,7 +3585,7 @@ void k_ResumeThread(X86 *c) {
             --t->suspend_count;
         o->thread_suspended = t->suspend_count > 0;
         if (!t->suspend_count)
-            g_sched_cv.notify_all();
+            sched_notify_all_locked();
         g_sched_m.unlock();
         set_eax(c, (uint32_t)was);
         return;
@@ -3468,6 +3683,39 @@ void k_UnhandledExceptionFilter(X86 *c) {
 // delivered anywhere. Continuing would run the guest past a point it never
 // reaches on Windows, so both abort with the state that caused them.
 } // namespace
+
+bool win32_close_handle(uint32_t handle) {
+    HObj *o = handle_any(handle);
+    if (!o)
+        return false;
+    if (--o->references)
+        return true;
+    if ((o->kind == H_FILE || o->kind == H_MAPPING) && o->fd >= 0)
+        os_fd_close(o->fd);
+    handles().erase(handle);
+    return true;
+}
+
+uint32_t guest_runtime_thread_create(uint32_t start, uint32_t param) {
+    const uint32_t h = handle_new(H_THREAD);
+    handles()[h].thread_start = start;
+    handles()[h].thread_param = param;
+    handles()[h].exit_code = STILL_ACTIVE_;
+    if (!thread_spawn(h)) {
+        handles().erase(h);
+        return 0;
+    }
+    handles()[h].thread_ran = true;
+    return h;
+}
+
+bool guest_runtime_thread_alive(uint32_t handle) {
+    std::lock_guard<std::mutex> lock(g_sched_m);
+    for (GuestThread *thread : threads())
+        if (thread->handle == handle)
+            return !thread->finished;
+    return false;
+}
 
 static bool printable_guest_string(uint32_t a, std::string *out) {
     if (!a || !gm_valid(a, 1))
@@ -3590,6 +3838,8 @@ std::vector<uint32_t> win32_return_chain(uint32_t ebp, size_t max) {
 namespace {
 
 void k_RaiseException(X86 *c) {
+    if (arg(c, 0) == 0x406d1388u)
+        return; // debugger thread-name notification
     // A raise the guest goes on to handle is invisible in a run log otherwise,
     // and the frames it climbed out of are exactly what a language exception
     // hides: the log shows the dialog that reported it and nothing that led
@@ -3918,6 +4168,18 @@ const char *locale_info(uint32_t lctype) {
 // before main: nothing is set, and the answer is the one en-US machine every
 // game of the era saw.
 void k_GetEnvironmentVariableA(X86 *c) {
+    const std::string name = lower(gm_str(arg(c, 0)));
+    for (const auto &entry : environment()) {
+        const size_t equals = entry.find('=');
+        if (lower(entry.substr(0, equals)) == name) {
+            const std::string value = entry.substr(equals + 1);
+            const uint32_t capacity = arg(c, 2);
+            set_eax(c, !arg(c, 1) || capacity <= value.size()
+                           ? uint32_t(value.size()) + 1
+                           : gm_put_str(arg(c, 1), value.c_str(), capacity));
+            return;
+        }
+    }
     set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
     set_eax(c, 0);
 }
@@ -3958,15 +4220,16 @@ void k_GetLogicalDrives(X86 *c) {
 
 void k_GlobalMemoryStatus(X86 *c) {
     uint32_t p = arg(c, 0);
-    if (!p)
+    if (!p || !gm_valid(p, 32))
         return;
-    const uint32_t mb = 1024u * 1024u;
-    wr32(p + 0, 32);           // dwLength
-    wr32(p + 4, 25);           // dwMemoryLoad, percent
-    wr32(p + 8, 512u * mb);    // dwTotalPhys
-    wr32(p + 12, 384u * mb);   // dwAvailPhys
-    wr32(p + 16, 1024u * mb);  // dwTotalPageFile
-    wr32(p + 20, 768u * mb);   // dwAvailPageFile
+    const uint64_t total = uint64_t(RECOMP_MEMORY_MB) * 1024 * 1024;
+    auto narrow = [](uint64_t value) { return uint32_t(std::min(value, uint64_t(UINT32_MAX))); };
+    wr32(p + 0, 32); // dwLength
+    wr32(p + 4, 25); // dwMemoryLoad, percent
+    wr32(p + 8, narrow(total));
+    wr32(p + 12, narrow(total * 3 / 4));
+    wr32(p + 16, narrow(total * 2));
+    wr32(p + 20, narrow(total * 3 / 2));
     wr32(p + 24, 0x7ffe0000u); // dwTotalVirtual
     wr32(p + 28, 0x60000000u); // dwAvailVirtual
 }
@@ -4211,7 +4474,7 @@ void sched_drive_release(void) {
             } else {
                 g_baton = NO_THREAD;
             }
-            g_sched_cv.notify_all();
+            sched_notify_all_locked();
         }
     }
     g_sched_m.unlock();
@@ -4464,6 +4727,27 @@ std::string full_path_named(const std::string &name) {
         full = "C:" + name;
     else
         full = g_cur_dir + "\\" + name;
+    std::replace(full.begin(), full.end(), '/', '\\');
+    const bool trailing = !full.empty() && full.back() == '\\';
+    const std::string drive = full.size() >= 2 && full[1] == ':' ? full.substr(0, 2) : "C:";
+    std::vector<std::string> components;
+    for (const auto &part : split_path(full.substr(2))) {
+        if (part == ".")
+            continue;
+        if (part == "..") {
+            if (!components.empty())
+                components.pop_back();
+        } else
+            components.push_back(part);
+    }
+    full = drive + "\\";
+    for (const auto &part : components) {
+        if (full.back() != '\\')
+            full += '\\';
+        full += part;
+    }
+    if (trailing && full.back() != '\\')
+        full += '\\';
     return full;
 }
 
@@ -4611,12 +4895,31 @@ void open_mutex_named(X86 *c, const std::string &name) {
 
 void get_command_line(X86 *c) {
     if (!g_cmdline_addr) {
-        std::string line = RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE;
+        std::string line = module_file_name(0);
+        if (line.find_first_of(" \t") != std::string::npos)
+            line = '"' + line + '"';
         if (const char *extra = recomp_env("GUEST_ARGS"); extra && *extra)
             line += std::string(" ") + extra;
         g_cmdline_addr = guest_strdup(line.c_str());
     }
     set_eax(c, g_cmdline_addr);
+}
+std::vector<std::string> win32_environment() {
+    return environment();
+}
+uint32_t win32_environment_block_w() {
+    X86 c{};
+    k_GetEnvironmentStringsW(&c);
+    return c.r[R_EAX];
+}
+bool win32_set_environment(const std::string &name, const std::string *value) {
+    if (name.empty() || name.find('=') != std::string::npos)
+        return false;
+    g_env_overrides[lower(name)] = {name, value ? *value : ""};
+    // Existing GetEnvironmentStrings blocks remain valid until their caller
+    // releases them; future queries see a fresh snapshot.
+    g_envblock_addr = g_envblockw_addr = 0;
+    return true;
 }
 
 void startup_info(X86 *c) {
@@ -4709,22 +5012,23 @@ void k_GetSystemTimeAsFileTime(X86 *c) {
 // structure is 64 bytes and each value is written as a pair of dwords.
 void k_GlobalMemoryStatusEx(X86 *c) {
     uint32_t p = arg(c, 0);
-    if (!p) {
+    if (!p || !gm_valid(p, 64) || rd32(p) != 64) {
         set_last_error(87 /* ERROR_INVALID_PARAMETER */);
         set_eax(c, 0);
         return;
     }
     const uint64_t mb = 1024ull * 1024ull;
+    const uint64_t total = uint64_t(RECOMP_MEMORY_MB) * mb;
     auto put64 = [&](uint32_t off, uint64_t v) {
         wr32(p + off, (uint32_t)v);
         wr32(p + off + 4, (uint32_t)(v >> 32));
     };
-    wr32(p + 0, 64);         // dwLength
-    wr32(p + 4, 25);         // dwMemoryLoad, percent
-    put64(8, 512ull * mb);   // ullTotalPhys
-    put64(16, 384ull * mb);  // ullAvailPhys
-    put64(24, 1024ull * mb); // ullTotalPageFile
-    put64(32, 768ull * mb);  // ullAvailPageFile
+    wr32(p + 0, 64); // dwLength
+    wr32(p + 4, 25); // dwMemoryLoad, percent
+    put64(8, total);
+    put64(16, total * 3 / 4);
+    put64(24, total * 2);
+    put64(32, total * 3 / 2);
     put64(40, 2047ull * mb); // ullTotalVirtual: a 32-bit process's 2 GB
     put64(48, 1900ull * mb); // ullAvailVirtual
     put64(56, 0);            // ullAvailExtendedVirtual is always zero
@@ -4975,7 +5279,6 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "OpenProcess", 3, nullptr},
     {"KERNEL32.dll", "ExpandEnvironmentStringsW", 3, nullptr},
     {"KERNEL32.dll", "GetCurrentDirectoryW", 2, nullptr},
-    {"KERNEL32.dll", "GetEnvironmentVariableW", 4, nullptr},
     {"KERNEL32.dll", "VerLanguageNameW", 3, nullptr},
     {"KERNEL32.dll", "SearchPathW", 6, nullptr},
     {"KERNEL32.dll", "GetStringTypeA", 5, k_GetStringTypeA},

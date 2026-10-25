@@ -63,7 +63,7 @@ void recomp_longjmp(X86 *c);
 /* The return address the runtime pushes when it calls a guest callback
  * (WNDPROC, thread body, multimedia timer). Executing it is a bug and the
  * runtime reports it by name. */
-#define RECOMP_CALLBACK_RETURN 0x0fdfff00u
+#define RECOMP_CALLBACK_RETURN GUEST_RETURN_SENTINEL
 
 #ifdef __cplusplus
 }

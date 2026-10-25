@@ -29,6 +29,7 @@ static uint32_t last_shim, last_unknown, last_div_error;
 static unsigned harness_checks_run;
 static int last_div_error_count;
 static uint64_t fake_tsc;
+void recomp_backedge_poll(void) {}
 
 /* An instruction case runs with no guest handlers, so a dereference through
  * the never-mapped first 64 KB has nowhere to raise to. Say which access it

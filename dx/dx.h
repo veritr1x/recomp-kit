@@ -47,6 +47,8 @@ void fmod_register();
 void soundlib_register();
 void galaxy_stub_register();
 void bink_register();
+void openal_register();
+void openal_reset();
 void weanetr_register();
 // Media Foundation: the session, the topology it is given and the file it
 // plays. Registered last of the media shims because nothing else defers to it.
@@ -74,6 +76,8 @@ void soundlib_reset();
 // Close open video players while the guest heap and host audio are still alive.
 // Call after guest workers stop, before tearing down the host.
 void bink_shutdown();
+// -1 restores the port's configured record layout; only for ABI regressions.
+void bink_record_sdk_for_test(int mode);
 
 // The host calls this after feeding new input through host_input_state. It
 // signals the notification event of every DirectInput device that registered

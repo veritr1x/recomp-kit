@@ -1875,6 +1875,8 @@ static void test_host_pad_defaults() {
 
     CHECK_EQ(host_pad_mode(), 0);
     CHECK_EQ(host_pad_native_apis(), 0);
+    CHECK_EQ(host_pad_attached_only(), 0);
+    CHECK_EQ(host_pad_attached(), 0);
 
     HostPadState pad;
     memset(&pad, 0xcd, sizeof pad);
@@ -7545,7 +7547,144 @@ static void test_bink_handle_flag_errors() {
     gm_put_str(sc(0), "intro.bik", 0x100);
     CHECK_EQ(call_shim(open, {sc(0), 0x04000000}), 0u);
     error = call_shim(get_error, {});
-    CHECK(error && gm_str(error) == "memory-resident video is not supported");
+    CHECK(error && gm_str(error) == "invalid or out-of-range memory video size");
+}
+static void test_bink_extended_abi() {
+    cpu_reset();
+    const uint32_t open = tramp("binkw32.dll", "_BinkOpen@8"), header = heap_alloc(64, true);
+    wr32(header, 0x694b4942);
+    wr32(header + 4, UINT32_MAX);
+    CHECK_EQ(call_shim(open, {header, 0x4000000}), 0u);
+    wr32(GUEST_SIZE - 8, 0x694b4942);
+    wr32(GUEST_SIZE - 4, 64);
+    CHECK_EQ(call_shim(open, {GUEST_SIZE - 8, 0x4000000}), 0u);
+    wr32(header + 4, 36);
+    wr32(header + 20, 16);
+    wr32(header + 24, 16);
+    wr32(header + 28, 30);
+    wr32(header + 32, 1);
+#ifndef RECOMP_HAVE_FFMPEG
+    bink_record_sdk_for_test(1);
+    const uint32_t memory_record = call_shim(open, {header, 0x4000000});
+    CHECK(memory_record);
+    if (memory_record) {
+        CHECK_EQ(rd32(memory_record), 16u);
+        CHECK_EQ(rd32(memory_record + 24), 1u);
+        call_shim(tramp("binkw32.dll", "_BinkClose@4"), {memory_record});
+    }
+    bink_record_sdk_for_test(-1);
+#endif
+    heap_free(header);
+#ifdef RECOMP_HAVE_FFMPEG
+    if (const char *path = recomp_env("TEST_BINK_MEMORY")) {
+        int fd = os_fd_open(path, OS_O_RDONLY);
+        OsStat stat{};
+        CHECK(fd >= 0 && os_fd_stat(fd, &stat) == 0 && stat.size <= GUEST_SIZE / 2);
+        if (fd >= 0 && stat.size && stat.size <= GUEST_SIZE / 2) {
+            const uint32_t movie = heap_alloc(uint32_t(stat.size), false);
+            CHECK(movie);
+            uint32_t read = 0;
+            while (movie && read < stat.size) {
+                const int64_t n = os_fd_read(fd, gm_ptr(movie + read), size_t(stat.size - read));
+                if (n <= 0)
+                    break;
+                read += uint32_t(n);
+            }
+            CHECK(read == stat.size);
+            os_fd_close(fd);
+            if (movie && read == stat.size) {
+                for (int sdk = 0; sdk < 2; ++sdk) {
+                    bink_record_sdk_for_test(sdk);
+                    const uint32_t rec = call_shim(open, {movie, 0x4000000});
+                    CHECK(rec);
+                    if (rec) {
+                        CHECK(rd32(rec + 8) > 0);
+                        call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+                        CHECK_EQ(call_shim(tramp("binkw32.dll", "_BinkGetRects@8"), {rec, 0}), 1u);
+                        call_shim(tramp("binkw32.dll", "_BinkClose@4"), {rec});
+                    }
+                }
+            }
+            if (movie)
+                heap_free(movie);
+        }
+    }
+    for (int sdk = 0; sdk < 2; ++sdk) {
+        bink_record_sdk_for_test(sdk);
+        with_bink_container([](uint32_t rec, uint32_t) {
+            const uint32_t width = rd32(rec), height = rd32(rec + 4), count = rd32(rec + 8);
+            if (width > 4096 || height > 4096)
+                return;
+            const uint32_t info = heap_alloc(120, true), summary = heap_alloc(128, true),
+                           realtime = heap_alloc(64, true),
+                           rgb = heap_alloc(width * height * 4, true);
+            call_shim(tramp("binkw32.dll", "_BinkGetFrameBuffersInfo@8"), {rec, info});
+            CHECK_EQ(rd32(info), 2u);
+            CHECK_EQ(rd32(info + 4), (width + 15) & ~15u);
+            CHECK_EQ(rd32(info + 12), rd32(info + 4) / 2);
+            std::vector<uint32_t> planes;
+            for (uint32_t slot = 0; slot < 2; ++slot)
+                for (uint32_t plane = 0; plane < 4; ++plane) {
+                    const uint32_t at = info + 24 + slot * 48 + plane * 12;
+                    if (!rd32(at))
+                        continue;
+                    const uint32_t h = plane == 1 || plane == 2 ? rd32(info + 16) : rd32(info + 8),
+                                   bytes = rd32(at + 8) * h, p = heap_alloc(bytes, true);
+                    CHECK(p);
+                    if (!p)
+                        return;
+                    wr32(at + 4, p);
+                    planes.push_back(p);
+                }
+            call_shim(tramp("binkw32.dll", "_BinkRegisterFrameBuffers@8"), {rec, info});
+            call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+            CHECK_EQ(rd32(info + 20), 0u);
+            call_shim(tramp("binkw32.dll", "_BinkCopyToBuffer@28"),
+                      {rec, rgb, width * 4, height, 0, 0, VIDEO_XRGB8888});
+            std::vector<uint8_t> converted(width * 4);
+            const uint32_t y = rd32(info + 28), cr = rd32(info + 40), cb = rd32(info + 52),
+                           yp = rd32(info + 32), cp = rd32(info + 44);
+            bool chroma_diff = false;
+            for (uint32_t row = 0; row < height; ++row) {
+                video_frame_convert_row(converted.data(), gm_ptr(y + row * yp),
+                                        gm_ptr(cb + (row / 2) * cp), gm_ptr(cr + (row / 2) * cp),
+                                        width, VIDEO_XRGB8888);
+                CHECK(!std::memcmp(converted.data(), gm_ptr(rgb + row * width * 4), width * 4));
+                for (uint32_t x = 0; x < (width + 1) / 2; ++x)
+                    chroma_diff |= rd8(cb + (row / 2) * cp + x) != rd8(cr + (row / 2) * cp + x);
+            }
+            if (!chroma_diff)
+                printf("bink plane fixture has no chroma difference; swap sensitivity not "
+                       "established\n");
+            std::vector<uint8_t> first(gm_ptr(rgb), gm_ptr(rgb) + width * height * 4);
+            if (count > 1) {
+                call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
+                call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+                CHECK_EQ(rd32(info + 20), 1u);
+                call_shim(tramp("binkw32.dll", "_BinkGoto@12"), {rec, 1, 0});
+                call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+                call_shim(tramp("binkw32.dll", "_BinkCopyToBuffer@28"),
+                          {rec, rgb, width * 4, height, 0, 0, VIDEO_XRGB8888});
+                CHECK(!std::memcmp(first.data(), gm_ptr(rgb), first.size()));
+            }
+            wr32(summary + 124, 0x12345678);
+            call_shim(tramp("binkw32.dll", "_BinkGetSummary@8"), {rec, summary});
+            CHECK_EQ(rd32(summary), width);
+            CHECK_EQ(rd32(summary + 32), count);
+            CHECK_EQ(rd32(summary + 124), 0x12345678u);
+            wr32(realtime + 56, 0x87654321);
+            call_shim(tramp("binkw32.dll", "_BinkGetRealtime@12"), {rec, realtime, 0});
+            CHECK_EQ(rd32(realtime), rd32(rec + 12));
+            CHECK(rd32(realtime + 4) && rd32(realtime + 8));
+            CHECK_EQ(rd32(realtime + 56), 0x87654321u);
+            for (auto p : planes)
+                heap_free(p);
+            for (auto p : {info, summary, realtime, rgb})
+                heap_free(p);
+        });
+    }
+    bink_record_sdk_for_test(-1);
+#endif
 }
 
 static void test_bink_play() {
@@ -12840,6 +12979,7 @@ int main() {
         {"Bink play", test_bink_play},
         {"Bink open from handle", test_bink_open_from_handle},
         {"Bink handle flag errors", test_bink_handle_flag_errors},
+        {"Bink extended ABI", test_bink_extended_abi},
         {"Bink rects and pause", test_bink_rects_and_pause},
         {"Bink audio without service", test_bink_audio_without_service},
         {"Bink shutdown with open player", test_bink_shutdown_with_open_player},

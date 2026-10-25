@@ -47,6 +47,7 @@
 // ---------------------------------------------------------------------------
 static int g_pad_mode = 2;
 static int g_pad_apis = 1;
+static bool g_attached_only = false, g_attached = false;
 static HostPadState g_pad;
 static uint32_t g_pad_packet = 0;
 // The host's retained edges, oldest first, as vpad's ring would hold them.
@@ -60,6 +61,7 @@ static const char *const kDefaultButtons =
 static void pad_reset() {
     g_pad_mode = 2;
     g_pad_apis = 1;
+    g_attached_only = g_attached = false;
     memset(&g_pad, 0, sizeof g_pad);
     g_pad_packet = 0;
     g_pad_events.clear();
@@ -84,6 +86,12 @@ int host_pad_mode(void) {
 }
 int host_pad_native_apis(void) {
     return g_pad_apis;
+}
+int host_pad_attached_only(void) {
+    return g_attached_only;
+}
+int host_pad_attached(void) {
+    return g_attached;
 }
 uint32_t host_pad_state(HostPadState *out) {
     if (out)
@@ -209,6 +217,14 @@ static void test_joy_sdk_layouts() {
 // sees a gamepad devtype, an older one filters and sees DIDEVTYPE_JOYSTICK.
 static void test_joy_pure_helpers() {
     pad_reset();
+    CHECK(joy_served());
+    g_attached_only = true;
+    CHECK(!joy_served());
+    g_attached = true;
+    CHECK(joy_served());
+    g_attached = false;
+    CHECK(!joy_served());
+    g_attached_only = false;
     CHECK(joy_served());
     g_pad_mode = 1;
     CHECK(!joy_served());
@@ -446,6 +462,18 @@ static void test_joy_dinput8() {
     CHECK_EQ(g_enum_calls, 0u);
 
     // Mapped mode: the version 8 interface serves no joystick either.
+    g_attached_only = true;
+    g_enum_calls = 0;
+    CHECK_EQ(call_method(di, DI_EnumDevices, {DI8_CLASS_GAMECTRL, cb, 0, 1}), DI_OK);
+    CHECK_EQ(g_enum_calls, 0u);
+    g_attached = true;
+    CHECK_EQ(call_method(di, DI_EnumDevices, {DI8_CLASS_GAMECTRL, cb, 0, 1}), DI_OK);
+    CHECK_EQ(g_enum_calls, 1u);
+    g_attached = false;
+    g_enum_calls = 0;
+    CHECK_EQ(call_method(di, DI_EnumDevices, {DI8_CLASS_GAMECTRL, cb, 0, 1}), DI_OK);
+    CHECK_EQ(g_enum_calls, 0u);
+    g_attached_only = false;
     g_pad_mode = 1;
     g_enum_calls = 0;
     CHECK_EQ(call_method(di, DI_EnumDevices, {DI8_CLASS_GAMECTRL, cb, 0, 1}), DI_OK);
@@ -905,6 +933,14 @@ static void test_xinput() {
 
     // Any user but 0 is not connected, even when served.
     CHECK_EQ(call_shim(get_state, {1, st}), XI_ERROR_DEVICE_NOT_CONNECTED);
+    g_attached_only = true;
+    CHECK_EQ(call_shim(get_state, {0, st}), XI_ERROR_DEVICE_NOT_CONNECTED);
+    g_attached = true;
+    CHECK_EQ(call_shim(get_state, {0, st}), XI_ERROR_SUCCESS);
+    g_attached = false;
+    CHECK_EQ(call_shim(get_state, {0, st}), XI_ERROR_DEVICE_NOT_CONNECTED);
+    g_attached_only = false;
+    CHECK_EQ(call_shim(get_state, {0, st}), XI_ERROR_SUCCESS);
 
     // Mapped mode (not native): not connected either.
     g_pad_mode = 1;

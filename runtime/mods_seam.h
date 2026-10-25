@@ -24,6 +24,8 @@ void mods_options_request(void);
 
 // Lifecycle, called by the host.
 bool mods_load_all(void);
+// Install the writable profile independently of optional user/core mods.
+void mods_overlay_reset(void);
 // Shutdown is two steps, because the teardown cannot run while a guest worker
 // is still going. mods_shutdown_request revokes every mod at once, so nothing
 // a surviving worker does reaches a plugin; mods_shutdown_complete runs the

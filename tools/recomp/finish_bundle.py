@@ -16,6 +16,14 @@ import copy_layouts  # noqa: E402
 GENERAL_MIDI = ROOT / "third_party/soundfonts/generaluser-gs/GeneralUser-GS.sf2"
 
 
+def sign_bundle(bundle):
+    """Seal the app with hardened runtime and only the media-library exception."""
+    subprocess.run(["codesign", "--force", "--deep", "--options", "runtime",
+                    "--entitlements", str(ROOT / "host/macos.entitlements"),
+                    "--sign", "-", str(bundle)], check=True)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
+
+
 def rename_identity(plist_path, name, version):
     """Stamp the version; the bundle's identity comes from generated/Info.plist."""
     data = plistlib.loads(plist_path.read_bytes())
@@ -86,8 +94,7 @@ def main():
     bundle_ffmpeg(contents, args.ffmpeg_library)
     # Seal after every resource is in place: the linker signature alone does
     # not cover the resource envelope.
-    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(args.bundle)], check=True)
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(args.bundle)], check=True)
+    sign_bundle(args.bundle)
     shown = args.bundle.relative_to(ROOT) if args.bundle.is_relative_to(ROOT) else args.bundle
     print("built %s" % shown)
 

@@ -326,9 +326,9 @@ class WebGpuRenderer final : public D9Backend {
         uint32_t width = d.width ? d.width : 1;
         uint32_t height = cube ? width : (d.height ? d.height : 1);
         bool target = (d.usage & (HOST_D9_USAGE_RENDERTARGET | HOST_D9_USAGE_DEPTH)) || depth;
-        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D) {
+        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D &&
+            set_render_scale_base(d.height, base_rows_)) {
             scale_chosen_ = true;
-            base_rows_ = d.height;
             const float want = wanted_scale();
             if (want > 0)
                 scale_ = want;
@@ -590,11 +590,28 @@ class WebGpuRenderer final : public D9Backend {
             mix(mix((uint64_t)d.decl_id << 32 | d.decl_size, vs_key), fnv(d.decl, d.decl_size));
         {
             uint64_t strides = 0;
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < 8; ++i) {
                 strides = strides * 1099511628211ull + d.stream[i].stride;
+                strides =
+                    mix(strides, uint64_t(d.stream[i].frequency & HOST_D9_STREAM_INSTANCE) << 32 |
+                                     host_d9_stream_rate(d.stream[i].frequency));
+            }
             vkey = mix(vkey, strides);
         }
         const VLayout &vl = vertex_layout(d, vp, vkey);
+        for (uint32_t stream = 0; stream < 8; ++stream)
+            if ((vl.streams >> stream & 1) && host_d9_stream_rate(d.stream[stream].frequency) > 1) {
+                log_once("d3d9.webgpu.divisor",
+                         "d3d9 webgpu: skipped a draw with stream divider %u; core WebGPU supports "
+                         "only one",
+                         host_d9_stream_rate(d.stream[stream].frequency));
+                skip("stream divisors above one are unsupported by core WebGPU");
+                return;
+            }
+        if (vl.zero && d.instance_count > 1) {
+            skip("instanced draw has missing vertex attributes");
+            return;
+        }
 
         WGPUPrimitiveTopology topology;
         switch (d.primitive) {
@@ -942,7 +959,7 @@ class WebGpuRenderer final : public D9Backend {
             submit();
             return;
         }
-        base_rows_ = t->desc.height;
+        set_render_scale_base(t->desc.height, base_rows_);
         submit();
         if (t->info.format == WGPUTextureFormat_BGRA8Unorm) {
             if (!t->imported) {
@@ -1570,7 +1587,9 @@ class WebGpuRenderer final : public D9Backend {
             if (s < 8) {
                 uint32_t stride = d.stream[s].stride ? d.stream[s].stride : stream_end[s];
                 b.arrayStride = std::max(stride, stream_end[s]);
-                b.stepMode = WGPUVertexStepMode_Vertex;
+                b.stepMode = (d.stream[s].frequency & HOST_D9_STREAM_INSTANCE)
+                                 ? WGPUVertexStepMode_Instance
+                                 : WGPUVertexStepMode_Vertex;
                 v.slot_of[s] = slot;
             } else {
                 b.arrayStride = 16;
@@ -1998,6 +2017,7 @@ class WebGpuRenderer final : public D9Backend {
     }
 
     void encode_primitives(const HostD9Draw &d) {
+        const uint32_t instances = d.instance_count ? d.instance_count : 1;
         uint32_t count = d.primitive_count;
         bool fan = false;
         switch (d.primitive) {
@@ -2025,7 +2045,7 @@ class WebGpuRenderer final : public D9Backend {
             return;
         bool indexed = d.index_buffer || d.inline_indices;
         if (!indexed && !fan) {
-            wgpuRenderPassEncoderDraw(pass_, count, 1, d.start, 0);
+            wgpuRenderPassEncoderDraw(pass_, count, instances, d.start, 0);
             return;
         }
         const WGPUIndexFormat itype =
@@ -2041,14 +2061,15 @@ class WebGpuRenderer final : public D9Backend {
                 b->second.used = serial_;
                 wgpuRenderPassEncoderSetIndexBuffer(pass_, b->second.buffer, itype, 0,
                                                     WGPU_WHOLE_SIZE);
-                wgpuRenderPassEncoderDrawIndexed(pass_, count, 1, d.start, d.base_vertex, 0);
+                wgpuRenderPassEncoderDrawIndexed(pass_, count, instances, d.start, d.base_vertex,
+                                                 0);
             } else {
                 uint64_t off = 0;
                 WGPUBuffer b = ring_write(d.inline_indices, (uint64_t)count * isize, &off,
                                           WGPUBufferUsage_Vertex);
                 wgpuRenderPassEncoderSetIndexBuffer(pass_, b, itype, off,
                                                     round_up((uint64_t)count * isize, 4));
-                wgpuRenderPassEncoderDrawIndexed(pass_, count, 1, 0, 0, 0);
+                wgpuRenderPassEncoderDrawIndexed(pass_, count, instances, 0, 0, 0);
             }
             return;
         }
@@ -2079,7 +2100,7 @@ class WebGpuRenderer final : public D9Backend {
         uint64_t off = 0;
         WGPUBuffer b = ring_write(fan_.data(), fan_.size() * 4, &off, WGPUBufferUsage_Vertex);
         wgpuRenderPassEncoderSetIndexBuffer(pass_, b, WGPUIndexFormat_Uint32, off, fan_.size() * 4);
-        wgpuRenderPassEncoderDrawIndexed(pass_, count * 3, 1, 0, 0, 0);
+        wgpuRenderPassEncoderDrawIndexed(pass_, count * 3, instances, 0, 0, 0);
     }
 
     float wanted_scale() const {

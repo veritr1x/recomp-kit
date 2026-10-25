@@ -10,5 +10,6 @@ ComObj *d9_api_surface(ComObj *device, uint32_t width, uint32_t height, uint32_t
 void d9_api_stream(ComObj *device, uint32_t stream, ComObj *buffer, uint32_t offset,
                    uint32_t stride);
 void d9_api_indices(ComObj *device, ComObj *buffer);
+void d3d9_device_destroy(ComObj *device);
 void d9_api_indexed_draw(ComObj *device, uint32_t primitive, int32_t base_vertex,
                          uint32_t first_index, uint32_t primitive_count);

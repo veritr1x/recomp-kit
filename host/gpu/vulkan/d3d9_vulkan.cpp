@@ -434,9 +434,9 @@ class VkRenderer final : public D9Backend {
         uint32_t width = d.width ? d.width : 1;
         uint32_t height = cube ? width : (d.height ? d.height : 1);
         bool target = (d.usage & (HOST_D9_USAGE_RENDERTARGET | HOST_D9_USAGE_DEPTH)) || depth;
-        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D) {
+        if (target && !scale_chosen_ && d.kind == HOST_D9_TEX_2D &&
+            set_render_scale_base(d.height, base_rows_)) {
             scale_chosen_ = true;
-            base_rows_ = d.height;
             const float want = wanted_scale();
             if (want > 0)
                 scale_ = want;
@@ -714,11 +714,29 @@ class VkRenderer final : public D9Backend {
             mix(mix((uint64_t)d.decl_id << 32 | d.decl_size, vs_key), fnv(d.decl, d.decl_size));
         {
             uint64_t strides = 0;
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < 8; ++i) {
                 strides = strides * 1099511628211ull + d.stream[i].stride;
+                strides =
+                    mix(strides, uint64_t(d.stream[i].frequency & HOST_D9_STREAM_INSTANCE) << 32 |
+                                     host_d9_stream_rate(d.stream[i].frequency));
+            }
             vkey = mix(vkey, strides);
         }
         const VLayout &layout = vertex_layout(d, vp, vkey);
+        for (uint32_t stream = 0; stream < 8; ++stream)
+            if ((layout.streams >> stream & 1) &&
+                host_d9_stream_rate(d.stream[stream].frequency) > 1) {
+                log_once("d3d9.vulkan.divisor",
+                         "d3d9 vulkan: skipped a draw with stream divider %u; divisor features are "
+                         "unavailable",
+                         host_d9_stream_rate(d.stream[stream].frequency));
+                skip("stream divisors above one require unsupported Vulkan divisor features");
+                return;
+            }
+        if (layout.zero && d.instance_count > 1) {
+            skip("instanced draw has missing vertex attributes");
+            return;
+        }
 
         // Pipeline.
         uint32_t topology;
@@ -1139,7 +1157,7 @@ class VkRenderer final : public D9Backend {
             flush();
             return;
         }
-        base_rows_ = t->desc.height;
+        set_render_scale_base(t->desc.height, base_rows_);
         const uint32_t pw = t->width, ph = t->height;
         const bool bgra = t->info.bgra8();
         if (bgra)
@@ -1966,7 +1984,10 @@ class VkRenderer final : public D9Backend {
             if (!(v.streams >> s & 1))
                 continue;
             uint32_t stride = d.stream[s].stride ? d.stream[s].stride : stream_end[s];
-            v.bindings.push_back({s, std::max(stride, stream_end[s]), VK_VERTEX_INPUT_RATE_VERTEX});
+            v.bindings.push_back({s, std::max(stride, stream_end[s]),
+                                  (d.stream[s].frequency & HOST_D9_STREAM_INSTANCE)
+                                      ? VK_VERTEX_INPUT_RATE_INSTANCE
+                                      : VK_VERTEX_INPUT_RATE_VERTEX});
         }
         if (v.zero)
             v.bindings.push_back({8, 16, VK_VERTEX_INPUT_RATE_INSTANCE});
@@ -2342,6 +2363,7 @@ class VkRenderer final : public D9Backend {
     }
 
     void encode_primitives(const HostD9Draw &d) {
+        const uint32_t instances = d.instance_count ? d.instance_count : 1;
         VkCommandBuffer cb = cur_->cb;
         uint32_t count = d.primitive_count;
         bool fan = false;
@@ -2370,7 +2392,7 @@ class VkRenderer final : public D9Backend {
             return;
         bool indexed = d.index_buffer || d.inline_indices;
         if (!indexed && !fan) {
-            vkCmdDraw(cb, count, 1, d.start, 0);
+            vkCmdDraw(cb, count, instances, d.start, 0);
             return;
         }
         const VkIndexType itype = d.index_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
@@ -2384,12 +2406,12 @@ class VkRenderer final : public D9Backend {
                     return;
                 b->second.used = serial_;
                 bind_index(b->second.buf.buffer, 0, itype);
-                vkCmdDrawIndexed(cb, count, 1, d.start, d.base_vertex, 0);
+                vkCmdDrawIndexed(cb, count, instances, d.start, d.base_vertex, 0);
             } else {
                 Slice s = ring_alloc((uint64_t)count * isize, 4);
                 memcpy(s.data, d.inline_indices, (size_t)count * isize);
                 bind_index(s.buffer, s.offset, itype);
-                vkCmdDrawIndexed(cb, count, 1, 0, 0, 0);
+                vkCmdDrawIndexed(cb, count, instances, 0, 0, 0);
             }
             return;
         }
@@ -2420,7 +2442,7 @@ class VkRenderer final : public D9Backend {
             list[i * 3 + 2] = source(i + 2);
         }
         bind_index(s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cb, count * 3, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cb, count * 3, instances, 0, 0, 0);
     }
     void bind_index(VkBuffer b, VkDeviceSize off, VkIndexType type) {
         if (es_.ib == b && es_.ib_offset == off && es_.ib_type == type)

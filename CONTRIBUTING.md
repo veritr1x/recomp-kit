@@ -6,9 +6,9 @@ portable tests and mod examples. Open an issue before a large architecture chang
 
 ## Prerequisites
 
-- Python 3.9 or later; create `.venv` and install `requirements-dev.txt`.
+- Python 3.9 or later; create `.venv` and install `requirements.lock` with `pip install --require-hashes --only-binary=:all: -r requirements.lock`.
 - Native builds on macOS: Apple Silicon, Xcode Command Line Tools and Git. CMake
-  and Ninja come from `requirements-dev.txt`.
+  and Ninja come from the hashed lock (maintained from `requirements-dev.txt`).
 - Native builds on Linux: clang, lld and GNU make
   (`apt-get install clang lld build-essential`), plus SDL's platform headers
   listed in `.github/workflows/checks.yml`. FFmpeg builds from source; no
@@ -27,6 +27,14 @@ portable tests and mod examples. Open an issue before a large architecture chang
 `tools/build.py --target app` builds the desktop host on macOS, Linux and
 Windows; `--regenerate` runs the Python translator on each. Only the iOS
 packager (`--target ios`, including `--stub`) requires macOS.
+
+The lock covers all tooling dependencies and platform wheels. Maintain inputs
+in `requirements-dev.txt` and regenerate hashes with `pip-tools` 7.5.2 using
+the command in the lock header. Native CI jobs use `tools/requirements-build.lock`
+for CMake, Ninja and the decoder used by generated integration fixtures. They
+configure through `tools/build.py` so generation uses that same interpreter.
+SDL3/glslang archives are pinned to commits
+and SHA-256 digests in `cmake/Dependencies.cmake`.
 
 ## Prepare a game installation
 

@@ -12,6 +12,130 @@ from test_translate_insns import Case, T, translate_case
 BASE = 0x0D02A000
 
 
+def msvc_fixture(publication="ebp", tries=True, continuation_outside=False, two_paths=False):
+    stub, catch, cleanup = BASE + 0x180, BASE + 0x200, BASE + 0x240
+    info, unwind, try_map, handlers, slot, throw_slot = [BASE + x for x in
+                                                       (0x1000, 0x1040, 0x1060, 0x1080, 0x1100, 0x1104)]
+    landing = BASE + (0x300 if continuation_outside else 0x60)
+    restore = bytes.fromhex("8b4df464890d000000008be55dc3")
+    head = bytes.fromhex("558bec6aff68") + struct.pack("<I", stub)
+    head += bytes.fromhex("64a10000000050")
+    if publication == "esp":
+        head += bytes.fromhex("6489250000000083ec40")
+    else:
+        head += bytes.fromhex("83ec40")
+        head += bytes.fromhex("8d442440" if publication == "esp-lea" else "8d45f4")
+        if publication == "clobbered":
+            head += bytes.fromhex("31c0")
+        head += bytes.fromhex("64a300000000")
+    head += bytes.fromhex("c745fc00000000")
+    head += b"\xff\x15" + struct.pack("<I", throw_slot) + b"\xcc"
+    catch_code = b"\xb8" + struct.pack("<I", landing) + b"\xc3"
+    if two_paths:
+        catch_code = b"\x85\xc0\x74\x06" + catch_code + b"\xb8" + struct.pack("<I", landing + 0x30) + b"\xc3"
+    blocks = {BASE: head, stub: b"\xb8" + struct.pack("<I", info) + b"\xff\x25" + struct.pack("<I", slot),
+              catch: catch_code, cleanup: b"\xc3", landing: restore,
+              info: struct.pack("<9I", 0x19930522, 2, unwind, int(tries), try_map, 0, 0, 0, 0),
+              unwind: struct.pack("<4I", 0xffffffff, cleanup, 0, cleanup),
+              try_map: struct.pack("<5I", 0, 1, 1, 1, handlers),
+              handlers: struct.pack("<4I", 0, 0, 0, catch)}
+    if two_paths:
+        blocks[landing + 0x30] = restore
+    image = synthetic_image(blocks, base=BASE, size=0x1800)
+    image.exec_ranges = [(BASE, BASE + 0x800, ".text")]
+    image.data_ranges = [(BASE + 0x1000, BASE + 0x1800, ".rdata")]
+    image.iat_names = {slot: "__CxxFrameHandler3", throw_slot: "_CxxThrowException"}
+    image.code_pointers = lambda *args, **kwargs: (set(), set())
+    listings = {BASE: head if continuation_outside else [(BASE, head), (landing, restore)]}
+    return image, listings, stub, catch, cleanup, landing
+
+
+@pytest.mark.parametrize("publication", ["ebp", "esp", "esp-lea"])
+@pytest.mark.parametrize("outside", [False, True])
+def test_msvc_checkpoints_and_omitted_funclets(tmp_path, monkeypatch, publication, outside):
+    image, listings, stub, catch, cleanup, landing = msvc_fixture(publication, continuation_outside=outside)
+    metadata = image.msvc_func_info(stub)
+    assert metadata["funclets"] == {catch, cleanup}
+    assert metadata["landings"] == {landing}
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, listings)
+    body = emitted_body(text, BASE)
+    assert "recomp_msvc_frame_enter(c," in body
+    assert "recomp_msvc_frame_land(c)" in body
+    assert "recomp_seh_frame_enter" not in body
+    assert "/* %08x MOV" % landing in text
+    assert "/* %08x MOV" % catch in text
+    if not outside:
+        assert "case 0x%xu: goto L_%08x;" % (landing, landing) in body
+        assert "recomp_msvc_frame_leave(c)" in body
+    assert 'include "msvc_eh.h"' in (tmp_path / "gen" / "funcs.h").read_text()
+
+
+@pytest.mark.parametrize("publication", ["ebp", "esp", "esp-lea"])
+def test_msvc_cleanup_only_frames_have_no_host_checkpoint(tmp_path, monkeypatch, publication):
+    image, listings, *_ = msvc_fixture(publication, tries=False)
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, listings)
+    body = emitted_body(text, BASE)
+    assert "recomp_msvc_" not in body and "recomp_seh_" not in body
+
+
+def test_msvc_publication_requires_live_lea_register(tmp_path, monkeypatch):
+    image, listings, *_ = msvc_fixture("clobbered")
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, listings)
+    assert "recomp_msvc_frame_enter" not in emitted_body(text, BASE)
+
+
+def test_msvc_handler_identity_is_required():
+    image, _, stub, *_ = msvc_fixture()
+    image.iat_names = {}
+    assert image.msvc_func_info(stub) is None
+
+
+def test_msvc_continuations_from_both_catch_paths(tmp_path, monkeypatch):
+    image, listings, stub, _, _, landing = msvc_fixture(two_paths=True)
+    assert image.msvc_func_info(stub)["landings"] == {landing, landing + 0x30}
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, listings)
+    assert "/* %08x MOV" % (landing + 0x30) in text
+
+
+def test_msvc_metadata_bounds_are_checked():
+    image, _, stub, *_ = msvc_fixture()
+    data = bytearray(image.data)
+    struct.pack_into("<I", data, 0x1000 + 12, 4097)
+    image.data = bytes(data)
+    for _ in range(2):
+        with pytest.raises(T.TranslateError, match="FuncInfo"):
+            image.msvc_func_info(stub)
+
+
+def test_msvc_only_returned_eax_addresses_are_continuations():
+    image, _, stub, catch, _, landing = msvc_fixture()
+    data = bytearray(image.data)
+    code = b"\xb8" + struct.pack("<I", BASE + 0x400) + b"\xb8" + struct.pack("<I", landing) + b"\xc3"
+    data[catch-BASE:catch-BASE+len(code)] = code
+    image.data = bytes(data)
+    assert image.msvc_func_info(stub)["landings"] == {landing}
+
+
+@pytest.mark.parametrize("clobber", ["0fa2", "f7e1", "0fc1c1"])
+def test_msvc_implicit_and_second_operand_eax_writes_kill_continuations(clobber):
+    image, _, stub, catch, _, landing = msvc_fixture()
+    data = bytearray(image.data)
+    code = b"\xb8" + struct.pack("<I", landing) + bytes.fromhex(clobber) + b"\xc3"
+    data[catch-BASE:catch-BASE+len(code)] = code
+    image.data = bytes(data)
+    assert image.msvc_func_info(stub)["landings"] == set()
+
+
+def test_msvc_checkpoints_reject_host_frames_that_can_return_early(tmp_path, monkeypatch):
+    image, _, stub, *_ = msvc_fixture()
+    fn = T.Function(BASE, "msvc", 0, image.recover(BASE, {stub}))
+    fn.measure(image)
+    translator = T.Translator(image, {BASE}, type("Opts", (), {"eager_flags": False})())
+    monkeypatch.setattr(T, "RESUMABLE_STACKS", True)
+    with pytest.raises(T.TranslateError, match="preserved native call frames"):
+        translator.prepare(fn)
+
+
 def emitted_body(text, address):
     shared = "static void body_%08x(X86 *c, uint32_t entry_) {" % address
     start = shared if shared in text else "void fn_%08x(X86 *c) {" % address

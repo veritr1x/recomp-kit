@@ -340,25 +340,30 @@ void heap_reset() {
 
 } // namespace
 
+static uint64_t arena_generation = 0;
+uint64_t mem_generation() {
+    return arena_generation;
+}
 void mem_init() {
     recomp_seh_reset(nullptr);
     if (g_mem) {
-        os_vm_release(g_mem, GUEST_SIZE);
+        os_guest_arena_release(g_mem, GUEST_SIZE);
         g_mem = nullptr;
     }
-    void *p = os_vm_reserve(GUEST_SIZE);
+    void *p = os_guest_arena_reserve(GUEST_SIZE);
     if (!p) {
         fprintf(stderr, "[recomp] fatal: cannot map %u bytes of guest memory\n", GUEST_SIZE);
         abort();
     }
     g_mem = (uint8_t *)p;
     heap_reset();
+    ++arena_generation;
 }
 
 void mem_shutdown() {
     recomp_seh_reset(nullptr);
     if (g_mem) {
-        os_vm_release(g_mem, GUEST_SIZE);
+        os_guest_arena_release(g_mem, GUEST_SIZE);
         g_mem = nullptr;
     }
     if (g_blocks) {

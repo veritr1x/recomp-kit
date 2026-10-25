@@ -94,12 +94,16 @@ trampoline; `imports_register_data(dll, name, size)` adds more.
 
 ## `_setjmp` / `_longjmp`
 
-The translator substitutes these by address (`_longjmp` is `0x0055db78`).
+The translator substitutes the configured `[translate.intrinsics]` address pair.
+Both setjmp and longjmp must be specified together; an empty table disables
+substitution and an omitted table retains the legacy port's pair.
 `intrinsics.h` documents the contract: prefer the two-call form, which puts the
 host `setjmp` in the generated function's own frame:
 
 ```c
-{ jmp_buf *b = recomp_setjmp_prepare(c); recomp_setjmp_return(c, setjmp(*b)); }
+{ jmp_buf *b = recomp_setjmp_prepare(c);
+  if (setjmp(*b) == 0) recomp_setjmp_return(c, 0);
+  else recomp_setjmp_return(c, (int32_t)c->r[R_EAX]); }
 ```
 
 `recomp_setjmp(c)` exists only to catch a call site that was not translated
@@ -107,8 +111,35 @@ into that form. It cannot work, because the host `setjmp` would belong to a
 frame that has returned by the time `_longjmp` fires, so it logs what the call
 site should emit and aborts.
 
-`RaiseException` and `RtlUnwind` log their arguments and abort: there is no SEH
-here, so continuing would run the guest past a point Windows never reaches.
+`RaiseException` walks the guest registration chain and `RtlUnwind` runs its
+cleanup handlers. Delphi checkpoints and MSVC C++ checkpoints keep their own
+ownership records; a host setjmp always belongs to the establishing translated
+function, never a helper that already returned.
+
+VC8 `_CxxThrowException` matches the x86 FuncInfo try/handler maps and catchable
+types, builds the catch object (including a guest copy constructor), unwinds
+intervening states, and invokes the catch funclet with the establishing EBP.
+The funclet's returned continuation resumes through that frame's live checkpoint.
+The saved ESP survives the funclet; exception destruction occurs once after
+handling or when a replacement throw abandons its catch. Rethrow retains the
+original object. Every address in these records remains a 32-bit guest address.
+
+Only try-bearing C++ frames receive host checkpoints. Handler stubs must name
+FuncInfo and jump to imported `__CxxFrameHandler3`; LEA and ESP publications are
+recognized from a proven prologue. Funclets and their continuation addresses
+are recovered even when the listing omits them. Longjmp and thread/context
+teardown retire abandoned checkpoints. A throw cannot cross an unrelated
+`guest_call`; the exception dispatcher's own callbacks are identified explicitly.
+Uncaught throws name their type, and a throw while copying or unwinding terminates.
+A matching try inside an active catch in the same frame is a named unsupported
+case. C++ checkpoint translation rejects resumable-stacks mode, which can
+return from a native frame before its guest frame ends. `_except_handler4_common`
+passes exceptions on without executing filters. Longjmp restores the saved
+registration head and rejects buffers from another CPU or an older arena.
+
+`std::exception` uses VC8's three guest fields (vftable, message, ownership flag),
+with guest RTTI and copied or borrowed messages. Initialized data imports are
+rebuilt for each arena generation, including vtable prefixes for RTTI locators.
 
 ## Behaviour worth knowing before you debug something
 

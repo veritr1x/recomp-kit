@@ -30,10 +30,10 @@ def run(args, **kwargs):
     subprocess.run([str(arg) for arg in args], cwd=ROOT, check=True, **kwargs)
 
 
-def validate_game(directory, executable, sha256, required_dirs=()):
+def validate_game(directory, executable, sha256, required_dirs=(), exe_dir=""):
     """Require the supported executable and game-data directories before creating a link."""
     directory = directory.expanduser().resolve()
-    image = directory / executable
+    image = directory / exe_dir / executable
     if not image.is_file():
         raise ValueError(f"{executable} was not found in {directory}")
     digest = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -128,10 +128,10 @@ def main():
         cfg = game_config.load(args.game_dir.resolve())
         setup = cfg.get("setup", {})
         directory = validate_game(args.install, cfg["game"]["executable"], cfg["game"]["sha256"],
-                                  setup.get("required_dirs", ()))
+                                  setup.get("required_dirs", ()), cfg["game"]["exe_dir"])
         if not args.link_only and not args.ghidra_home:
             raise ValueError("Set --ghidra-home or GHIDRA_HOME; see the game's CONTRIBUTING.md")
-        link_game(directory, cfg["developer_exe_path"].parent)
+        link_game(directory, cfg["developer_game_dir_path"])
         if not args.link_only:
             annotations = None
             if setup.get("annotations_url"):

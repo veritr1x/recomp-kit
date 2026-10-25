@@ -27,7 +27,7 @@ def main():
     if not binary.is_file():
         binary = shutil.which("clang-format")
     if not binary:
-        parser.error("Install requirements-dev.txt in the Python environment running this command")
+        parser.error("Install requirements.lock with --require-hashes in the Python environment running this command")
     files = source_files()
     flags = ["-i"] if args.write else ["--dry-run", "--Werror"]
     for offset in range(0, len(files), 50):

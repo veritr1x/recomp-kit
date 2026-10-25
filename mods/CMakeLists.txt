@@ -49,6 +49,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 endif()
 
+# The file confinement checks use the actual runtime and profile overlay,
+# without a game's translated code or assets.
+if(TARGET recomp_gen AND NOT IOS AND NOT ANDROID)
+add_executable(hardening_tests ${POP_ROOT}/runtime/tests/hardening_tests.cpp)
+target_link_libraries(hardening_tests PRIVATE recomp_platform recomp_runtime_testing recomp_mods_testing)
+pop_link_gen(hardening_tests)
+target_compile_options(hardening_tests PRIVATE ${POP_WARN_HOST})
+pop_test_binary(hardening_tests)
+add_test(NAME hardening_tests COMMAND hardening_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(hardening_tests PROPERTIES LABELS nogame TIMEOUT 30)
+endif()
+
 # Plugin fixtures the loader tests load. Every .c becomes a module of the same
 # name; old_cpu is built with the older header AHEAD of the real one so its
 # sizeof(pop_cpu_v1) really is the older value.

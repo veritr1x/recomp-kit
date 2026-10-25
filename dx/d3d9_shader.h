@@ -91,6 +91,8 @@ enum Op : uint32_t {
     OP_TEXDP3 = 85,
     OP_CMP = 88,
     OP_DP2ADD = 90,
+    OP_DSX = 91,
+    OP_DSY = 92,
     OP_PHASE = 0xfffd,
     OP_COMMENT = 0xfffe,
     OP_END = 0xffff,

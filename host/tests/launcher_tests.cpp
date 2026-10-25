@@ -760,6 +760,30 @@ void test_ui_text_fits() {
     }
 }
 
+void test_nested_executable() {
+    Spec s = spec();
+    s.exe_dir = "Binaries/Win32";
+    const std::string top = fresh("nested-exe"), root = top + "/Game";
+    write_file(root + "/BINARIES/win32/game.exe", kExeBytes);
+    write_file(root + "/DATA/asset.bin", "asset");
+    write_file(root + "/levels/one.lvl", "level");
+    CHECK(find_root(s, root) == root);
+    CHECK(find_root(s, root + "/BINARIES/win32/") == root);
+    CHECK(find_root(s, root + "/BINARIES/win32/game.exe") == root);
+    CHECK(check(s, root).state == State::Ready);
+    CHECK(check(s, root).exe == root + "/BINARIES/win32/game.exe");
+    CHECK(detect_under(s, {root}) == std::vector<std::string>{root});
+    const std::string dest = top + "/imported";
+    auto source = folder_source(top);
+    CHECK(import_game(s, *source, dest).result == ImportResult::Done);
+    CHECK(read_file(dest + "/DATA/asset.bin") == "asset");
+    CHECK(read_file(dest + "/BINARIES/win32/game.exe") == kExeBytes);
+    CHECK(check(s, dest).state == State::Ready);
+    auto bare = folder_source(root);
+    CHECK(import_game(s, *bare, top + "/bare").result == ImportResult::Done);
+    CHECK(check(s, top + "/bare").state == State::Ready);
+}
+
 int main() {
     const char *base = getenv("RECOMP_LAUNCHER_TEST_DIR");
     g_scratch = std::string(base && *base ? base : "build/recomp") + "/launcher-test";
@@ -774,6 +798,7 @@ int main() {
         void (*run)();
     } tests[] = {
         {"sha256", test_sha256},
+        {"nested executable", test_nested_executable},
         {"wildcards and exclusion", test_wildcards},
         {"find and check", test_find_and_check},
         {"folder import", test_folder_import},

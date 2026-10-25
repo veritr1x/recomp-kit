@@ -50,10 +50,10 @@ extern uint8_t *g_mem;
  *   0x00400000 + SizeOfImage  image (preferred base, no relocation).  The end
  *                             is a PE header value, not a constant; ask the
  *                             loader (loader_image_limit()) for it.
- *   GUEST_HEAP_BASE..0x0e000000  heap arena (default 0x01000000)
- *   0x0f000000                stack top, grows down (1 MB)
- *   0x0fe00000                TEB (FS base)
- *   0x0ff00000 + 16*i         import shim trampoline for import i
+ *   GUEST_HEAP_BASE..GUEST_HEAP_END  heap arena (default 0x01000000)
+ *   GUEST_STACK_TOP            stack top, grows down (8 MB)
+ *   GUEST_TEB_BASE             TEB (FS base)
+ *   GUEST_SHIM_BASE + 16*i     import shim trampoline for import i
  */
 /* The build passes the game's image base; this default serves the test harness. */
 #ifndef GUEST_IMAGE_BASE
@@ -64,13 +64,19 @@ extern uint8_t *g_mem;
 #ifndef GUEST_HEAP_BASE
 #define GUEST_HEAP_BASE 0x01000000u
 #endif
-#define GUEST_HEAP_END 0x0e000000u
-#define GUEST_STACK_TOP 0x0f000000u
-#define GUEST_TEB_BASE 0x0fe00000u
-#define GUEST_SHIM_BASE 0x0ff00000u
-#define GUEST_SHIM_END 0x10000000u
+/* The mapped arena may extend past a high DLL. All runtime allocations end
+ * below that DLL, so growing the arena cannot move stacks/shims into its code. */
+#ifndef GUEST_LAYOUT_END
+#define GUEST_LAYOUT_END GUEST_SIZE
+#endif
+#define GUEST_HEAP_END (GUEST_LAYOUT_END - 0x02000000u)
+#define GUEST_STACK_TOP (GUEST_LAYOUT_END - 0x01000000u)
+#define GUEST_STACK_SIZE 0x00800000u
+#define GUEST_TEB_BASE (GUEST_LAYOUT_END - 0x00200000u)
+#define GUEST_SHIM_BASE (GUEST_LAYOUT_END - 0x00100000u)
+#define GUEST_SHIM_END GUEST_LAYOUT_END
 #define GUEST_SHIM_STRIDE 16u
-#define GUEST_RETURN_SENTINEL 0x0fdfff00u
+#define GUEST_RETURN_SENTINEL (GUEST_TEB_BASE - 0x100u)
 /* Windows maps nothing in the first 64 KB, so a read or a write through a
  * null pointer faults and the program's own handlers see it. A flat arena
  * hands back a zero instead, which turns a null dereference into ordinary
@@ -121,6 +127,7 @@ RECOMP_HOT_INLINE uint32_t rd32(uint32_t a) {
     return v;
 }
 RECOMP_HOT_INLINE uint64_t rd64(uint32_t a) {
+    RECOMP_NULL_GUARD(a, 0);
     uint64_t v;
     memcpy(&v, g_mem + a, 8);
     return v;
@@ -184,25 +191,30 @@ RECOMP_HOT_INLINE void wr32(uint32_t a, uint32_t v) {
     recomp_watch(a, 4, v);
 }
 RECOMP_HOT_INLINE void wr64(uint32_t a, uint64_t v) {
+    RECOMP_NULL_GUARD(a, 1);
     memcpy(g_mem + a, &v, 8);
     recomp_watch(a, 8, v);
 }
 RECOMP_HOT_INLINE float rdf32(uint32_t a) {
+    RECOMP_NULL_GUARD(a, 0);
     float v;
     memcpy(&v, g_mem + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE double rdf64(uint32_t a) {
+    RECOMP_NULL_GUARD(a, 0);
     double v;
     memcpy(&v, g_mem + a, 8);
     return v;
 }
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
+    RECOMP_NULL_GUARD(a, 1);
     memcpy(g_mem + a, &v, 4);
     if (g_dirty_count != 0)
         recomp_dirty(a, 4);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
+    RECOMP_NULL_GUARD(a, 1);
     memcpy(g_mem + a, &v, 8);
     if (g_dirty_count != 0)
         recomp_dirty(a, 8);
@@ -252,6 +264,7 @@ static inline void wrf80(uint32_t a, double v) {
  * to nearest even as the default control word does. Out-of-range values store
  * the BCD indefinite (0xffff c000 0000 0000 0000), as the hardware does. */
 static inline void wrbcd80(uint32_t a, double v) {
+    RECOMP_NULL_GUARD(a, 1);
     uint8_t out[10];
     memset(out, 0, sizeof out);
     double r = nearbyint(v);
@@ -300,25 +313,111 @@ struct X86 {
      * use.  Initialise to 0xffff (the post-FINIT all-empty state). */
     uint16_t fpu_tag;
     uint32_t fs_base;
-    /* SSE2. The translator models the data-movement subset only -
-     * loads, stores, a dword broadcast - which is all a Delphi runtime's
-     * FillChar and Move use, and byte order is then the only thing that has
-     * to be right. There are eight in 32-bit mode. CPUID advertises no SSE,
+    /* Eight SSE registers in 32-bit mode, held as dword lanes for scalar and
+     * packed arithmetic, comparisons, conversions and bit-preserving moves.
+     * CPUID advertises no SSE,
      * so nothing chooses one of these paths from a feature test; the RTL
      * takes them unconditionally because every CPU it supports has SSE2.
-     * Held as dwords: every modelled form - load, store, MOVD, MOVQ and
-     * PSHUFD's selector - addresses the register in dword lanes, and on a
-     * little-endian host the byte order of a copy then takes care of
-     * itself. Lane 0 is the low four bytes. */
+     * Lane 0 is the low four bytes. */
     uint32_t xmm[8][4];
     /* The eight MMX registers. Kept apart from the x87 stack: a program that
      * leaves MMX without EMMS and then uses the FPU sees its old values, not
      * the MMX ones, which no game this runtime serves relies on. */
     uint64_t mm[8];
+    /* XOR encoding makes a zero-initialized CPU start at MXCSR reset (0x1f80).
+     * Guest rounding control must survive context switches and longjmp. */
+    uint32_t mxcsr_xor;
+    uint32_t backedge_count;
 };
 typedef struct X86 X86;
 
+/* Pure guest loops must periodically offer the cooperative baton to workers.
+ * The slow path checks registered guest identity and atomic stretches. */
+void recomp_backedge_poll(void);
+#define RECOMP_BACKEDGE(c)                                                                         \
+    do {                                                                                           \
+        if (RECOMP_UNLIKELY(++(c)->backedge_count >= 4096u)) {                                     \
+            (c)->backedge_count = 0;                                                               \
+            recomp_backedge_poll();                                                                \
+        }                                                                                          \
+    } while (0)
+
 /* ----------------------------------------------------------------- SSE */
+static inline uint32_t sse_mxcsr(const X86 *c) {
+    return c->mxcsr_xor ^ 0x1f80u;
+}
+static inline double sse_round(double value, unsigned mode) {
+    if (mode == 1)
+        return floor(value);
+    if (mode == 2)
+        return ceil(value);
+    if (mode == 3)
+        return trunc(value);
+    double lo = floor(value), hi = ceil(value);
+    if (value - lo < hi - value)
+        return lo;
+    if (value - lo > hi - value)
+        return hi;
+    return fmod(lo, 2.0) == 0.0 ? lo : hi;
+}
+/* SSE stores the integer indefinite for NaN/overflow, never a C cast outside
+ * its defined range. Track masked invalid/precision status for STMXCSR. */
+static inline uint32_t sse_i32(X86 *c, double value, int truncate) {
+    double rounded = sse_round(value, truncate ? 3u : (sse_mxcsr(c) >> 13) & 3u);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) {
+        c->mxcsr_xor |= 1u;
+        return 0x80000000u;
+    }
+    if (value != rounded)
+        c->mxcsr_xor |= 0x20u;
+    return (uint32_t)(int32_t)rounded;
+}
+static inline float sse_float(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, 4);
+    return value;
+}
+static inline uint32_t sse_float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    return bits;
+}
+static inline double sse_double(uint64_t bits) {
+    double value;
+    memcpy(&value, &bits, 8);
+    return value;
+}
+static inline uint32_t sse_compare(double a, double b, uint32_t predicate) {
+    const int unordered = a != a || b != b;
+    int result;
+    switch (predicate & 7u) {
+    case 0:
+        result = a == b;
+        break;
+    case 1:
+        result = a < b;
+        break;
+    case 2:
+        result = a <= b;
+        break;
+    case 3:
+        result = unordered;
+        break;
+    case 4:
+        result = a != b;
+        break;
+    case 5:
+        result = !(a < b);
+        break;
+    case 6:
+        result = !(a <= b);
+        break;
+    default:
+        result = !unordered;
+        break;
+    }
+    return result ? UINT32_MAX : 0;
+}
 
 /* An XMM register holds dwords (see struct X86), so a scalar double or float
  * in its low lanes is read and written through these. Scalar SSE arithmetic
@@ -1528,6 +1627,31 @@ static inline int64_t fist_i64(X86 *c) {
     if (c->st_exact[c->fpu_top])
         return (int64_t)c->st_bits[c->fpu_top];
     return fto_i64(c, ST(c, 0));
+}
+
+/* FISTTP ignores x87 RC. Bounds are checked before every narrowing cast. */
+static inline int16_t fisttp_i16(X86 *c) {
+    double v = trunc(ST(c, 0));
+    if (v >= -32768.0 && v <= 32767.0)
+        return (int16_t)v;
+    c->fpu_sw |= 1u;
+    return INT16_MIN;
+}
+static inline int32_t fisttp_i32(X86 *c) {
+    double v = trunc(ST(c, 0));
+    if (v >= -2147483648.0 && v <= 2147483647.0)
+        return (int32_t)v;
+    c->fpu_sw |= 1u;
+    return INT32_MIN;
+}
+static inline int64_t fisttp_i64(X86 *c) {
+    if (c->st_exact[c->fpu_top])
+        return (int64_t)c->st_bits[c->fpu_top];
+    double v = trunc(ST(c, 0));
+    if (v >= -9223372036854775808.0 && v < 9223372036854775808.0)
+        return (int64_t)v;
+    c->fpu_sw |= 1u;
+    return INT64_MIN;
 }
 
 /* FPREM / FPREM1.

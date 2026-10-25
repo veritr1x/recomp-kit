@@ -20,6 +20,105 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
+    def test_bink_record_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            (game / "globals.toml").write_text("", encoding="utf-8")
+            for record, macro in (("legacy", 0), ("sdk", 1)):
+                (game / "game.toml").write_text(stub+'\n[bink]\nrecord="'+record+'"\n', encoding="utf-8")
+                cfg = game_config.load(game)
+                self.assertIn("#define RECOMP_BINK_SDK_RECORD %d" % macro,gen_game_config.render_header(cfg))
+            for value in ('true', '"other"', '[1]'):
+                (game / "game.toml").write_text(stub+'\n[bink]\nrecord='+value+'\n', encoding="utf-8")
+                with self.assertRaisesRegex(ValueError,"bink"):
+                    game_config.load(game)
+        self.assertEqual(game_config.load(ROOT / "games/stub")["bink"]["record"],"legacy")
+
+    def test_expanded_guest_layout(self):
+        self.assertEqual(game_config.validate_guest_size(0x80000000),0x80000000)
+        self.assertEqual(game_config.validate_heap_base(0x40000000,0x80000000),0x40000000)
+        for value in (True,0x10001000,0x100000000,0x0fff0000,"0x80000000"):
+            with self.assertRaisesRegex(ValueError,"guest_size"):
+                game_config.validate_guest_size(value)
+        with self.assertRaisesRegex(ValueError,"heap_base"):
+            game_config.validate_heap_base(0x7e000000,0x80000000)
+
+    def test_untranslated_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            (game / "globals.toml").write_text("", encoding="utf-8")
+            valid = '[{start=0x401000,end=0x402000,on_branch="trap"}]'
+            for value in (valid, '[]', '[{start=0x401000,end=0x402000}]'):
+                (game / "game.toml").write_text(stub.replace('[translate]', '[translate]\nuntranslated_ranges = '+value), encoding="utf-8")
+                cfg = game_config.load(game)
+                self.assertIn("untranslated_ranges",cfg["translate"])
+            for value in ('true', '[1]', '[{start=true,end=42}]', '[{start=3,end=3}]',
+                          '[{start=-1,end=3}]','[{start=0,end=0x100000001}]',
+                          '[{start=1,end=4},{start=3,end=5}]',
+                          '[{start=1,end=4,on_branch="skip"}]', '[{start=1,end=4,typo=1}]'):
+                (game / "game.toml").write_text(stub.replace('[translate]', '[translate]\nuntranslated_ranges = '+value), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError,"untranslated_ranges"):
+                    game_config.load(game)
+
+    def test_executable_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            # The stub's EXE spelling can change without weakening this layout test.
+            lines = stub.splitlines()
+            lines = ['developer_exe = "original/Binaries/GAME.EXE"' if l.startswith('developer_exe =') else l for l in lines]
+            base = "\n".join(lines).replace("[game]\n", '[game]\nexe_dir = "Binaries"\n')
+            (game / "globals.toml").write_text("", encoding="utf-8")
+            (game / "game.toml").write_text(base, encoding="utf-8")
+            cfg = game_config.load(game)
+            self.assertEqual(cfg["developer_game_dir_path"], (game / "original").resolve())
+            self.assertIn('#define RECOMP_EXE_DIR "Binaries"', gen_game_config.render_header(cfg))
+            self.assertIn((game / "original").resolve().as_posix(), gen_game_config.render_cmake(cfg))
+            for bad in ('"../Binaries"', '"C:/Binaries"', '"/Binaries"', '"."', '"Bin//x"', 'true', '"Other"'):
+                (game / "game.toml").write_text(base.replace('exe_dir = "Binaries"', 'exe_dir = ' + bad), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "exe_dir"):
+                    game_config.load(game)
+
+    def test_hardware_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            (game / "globals.toml").write_text("", encoding="utf-8")
+            settings = ('\n[system]\ndesktop = "1920x1080"\nmemory_mb = 8192\n'
+                        '[d3d9.adapter]\nvendor_id = 4098\ndevice_id = 123\n'
+                        'description = "Test \\"GPU\\""\nvideo_memory_mb = 1024\n')
+            # TOML string quoting remains intentional, including the embedded quotes.
+            (game / "game.toml").write_text(stub + settings, encoding="utf-8")
+            cfg = game_config.load(game)
+            header = gen_game_config.render_header(cfg)
+            for macro, value in (("DESKTOP_WIDTH", 1920), ("DESKTOP_HEIGHT", 1080),
+                                 ("MEMORY_MB", 8192), ("ADAPTER_VENDOR_ID", 4098),
+                                 ("ADAPTER_DEVICE_ID", 123), ("ADAPTER_VIDEO_MEMORY_MB", 1024)):
+                self.assertIn("#define RECOMP_%s %du" % (macro, value), header)
+            self.assertIn('"Test \\"GPU\\""', header)
+            defaults = game_config.load(ROOT / "games/stub")
+            self.assertEqual(defaults["system"]["desktop"], "1024x768")
+            self.assertEqual(defaults["system"]["memory_mb"], 512)
+            self.assertEqual(defaults["d3d9"]["adapter"]["video_memory_mb"], 32)
+
+    def test_hardware_configuration_rejects_invalid_values(self):
+        cases = [("system", "desktop", v) for v in ('"0x768"', '"1024x20000"', '"1024X768"', 'true')]
+        cases += [("system", "memory_mb", v) for v in ('0', '-1', 'true', '1.5', '1048577')]
+        for key in ("vendor_id", "device_id", "video_memory_mb"):
+            cases += [("d3d9.adapter", key, v) for v in ('-1', 'true', '65536', '"123"')]
+        cases += [("d3d9.adapter", "description", v) for v in ('""', '42', '"bad\\nname"')]
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            (game / "globals.toml").write_text("", encoding="utf-8")
+            for table, key, value in cases:
+                with self.subTest(table=table, key=key, value=value):
+                    (game / "game.toml").write_text(stub + '\n[%s]\n%s = %s\n' % (table, key, value), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, key):
+                        game_config.load(game)
+
     def test_cd_tracks_preserve_disc_order_and_reject_non_strings(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)
@@ -162,8 +261,8 @@ class LoadTests(unittest.TestCase):
 
     def test_auxiliary_modules_and_guest_size(self):
         """[modules.aux.<key>] names a DLL the guest loads at run time that the kit
-        translates as a second image at its preferred base; [game] guest_size
-        grows the arena to hold it. Defaults: no modules, 0x10000000."""
+        translates below the heap or above all runtime regions. Defaults: no
+        modules and a 0x10000000 arena."""
         base = game_config.load(ROOT / "games/stub")
         self.assertEqual(base["aux_modules"], [])
         self.assertEqual(base["game"]["guest_size"], 0x10000000)
@@ -175,7 +274,7 @@ class LoadTests(unittest.TestCase):
             text = (ROOT / "games/stub/game.toml").read_text()
             text = text.replace('guest_root = ', 'guest_size = 0x10100000\nguest_root = ', 1)
             text += ('\n[modules.aux.blit]\nname = "Blit_p6.dll"\npath = "original/Blit_p6.dll"\n'
-                     'sha256 = "%s"\nbase = 0x10000000\nsize = 0x28000\nlistings = "analysis/Blit_p6.dll"\nfunction_alignment = 1\n' % ("ab" * 32))
+                     'sha256 = "%s"\nbase = 0x00020000\nsize = 0x28000\nlistings = "analysis/Blit_p6.dll"\nfunction_alignment = 1\n' % ("ab" * 32))
             (game / "game.toml").write_text(text)
             (game / "globals.toml").write_text((ROOT / "games/stub/globals.toml").read_text())
             cfg = game_config.load(game)
@@ -187,26 +286,78 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(mod["listings_path"], (game / "analysis/Blit_p6.dll").resolve())
             self.assertEqual(mod["function_alignment"], 1)
             self.assertEqual(mod["entry_points"], [])
-            self.assertEqual((mod["base"], mod["size"]), (0x10000000, 0x28000))
+            self.assertEqual((mod["base"], mod["size"]), (0x20000, 0x28000))
             header = gen_game_config.render_header(cfg)
             self.assertIn("#define RECOMP_GUEST_SIZE 0x10100000u", header)
             self.assertIn("#define RECOMP_AUX_MODULE_COUNT 1", header)
-            self.assertIn('{"Blit_p6.dll", "%s", "%s", 0x10000000u, 0x00028000u}' % ((game / "original/Blit_p6.dll").resolve().as_posix(), "ab" * 32),
+            self.assertIn('{"Blit_p6.dll", "%s", "%s", 0x00020000u, 0x00028000u}' % ((game / "original/Blit_p6.dll").resolve().as_posix(), "ab" * 32),
                           header)
             cmake = gen_game_config.render_cmake(cfg)
             self.assertIn("set(RECOMP_GUEST_SIZE 0x10100000u)", cmake)
             self.assertIn("set(RECOMP_AUX_MODULES blit)", cmake)
-            (game / "game.toml").write_text(text + 'entry_points = [0x10001234]\n')
+            (game / "game.toml").write_text(text + 'entry_points = [0x00021234]\n')
             self.assertEqual(game_config.load(game)["aux_modules"][0]["entry_points"],
-                             [0x10001234])
-            for entries in ('[0x0fffffff]', '[0x10028000]', '["0x10001234"]', '7'):
+                             [0x00021234])
+            for entries in ('[0x1ffff]', '[0x48000]', '["0x21234"]', '7'):
                 (game / "game.toml").write_text(text + 'entry_points = ' + entries + '\n')
                 with self.assertRaises(ValueError):
                     game_config.load(game)
-            bad = text.replace('guest_size = 0x10100000', 'guest_size = 0x10000000')
-            (game / "game.toml").write_text(bad)
-            with self.assertRaises(ValueError):
-                game_config.load(game)   # a module needs an arena that reaches it: checked at load
+            for bad_base in ('0', '0x1000', '0x21000', '0x10100000', 'true'):
+                (game / "game.toml").write_text(text.replace('base = 0x00020000', 'base = ' + bad_base), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "base/size"):
+                    game_config.load(game)
+            duplicate = text[text.index('[modules.aux.blit]'):].replace('[modules.aux.blit]', '[modules.aux.other]')
+            (game / "game.toml").write_text(text + '\n' + duplicate, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                game_config.load(game)
+
+    def test_auxiliary_modules_above_runtime_regions(self):
+        """High DLLs must leave heap, stacks, TEB and shims below their load base."""
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            text = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            text = text.replace('guest_root = ', 'guest_size = 0x10100000\nguest_root = ', 1)
+            text += ('\n[modules.aux.high]\nname = "high.dll"\npath = "original/high.dll"\n'
+                     'sha256 = "%s"\nbase = 0x10000000\nsize = 0x28000\n' % ("ab" * 32))
+            (game / "globals.toml").write_bytes((ROOT / "games/stub/globals.toml").read_bytes())
+            config = game / "game.toml"
+            config.write_text(text, encoding="utf-8")
+            cfg = game_config.load(game)
+            self.assertEqual(cfg["game"]["layout_end"], 0x10000000)
+            self.assertIn("#define RECOMP_LAYOUT_END 0x10000000u", gen_game_config.render_header(cfg))
+            self.assertIn("set(RECOMP_LAYOUT_END 0x10000000u)", gen_game_config.render_cmake(cfg))
+            for bad in (text.replace('base = 0x10000000', 'base = 0x0fff0000'),
+                        text.replace('base = 0x10000000', 'base = 0x00ff0000'),
+                        text.replace('size = 0x28000', 'size = 0x110000')):
+                config.write_text(bad, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    game_config.load(game)
+            config.write_text(text.replace('guest_size = 0x10100000',
+                                           'guest_size = 0x80000000').split('[modules.aux.high]')[0],
+                              encoding="utf-8")
+            self.assertEqual(game_config.load(game)["game"]["layout_end"], 0x80000000)
+            config.write_text(text.replace('guest_size = 0x10100000',
+                                           'guest_size = 0x80000000\nheap_base = 0x40000000').replace(
+                                               'base = 0x10000000', 'base = 0x3fff0000'),
+                              encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "base/size"):
+                game_config.load(game)
+
+    def test_mm_timer_mode(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        self.assertEqual(cfg["system"]["mm_timers"], "message_loop")
+        self.assertIn("#define RECOMP_MM_TIMER_THREAD 0", gen_game_config.render_header(cfg))
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            base = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text((ROOT / "games/stub/globals.toml").read_text())
+            (game / "game.toml").write_text(base + '\n[system]\nmm_timers = "thread"\n')
+            cfg = game_config.load(game)
+            self.assertIn("#define RECOMP_MM_TIMER_THREAD 1", gen_game_config.render_header(cfg))
+            for invalid in ('"native"', 'true', '1'):
+                (game / "game.toml").write_text(base + '\n[system]\nmm_timers = ' + invalid + '\n')
+                with self.assertRaises(ValueError):
+                    game_config.load(game)
 
     def test_controls_section(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,7 +369,19 @@ class LoadTests(unittest.TestCase):
             cfg = game_config.load(game)
             self.assertEqual(cfg["controls"]["default_layout"], "keys")
             self.assertEqual(cfg["controls"]["pad"], "mapped")
+            self.assertFalse(cfg["controls"]["native"]["attached_only"])
             self.assertEqual(cfg["controls"]["mapped"], game_config.MAPPED_DEFAULTS)
+
+            (game / "game.toml").write_text(
+                base + '\n[controls]\npad = "native"\n[controls.native]\nattached_only = true\n')
+            cfg = game_config.load(game)
+            self.assertTrue(cfg["controls"]["native"]["attached_only"])
+            self.assertIn("#define RECOMP_CONTROLS_NATIVE_ATTACHED_ONLY 1", gen_game_config.render_header(cfg))
+            for invalid in ('"true"', '1', '[]'):
+                (game / "game.toml").write_text(
+                    base + '\n[controls.native]\nattached_only = ' + invalid + '\n')
+                with self.assertRaises(ValueError):
+                    game_config.load(game)
 
             # The old [touch] keypad knob maps onto default_layout when the
             # game names no default_layout of its own.
@@ -254,6 +417,7 @@ class LoadTests(unittest.TestCase):
             (game / "game.toml").write_text(base)
             header = gen_game_config.render_header(game_config.load(game))
             self.assertIn("#define RECOMP_CONTROLS_PAD 1", header)
+            self.assertIn("#define RECOMP_CONTROLS_NATIVE_ATTACHED_ONLY 0", header)
             self.assertIn("cross=mouse_left", header)
 
             # The old rows spelling still loads.

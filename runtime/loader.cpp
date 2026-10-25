@@ -24,6 +24,7 @@ __attribute__((weak)) const uint32_t recomp_data_seed_count = 0;
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <set>
 #include "../platform/os.h"
 
 const char *const LOADER_DEFAULT_EXE = RECOMP_DEVELOPER_EXE;
@@ -191,7 +192,7 @@ bool rva_ok(uint32_t rva, uint32_t len) {
 // runtime trampolines or registered guest data storage. Bound every descriptor
 // and RVA by the image before reading or patching it.
 bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_magic,
-               uint32_t g_base, uint32_t g_size) {
+               uint32_t g_base, uint32_t g_size, LoaderModule *owner = nullptr) {
     auto rva_ok = [g_size](uint32_t rva, uint32_t len) { return rva_in(g_size, rva, len); };
     size_t dd_off = opt_off + (opt_magic == 0x20b ? 112 : 96);
     if (dd_off + 16 > file.size()) {
@@ -260,6 +261,10 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
             // must hold the original guest address, not a host trampoline or
             // a separately allocated copy of an exported global.
             if (const LoaderModule *module = loader_module_named(dll.c_str())) {
+                if (owner && module != owner && module->base != loader_image_base() &&
+                    std::find(owner->dependencies.begin(), owner->dependencies.end(),
+                              module->name) == owner->dependencies.end())
+                    owner->dependencies.push_back(module->name);
                 uint32_t address = (t & 0x80000000u)
                                        ? loader_module_export_ordinal(*module, t & 0xffff)
                                        : loader_module_export(*module, namebuf);
@@ -294,8 +299,9 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
 
 // --------------------------------------------------------------------------
 // Auxiliary modules: DLLs game.toml names, mapped beside the main image at
-// their preferred base (no relocation support, as for the image itself) and
-// verified by content hash like it. Preserve configured installation subfolders
+// their configured load base and verified by content hash like the main image.
+// PE32 HIGHLOW relocations are applied when their preferred base differs.
+// Preserve configured installation subfolders
 // when the executable and its game directory have moved onto another device.
 // --------------------------------------------------------------------------
 struct AuxSpec {
@@ -304,6 +310,64 @@ struct AuxSpec {
 };
 const AuxSpec g_aux_specs[] = RECOMP_AUX_MODULES;
 std::vector<LoaderModule> g_aux;
+struct AuxPending {
+    std::vector<uint8_t> file;
+    size_t opt_off;
+};
+std::vector<AuxPending> g_aux_pending;
+
+// Validate the complete relocation directory before writing any site. A PE32
+// HIGHLOW is a 32-bit guest address; modulo arithmetic is intentional here.
+bool relocate_image(uint32_t base, uint32_t size, uint32_t preferred, uint32_t rva, uint32_t length,
+                    uint32_t opt_off) {
+    if (base == preferred)
+        return true;
+    if (!rva || length < 8 || !rva_in(size, rva, length)) {
+        g_error = "missing or out-of-image base relocation directory";
+        return false;
+    }
+    std::set<uint32_t> sites;
+    const uint32_t end = rva + length;
+    for (uint32_t at = rva; at < end;) {
+        if (end - at < 8) {
+            g_error = "truncated base relocation block";
+            return false;
+        }
+        uint32_t page = rd32(base + at), bytes = rd32(base + at + 4);
+        if (bytes < 8 || bytes % 2 || bytes > end - at) {
+            g_error = "invalid base relocation block size";
+            return false;
+        }
+        for (uint32_t i = at + 8; i < at + bytes; i += 2) {
+            uint32_t entry = rd16(base + i), kind = entry >> 12;
+            const uint64_t site = uint64_t(page) + (entry & 0xfff);
+            if (!kind)
+                continue;
+            if (kind != 3 || site + 4 > size || !sites.insert(uint32_t(site)).second) {
+                g_error = "unsupported, duplicate or out-of-image base relocation";
+                return false;
+            }
+        }
+        at += bytes;
+    }
+    for (uint32_t site : sites)
+        wr32(base + site, rd32(base + site) + base - preferred);
+    wr32(base + opt_off + 28, base);
+    return true;
+}
+
+bool bind_aux_modules() {
+    for (size_t i = 0; i < g_aux.size(); ++i) {
+        LoaderModule &m = g_aux[i];
+        if (!patch_iat(g_aux_pending[i].file, g_aux_pending[i].opt_off, 0x10b, m.base, m.size,
+                       &m)) {
+            g_error = m.name + ": " + g_error;
+            return false;
+        }
+        m.initial_image.assign(g_mem + m.base, g_mem + m.base + m.size);
+    }
+    return true;
+}
 
 bool load_aux_module(const AuxSpec &spec) {
     LoaderModule m;
@@ -315,7 +379,7 @@ bool load_aux_module(const AuxSpec &spec) {
         const std::string configured = spec.path;
         bool found = false;
         if (configured.compare(0, root.size(), root) == 0) {
-            m.path = dirname_of(g_exe_path) + "/" + configured.substr(root.size());
+            m.path = win32_game_dir() + "/" + configured.substr(root.size());
             found = read_file(m.path.c_str(), file);
         }
         if (!found) {
@@ -348,7 +412,7 @@ bool load_aux_module(const AuxSpec &spec) {
     uint16_t opt_size = rd<uint16_t>(file, fh_off + 16);
     size_t opt_off = fh_off + 20;
     uint16_t opt_magic = rd<uint16_t>(file, opt_off);
-    if (opt_magic != 0x10b || opt_size < 96) {
+    if (opt_magic != 0x10b || opt_size < 96 + 6 * 8 || opt_off + opt_size > file.size()) {
         g_error = m.path + " is not a PE32 image";
         return false;
     }
@@ -358,24 +422,21 @@ bool load_aux_module(const AuxSpec &spec) {
         return false;
     }
     uint32_t entry_rva = rd<uint32_t>(file, opt_off + 16);
-    uint32_t image_base = rd<uint32_t>(file, opt_off + 28);
+    uint32_t preferred_base = rd<uint32_t>(file, opt_off + 28);
+    uint32_t image_base = spec.base;
     uint32_t size_image = rd<uint32_t>(file, opt_off + 56);
     uint32_t size_hdrs = rd<uint32_t>(file, opt_off + 60);
-    if (image_base != spec.base) {
+    if (!size_image || size_image > spec.size || image_base < 0x10000 || image_base % 0x10000 ||
+        !gm_valid(image_base, spec.size) ||
+        (uint64_t(image_base) + spec.size > GUEST_HEAP_BASE && image_base < GUEST_LAYOUT_END) ||
+        size_hdrs > size_image || entry_rva >= size_image ||
+        (g_base && image_base < uint64_t(g_base) + g_size &&
+         g_base < uint64_t(image_base) + spec.size)) {
         char buf[200];
         snprintf(buf, sizeof buf,
-                 "%s: image base %08x is not the configured %08x (no relocation support)",
-                 spec.name, image_base, spec.base);
-        g_error = buf;
-        return false;
-    }
-    if (size_image > spec.size || image_base < GUEST_SHIM_END ||
-        (uint64_t)image_base + spec.size > GUEST_SIZE) {
-        char buf[200];
-        snprintf(
-            buf, sizeof buf,
-            "%s: [%08x, %08x) does not fit the configured [%08x, %08x) above the arena's shims",
-            spec.name, image_base, image_base + size_image, spec.base, spec.base + spec.size);
+                 "%s: [%08x, %08x) does not fit a free configured range outside runtime regions "
+                 "[%08x, %08x)",
+                 spec.name, image_base, image_base + size_image, spec.base, spec.base + spec.size);
         g_error = buf;
         return false;
     }
@@ -397,6 +458,7 @@ bool load_aux_module(const AuxSpec &spec) {
     if (rd<uint32_t>(file, opt_off + 92) > 9 && rd<uint32_t>(file, opt_off + 96 + 9 * 8))
         LOGW("%s has a TLS directory, which auxiliary modules do not get", spec.name);
 
+    memset(g_mem + image_base, 0, spec.size);
     size_t hdr_copy = size_hdrs < file.size() ? size_hdrs : file.size();
     memcpy(g_mem + image_base, file.data(), hdr_copy);
     for (uint16_t i = 0; i < nsections; ++i) {
@@ -424,18 +486,40 @@ bool load_aux_module(const AuxSpec &spec) {
             memcpy(g_mem + va, file.data() + raw_ptr, copy);
         }
     }
-    if (!patch_iat(file, opt_off, opt_magic, image_base, size_image)) {
+    if (!relocate_image(image_base, size_image, preferred_base,
+                        rd<uint32_t>(file, opt_off + 96 + 5 * 8),
+                        rd<uint32_t>(file, opt_off + 96 + 5 * 8 + 4), uint32_t(opt_off))) {
         g_error = std::string(spec.name) + ": " + g_error;
         return false;
     }
-    m.initial_image.assign(g_mem + image_base, g_mem + image_base + m.size);
     g_aux.push_back(m);
+    g_aux_pending.push_back({std::move(file), opt_off});
     LOGV("mapped auxiliary module %s: base %08x size %08x entry %08x", spec.name, m.base,
          size_image, m.entry);
     return true;
 }
 
 } // namespace
+
+#ifdef POPM_TESTING
+void loader_test_reset_modules() {
+    g_aux.clear();
+    g_aux_pending.clear();
+    g_main = LoaderModule{};
+    g_base = g_size = g_entry = 0;
+    g_error.clear();
+}
+bool loader_test_map_module(const char *name, const char *path, const char *sha256, uint32_t base,
+                            uint32_t size) {
+    return load_aux_module({name, path, sha256, base, size});
+}
+bool loader_test_bind_modules() {
+    return bind_aux_modules();
+}
+LoaderModule &loader_test_main_module() {
+    return g_main;
+}
+#endif
 
 uint32_t loader_module_count() {
     return (uint32_t)g_aux.size();
@@ -550,6 +634,7 @@ bool loader_load(const char *exe_path) {
     g_error.clear();
     g_sections.clear();
     g_aux.clear();
+    g_aux_pending.clear();
     g_main = LoaderModule{};
     g_iat_patched = 0;
     g_iat_data = 0;
@@ -749,11 +834,11 @@ bool loader_load(const char *exe_path) {
         }
     }
 
-    if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
-        return false;
     for (uint32_t i = 0; i < RECOMP_AUX_MODULE_COUNT; ++i)
         if (!load_aux_module(g_aux_specs[i]))
             return false;
+    if (!patch_iat(file, opt_off, opt_magic, g_base, g_size, &g_main) || !bind_aux_modules())
+        return false;
 
     if (g_entry != LOADER_EXPECTED_ENTRY)
         LOGW("entry point is %08x, expected %08x", g_entry, LOADER_EXPECTED_ENTRY);
@@ -829,6 +914,12 @@ void run_entry(X86 *c) {
     sched_set_guest_thread(true);
     // ExitProcess/TerminateProcess/ExitThread-outside-a-thread longjmp here.
     if (setjmp(*process_exit_jmp()) == 0) {
+        if (!win32_attach_static_modules(c)) {
+            LOGW("static DLL initialization failed");
+            c->r[R_EAX] = 1114;
+            sched_set_guest_thread(false);
+            return;
+        }
         uint32_t count = 0;
         for (uint32_t p = g_tls.callbacks; p && rva_ok(p - g_base, 4); p += 4) {
             uint32_t cb = rd32(p);

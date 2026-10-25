@@ -174,7 +174,7 @@ set(POP_PRESENT_SOURCES ${HOST}/present_pixels.cpp ${HOST}/present_thread.cpp ${
                         ${HOST}/indexed_frame.cpp)
 # The Direct3D 9 device's GPU renderer: the host entry points, and a backend
 # per GPU API (host/gpu/d3d9_backend.h). Without one the shim draws on the CPU.
-list(APPEND POP_PRESENT_SOURCES ${HOST}/gpu/d3d9_host.cpp)
+list(APPEND POP_PRESENT_SOURCES ${HOST}/gpu/d3d9_host.cpp ${HOST}/gpu/d3d9_warm.cpp)
 if(RECOMP_D9_VULKAN)
   list(APPEND POP_PRESENT_SOURCES ${HOST}/gpu/vulkan/d3d9_vulkan.cpp)
   set_source_files_properties(${HOST}/gpu/d3d9_host.cpp PROPERTIES COMPILE_DEFINITIONS RECOMP_D9_VULKAN=1)
@@ -277,6 +277,9 @@ if(TARGET recomp_gen)
     set(APP ${RECOMP_APP_NAME})
     set(TITLE ${RECOMP_GAME_NAME})
     configure_file(${POP_ROOT}/web/player/index.html ${POP_OUT}/index.html @ONLY)
+    configure_file(${POP_ROOT}/web/player/player.js ${POP_OUT}/player.js @ONLY)
+    configure_file(${POP_ROOT}/web/player/style.css ${POP_OUT}/style.css COPYONLY)
+    configure_file(${POP_ROOT}/web/player/env.mjs ${POP_OUT}/env.mjs COPYONLY)
     target_link_options(recomp_app PRIVATE
       -pthread -sPTHREAD_POOL_SIZE=24 -sWASMFS
       -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
@@ -335,6 +338,8 @@ pop_link_sdl(host_tests)
 pop_test_binary(host_tests)
 add_test(NAME host_tests COMMAND host_tests WORKING_DIRECTORY ${POP_ROOT})
 set_tests_properties(host_tests PROPERTIES LABELS gpu)
+  add_test(NAME d3d9_gpu_tests COMMAND host_tests --d3d9-gpu WORKING_DIRECTORY ${POP_ROOT})
+  set_tests_properties(d3d9_gpu_tests PROPERTIES LABELS gpu TIMEOUT 120)
 endif()
 
 # The production headless capture path with synthetic guest windows and no GPU.

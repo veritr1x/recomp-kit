@@ -67,7 +67,8 @@ def main():
     parser.add_argument("--dest", type=Path, required=True)
     args = parser.parse_args()
     cfg = game_config.load(args.game_dir)
-    n = stage(args.source, args.dest, cfg["game"]["executable"], cfg["bundle"]["exclude"], kept(cfg))
+    executable = str(Path(cfg["game"]["exe_dir"]) / cfg["game"]["executable"])
+    n = stage(args.source, args.dest, executable, cfg["bundle"]["exclude"], kept(cfg))
     print("staged %s -> %s (%d files copied)" % (args.source, args.dest, n))
 
 

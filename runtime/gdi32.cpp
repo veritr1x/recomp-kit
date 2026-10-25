@@ -1,5 +1,6 @@
 // Guest GDI objects, DC state and shared DIB/window pixel access.
 #include "imports.h"
+#include "game_config.h"
 #include "gdi_image.h"
 #include "gdi32_internal.h"
 #include <cstdlib>
@@ -71,8 +72,8 @@ void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
         return;
     if (ddraw_display_mode(w, h, bpp))
         return;
-    *w = 1024;
-    *h = 768;
+    *w = RECOMP_DESKTOP_WIDTH;
+    *h = RECOMP_DESKTOP_HEIGHT;
     *bpp = 32;
     if (const char *size = recomp_env("SMOKE_DRAWABLE")) {
         int width = 0, height = 0;

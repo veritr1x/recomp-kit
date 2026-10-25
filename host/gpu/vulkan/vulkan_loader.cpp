@@ -34,7 +34,7 @@ static bool try_path(const char *path) {
 bool vulkan_load() {
     std::call_once(g_once, [] {
 #ifndef _WIN32
-        const char *env = recomp_env("VULKAN_LIBRARY");
+        const char *env = recomp_dev_env("VULKAN_LIBRARY");
         if (env && *env && try_path(env)) {
             g_loaded = true;
             return;

@@ -71,10 +71,17 @@ def windows_version(value):
     return major, minor, build, 2 if major >= 5 else 1
 
 
-def validate_heap_base(value):
+def validate_guest_size(value):
+    if type(value) is not int or value % 0x10000 or not GUEST_SIZE_DEFAULT <= value <= 0xffff0000:
+        raise ValueError("[game] guest_size must be a 64 KB aligned integer in 0x10000000..0xffff0000")
+    return value
+
+
+def validate_heap_base(value, guest_size=GUEST_SIZE_DEFAULT):
     """The heap arena start: page aligned, above the image base, below the arena end."""
-    if value % 0x1000 or not (0x00400000 < value < HEAP_END):
-        raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, HEAP_END))
+    heap_end = guest_size - 0x02000000
+    if value % 0x1000 or not (0x00400000 < value < heap_end):
+        raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, heap_end))
     return value
 
 
@@ -118,14 +125,15 @@ def load_controls(controls, touch, source):
     controls["mapped"] = mapped
 
     native = dict(controls.get("native", {}))
-    unknown_native = sorted(k for k in native if k not in ("xinput", "dinput", "axes", "buttons"))
+    unknown_native = sorted(k for k in native if k not in ("xinput", "dinput", "attached_only", "axes", "buttons"))
     if unknown_native:
-        raise ValueError("%s: [controls.native] may name only xinput, dinput, axes, buttons, not %s"
+        raise ValueError("%s: [controls.native] may name only xinput, dinput, attached_only, axes, buttons, not %s"
                          % (source, ", ".join(unknown_native)))
     native.setdefault("xinput", True)
     native.setdefault("dinput", True)
-    if not isinstance(native["xinput"], bool) or not isinstance(native["dinput"], bool):
-        raise ValueError("%s: [controls.native] xinput and dinput must be booleans" % source)
+    native.setdefault("attached_only", False)
+    if any(not isinstance(native[key], bool) for key in ("xinput", "dinput", "attached_only")):
+        raise ValueError("%s: [controls.native] xinput, dinput and attached_only must be booleans" % source)
     axes = native.setdefault("axes", ["x", "y", "z", "rz", "rx", "ry"])
     if not isinstance(axes, list) or sorted(axes) != sorted(NATIVE_AXES):
         raise ValueError("%s: [controls.native] axes must list all six of %s exactly once, not %r"
@@ -150,9 +158,66 @@ def load(game_dir):
     missing = [key for key in REQUIRED_GAME_KEYS if key not in game]
     if missing:
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
-    game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
+    game["guest_size"] = validate_guest_size(game.get("guest_size", GUEST_SIZE_DEFAULT))
+    game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)), game["guest_size"])
     windows_version(game.setdefault("windows_version", "4.10"))
+    exe_dir = game.setdefault("exe_dir", "")
+    if (not isinstance(exe_dir, str) or (exe_dir and
+            (exe_dir.startswith(("/", "\\")) or ":" in exe_dir or
+             any(c in ("", ".", "..") for c in exe_dir.replace("\\", "/").split("/"))
+             or any(ord(c) < 32 for c in exe_dir)))):
+        raise ValueError('%s: [game] exe_dir must be a relative directory inside the game root' % source)
+    game["exe_dir"] = exe_dir.replace("\\", "/")
+    system = cfg.setdefault("system", {})
+    bink = cfg.setdefault("bink", {})
+    if (not isinstance(bink, dict) or set(bink) - {"record"}
+            or bink.setdefault("record", "legacy") not in ("legacy", "sdk")):
+        raise ValueError('%s: [bink] record must be "legacy" or "sdk"' % source)
+    if system.setdefault("mm_timers", "message_loop") not in ("message_loop", "thread"):
+        raise ValueError('%s: [system] mm_timers must be "message_loop" or "thread"' % source)
+    desktop = system.setdefault("desktop", "1024x768")
+    if (not isinstance(desktop, str) or not re.fullmatch(r"[0-9]+x[0-9]+", desktop)
+            or any(not 1 <= int(v) <= 16384 for v in desktop.split("x"))):
+        raise ValueError('%s: [system] desktop must be WIDTHxHEIGHT, each between 1 and 16384' % source)
+    memory = system.setdefault("memory_mb", 512)
+    if type(memory) is not int or not 1 <= memory <= 1048576:
+        raise ValueError('%s: [system] memory_mb must be an integer between 1 and 1048576' % source)
+    adapter = cfg.setdefault("d3d9", {}).setdefault("adapter", {})
+    if not isinstance(adapter, dict):
+        raise ValueError('%s: [d3d9] adapter must be a table' % source)
+    for key, default, limit in (("vendor_id", 0x10de, 0xffff), ("device_id", 0x0091, 0xffff),
+                                ("video_memory_mb", 32, 4095)):
+        value = adapter.setdefault(key, default)
+        if type(value) is not int or not (1 if key == "video_memory_mb" else 0) <= value <= limit:
+            raise ValueError('%s: [d3d9.adapter] %s must be an integer in range' % (source, key))
+    description = adapter.setdefault("description", "NVIDIA GeForce 7800 GTX")
+    if (not isinstance(description, str) or not description or len(description.encode("utf-8")) > 511
+            or any(ord(c) < 32 for c in description)):
+        raise ValueError('%s: [d3d9.adapter] description must be 1..511 UTF-8 bytes without control characters' % source)
     translate = cfg.setdefault("translate", {})
+    ranges = translate.setdefault("untranslated_ranges", [])
+    if not isinstance(ranges, list):
+        raise ValueError("%s: [translate] untranslated_ranges must be a list of tables" % source)
+    previous_end = 0
+    for entry in ranges:
+        if (not isinstance(entry, dict) or set(entry) - {"start", "end", "on_branch"}
+                or type(entry.get("start")) is not int or type(entry.get("end")) is not int
+                or not 0 <= entry["start"] < entry["end"] <= 0x100000000
+                or entry.get("on_branch", "fail") not in ("fail", "trap")):
+            raise ValueError("%s: [translate] untranslated_ranges requires disjoint 32-bit start/end ranges and on_branch fail/trap" % source)
+        entry.setdefault("on_branch", "fail")
+    for entry in sorted(ranges, key=lambda r: r["start"]):
+        if entry["start"] < previous_end:
+            raise ValueError("%s: [translate] untranslated_ranges must not overlap" % source)
+        previous_end = entry["end"]
+    intrinsics = translate.get("intrinsics")
+    if intrinsics is not None:
+        if not isinstance(intrinsics, dict) or (intrinsics and set(intrinsics) != {"setjmp", "longjmp"}):
+            raise ValueError("%s: [translate] intrinsics must name the setjmp/longjmp pair, or be empty" % source)
+        if any(type(value) is not int or not 0 < value <= 0xffffffff for value in intrinsics.values()):
+            raise ValueError("%s: [translate] intrinsic addresses must be nonzero 32-bit integers" % source)
+        if len(set(intrinsics.values())) != len(intrinsics):
+            raise ValueError("%s: [translate] intrinsic addresses must be distinct" % source)
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
         raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
@@ -203,6 +268,12 @@ def load(game_dir):
     # Developer inputs live beside game.toml: a game repository holds its own
     # ignored original/ and analysis/ directories.
     cfg["developer_exe_path"] = (game_dir / game["developer_exe"]).resolve()
+    developer_root = cfg["developer_exe_path"].parent
+    for component in reversed(game["exe_dir"].split("/")) if game["exe_dir"] else ():
+        if developer_root.name.casefold() != component.casefold():
+            raise ValueError('%s: [game] developer_exe must sit inside exe_dir' % source)
+        developer_root = developer_root.parent
+    cfg["developer_game_dir_path"] = developer_root
     cfg["listings_path"] = (game_dir / translate.get("listings", "analysis")).resolve()
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
@@ -225,25 +296,28 @@ def load_aux_modules(cfg, game_dir, source):
     the kit translates as a second image and maps at its preferred base, so
     its code runs as translated code and its exports answer GetProcAddress.
     Keys: name (the file name the guest asks for), path (developer copy,
-    relative to game.toml), sha256, base and size (the PE's preferred base
-    and SizeOfImage), listings (Ghidra export directory, relative), and
-    function_alignment (default 4). [game] guest_size must reach past every
-    module; the default arena is 0x10000000."""
+    relative to game.toml), sha256, base and size (the load address and reserved
+    image size), listings (Ghidra export directory, relative), and
+    function_alignment (default 4). Modules must not overlap, must be 64 KB
+    aligned, and must fit below the heap or above all runtime allocations.
+    High modules cap the runtime layout, independently of the arena size."""
     game = cfg["game"]
-    guest_size = int(game.setdefault("guest_size", GUEST_SIZE_DEFAULT))
-    if guest_size % 0x1000 or guest_size < GUEST_SIZE_DEFAULT:
-        raise ValueError("%s: [game] guest_size %#x must be page aligned and at least %#x"
-                         % (source, guest_size, GUEST_SIZE_DEFAULT))
+    guest_size = validate_guest_size(game.setdefault("guest_size", GUEST_SIZE_DEFAULT))
     game["guest_size"] = guest_size
     modules = []
     for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
         missing = [k for k in AUX_REQUIRED_KEYS if k not in entry]
         if missing:
             raise ValueError("%s: [modules.aux.%s] missing keys: %s" % (source, key, ", ".join(missing)))
-        base, size = int(entry["base"]), int(entry["size"])
-        if base % 0x1000 or size <= 0 or base + size > guest_size:
-            raise ValueError("%s: [modules.aux.%s] base %#x size %#x must fit below guest_size %#x"
-                             % (source, key, base, size, guest_size))
+        base, size = entry["base"], entry["size"]
+        if (type(base) is not int or type(size) is not int or base < 0x10000 or base % 0x10000
+                or size <= 0 or base + size > guest_size
+                or base < game["heap_base"] < base + size
+                or (base + size > game["heap_base"] and base < GUEST_SIZE_DEFAULT)):
+            raise ValueError("%s: [modules.aux.%s] base/size must be 64 KB aligned at or above 0x10000, fit the arena, and avoid runtime regions"
+                             % (source, key))
+        if any(base < m["base"] + m["size"] and m["base"] < base + size for m in modules):
+            raise ValueError("%s: [modules.aux.%s] overlaps another module" % (source, key))
         alignment = entry.get("function_alignment", 4)
         if type(alignment) is not int or alignment <= 0:
             raise ValueError("%s: [modules.aux.%s] function_alignment must be a positive integer" % (source, key))
@@ -259,4 +333,10 @@ def load_aux_modules(cfg, game_dir, source):
             "function_alignment": alignment,
             "entry_points": entries,
         })
+    # Keep every allocating region (including mod memory, stacks and shims)
+    # below high DLLs. Enlarging the arena to map a DLL must not move a shim
+    # table or a stack into that very DLL's preferred address range.
+    game["layout_end"] = min([guest_size] + [m["base"] for m in modules
+                                            if m["base"] >= game["heap_base"]])
+    validate_heap_base(game["heap_base"], game["layout_end"])
     return modules

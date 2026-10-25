@@ -30,6 +30,9 @@ int operand_count(uint32_t op, uint32_t major, uint32_t minor, bool pixel) {
     case OP_TEXM3X2TEX:
     case OP_TEXDP3:
         return 2;
+    case OP_DSX:
+    case OP_DSY:
+        return major >= 2 && pixel ? 2 : -1;
     case OP_ADD:
     case OP_SUB:
     case OP_MUL:

@@ -27,6 +27,7 @@
 #include "dxtypes.h"
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,8 @@ enum ComIface : uint16_t {
     IF_D3DINDEXBUFFER9,
     IF_D3DVERTEXDECL9,
     IF_D3DQUERY9,
+    IF_D3DVERTEXSHADER9,
+    IF_D3DPIXELSHADER9,
     // DirectInput 8: the same objects as DirectInput, reached through the
     // version 8 vtables.
     IF_DINPUT8,
@@ -219,6 +222,8 @@ enum ComKind : uint16_t {
     K_D3D9IB,         // an index buffer
     K_D3D9DECL,       // a vertex declaration
     K_D3D9QUERY,      // an occlusion or event query
+    K_D3D9VS,
+    K_D3D9PS,
 };
 
 // A DirectInput joystick axis's DIPROP_RANGE, DIPROP_DEADZONE and
@@ -258,6 +263,11 @@ struct ComObj {
     uint32_t d3d_version = 9;
     uint32_t d3d_usage = 0, d3d_pool = 0, d3d_fvf = 0;
     uint32_t d3d_format = 22, d3d_depth_format = 75;
+    uint32_t d3d_creation[4] = {}; // adapter, device type, focus HWND, behavior flags
+    std::shared_ptr<const std::vector<uint8_t>> d9_shader;
+    uint64_t d9_shader_key = 0;
+    uint32_t d9_shader_bindings = 0;
+    bool d9_shader_holds_device = false;
 
     // --- K_DDRAW
     uint32_t hwnd = 0;

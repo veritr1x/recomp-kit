@@ -144,10 +144,12 @@ def test_android_install_does_not_guess_between_devices(tmp_path, monkeypatch):
     assert calls == [["/sdk/adb", "devices"]]
 
 
-def test_android_push_stages_only_included_game_files(tmp_path, monkeypatch):
+@pytest.mark.parametrize("exe_dir", ["", "Binaries/Win32"])
+def test_android_push_stages_only_included_game_files(tmp_path, monkeypatch, exe_dir):
     source = tmp_path / "original/gog/app"
+    executable = (exe_dir + "/" if exe_dir else "") + "Stub.exe"
     files = {
-        "Stub.exe": b"test executable", "Data/sprites.bin": b"sprites",
+        executable: b"test executable", "Data/sprites.bin": b"sprites",
         "AUDIO/Music/track.mp3": b"music", "model.txt": b"model",
         "BINKS/intro.bik": b"video", "__support/helper.exe": b"installer",
         "sound.dll": b"dll", "Data/unused.dll": b"dll",
@@ -156,8 +158,8 @@ def test_android_push_stages_only_included_game_files(tmp_path, monkeypatch):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-    cfg = {"game": {"executable": "Stub.exe", "bundle_id": "dev.recompkit.stub"},
-           "developer_exe_path": source / "Stub.exe",
+    cfg = {"game": {"executable": "Stub.exe", "exe_dir": exe_dir, "bundle_id": "dev.recompkit.stub"},
+           "developer_exe_path": source / executable, "developer_game_dir_path": source,
            "bundle": {"exclude": ["BINKS", "__support", "*.dll"]}}
     output = tmp_path / "build"
     staged = output / "android/game"
@@ -170,12 +172,12 @@ def test_android_push_stages_only_included_game_files(tmp_path, monkeypatch):
         if "push" in command:
             assert command == ["/sdk/adb", "-s", "tablet", "push", str(staged),
                                "/sdcard/Android/data/dev.recompkit.stub/files/"]
-            assert sorted(p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file()) == [
-                ".stamp", "AUDIO/Music/track.mp3", "Data/sprites.bin", "Stub.exe", "model.txt"]
-            for name in ("Stub.exe", "Data/sprites.bin", "AUDIO/Music/track.mp3", "model.txt"):
+            assert sorted(p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file()) == sorted([
+                ".stamp", "AUDIO/Music/track.mp3", "Data/sprites.bin", executable, "model.txt"])
+            for name in (executable, "Data/sprites.bin", "AUDIO/Music/track.mp3", "model.txt"):
                 assert (staged / name).read_bytes() == files[name]
             import hashlib
-            assert (staged / ".stamp").read_text().strip() == hashlib.sha256(files["Stub.exe"]).hexdigest()
+            assert (staged / ".stamp").read_text().strip() == hashlib.sha256(files[executable]).hexdigest()
         return subprocess.CompletedProcess(command, 0, "List of devices attached\ntablet\tdevice\n")
 
     monkeypatch.setattr(build.shutil, "which", lambda name: "/sdk/adb")

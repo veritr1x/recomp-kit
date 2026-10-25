@@ -15,6 +15,14 @@ spec.loader.exec_module(translate)
 
 
 class ConfigureTests(unittest.TestCase):
+    def test_expanded_guest_shim_range(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        cfg["game"]["guest_size"] = 0x80000000
+        translate.configure(cfg)
+        self.assertEqual(translate.GUEST_SHIM_BASE,0x7ff00000)
+        self.assertEqual(translate.GUEST_SHIM_END,0x80000000)
+        translate.configure(game_config.load(ROOT / "games/stub"))
+
     def test_resumable_stacks_is_opt_in_for_main_and_auxiliary_images(self):
         cfg = game_config.load(ROOT / "games/stub")
         translate.configure(cfg)

@@ -100,7 +100,8 @@ const uint32_t BATTERY_LEVEL_FULL = 3;
 // Mirrors joy_served() (dinput_joystick.cpp): user 0 exists only in native
 // pad mode with the XInput bit set in RECOMP_CONTROLS_PAD's native-API mask.
 bool served() {
-    return host_pad_mode() == 2 && (host_pad_native_apis() & 2) != 0;
+    return host_pad_mode() == 2 && (host_pad_native_apis() & 2) != 0 &&
+           (!host_pad_attached_only() || host_pad_attached());
 }
 
 // XInputEnable's stored state. Starts enabled, matching a freshly loaded

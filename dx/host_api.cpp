@@ -108,6 +108,12 @@ HOST_DEFAULT int host_pad_mode(void) {
 HOST_DEFAULT int host_pad_native_apis(void) {
     return 0;
 }
+HOST_DEFAULT int host_pad_attached_only(void) {
+    return 0;
+}
+HOST_DEFAULT int host_pad_attached(void) {
+    return 0;
+}
 HOST_DEFAULT uint32_t host_pad_state(HostPadState *out) {
     if (out)
         memset(out, 0, sizeof(*out));

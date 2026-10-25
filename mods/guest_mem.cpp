@@ -1,8 +1,8 @@
 // guest_mem.cpp - the mod heap and the bounds-checked accessors.
 //
 // THE HEAP IS ITS OWN REGION AND ITS OWN ALLOCATOR. MOD_HEAP_BASE is the gap
-// between the game heap's HEAP_LIMIT (0x0e000000) and the guest stack's lower
-// limit (0x0ef00000), with a megabyte of guard below the stack. Nothing else
+// between the game heap's HEAP_LIMIT and the guest stack's lower
+// limit, with a guard below the stack. Nothing else
 // in the arena is allocated there, so:
 //
 //   * the game's HeapFree cannot free a mod's block - heap_free does not know

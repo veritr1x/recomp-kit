@@ -62,20 +62,24 @@ function unsafe(relative) {
 // `entries` are {path, size, mtime, isDir}; paths use "/".
 export function planImport(game, entries) {
   const exeName = game.executable.toLowerCase();
+  const exeDirs = (game.exeDir || "").replaceAll("\\", "/").split("/").filter(Boolean);
   let exe = null;
   let exeDepth = Infinity;
   for (const e of entries) {
     if (e.isDir || junk(e.path) || unsafe(e.path)) continue;
     const parts = e.path.split("/");
     if (parts[parts.length - 1].toLowerCase() !== exeName) continue;
+    const folder = parts.slice(0, -1);
+    if (folder.length < exeDirs.length || !exeDirs.every((p, i) =>
+      p.toLowerCase() === folder[folder.length - exeDirs.length + i].toLowerCase())) continue;
     const depth = parts.length - 1;
-    if (depth < exeDepth && depth <= 3) {
+    if (depth < exeDepth && depth <= 3 + exeDirs.length) {
       exe = e;
       exeDepth = depth;
     }
   }
   if (!exe) return { error: "noExecutable" };
-  const base = exe.path.includes("/") ? exe.path.slice(0, exe.path.lastIndexOf("/")) : "";
+  const base = exe.path.split("/").slice(0, -1 - exeDirs.length).join("/");
   const prefix = base ? base + "/" : "";
   const files = [];
   const tops = new Set();
@@ -86,7 +90,7 @@ export function planImport(game, entries) {
     if (!relative || excluded(relative, game.exclude || [])) continue;
     if (e.isDir || relative.includes("/")) tops.add(relative.split("/")[0].toLowerCase());
     if (e.isDir) continue;
-    if (relative.toLowerCase() === exeName) exeRelative = relative;
+    if (e === exe) exeRelative = relative;
     files.push({ entry: e, relative, size: e.size, mtime: e.mtime || 0 });
   }
   const missing = (game.requiredDirs || []).filter((d) => !tops.has(d.toLowerCase()));
@@ -431,7 +435,8 @@ export async function gameStatus(game, store) {
   const stamp = ((await store.readText(STAMP)) || "").trim();
   const manifest = JSON.parse((await store.readText(MANIFEST)) || '{"files":{}}');
   const names = Object.keys(manifest.files);
-  if (!names.some((n) => n.toLowerCase() === game.executable.toLowerCase())) return { state: "notFound" };
+  const exe = [game.exeDir, game.executable].filter(Boolean).join("/").toLowerCase();
+  if (!names.some((n) => n.toLowerCase() === exe)) return { state: "notFound" };
   const tops = new Set(names.filter((n) => n.includes("/")).map((n) => n.split("/")[0].toLowerCase()));
   const missing = (game.requiredDirs || []).filter((d) => !tops.has(d.toLowerCase()));
   if (stamp !== game.sha256) return { state: stamp ? "wrongVersion" : "incomplete", missing };

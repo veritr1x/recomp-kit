@@ -791,17 +791,19 @@ static void test_loader() {
     }
 
     // TEB.
-    check(rd32(0x0fe00000) == 0xffffffffu, "FS:[0] SEH head is -1");
-    check(rd32(0x0fe00018) == 0x0fe00000u, "FS:[0x18] points at the TEB");
-    check(rd32(0x0fe0002c) == 0x0fe01000u, "FS:[0x2c] points at the TLS array");
-    check(loader_context()->fs_base == 0x0fe00000u, "fs_base is the TEB");
+    check(rd32(GUEST_TEB_BASE) == 0xffffffffu, "FS:[0] SEH head is -1");
+    check(rd32(GUEST_TEB_BASE + 0x18) == GUEST_TEB_BASE, "FS:[0x18] points at the TEB");
+    check(rd32(GUEST_TEB_BASE + 0x2c) == GUEST_TEB_BASE + 0x1000,
+          "FS:[0x2c] points at the TLS array");
+    check(loader_context()->fs_base == GUEST_TEB_BASE, "fs_base is the TEB");
     const X86 *ic = loader_context();
     check(ic->fpu_cw == 0x037f && ic->fpu_sw == 0 && ic->fpu_tag == 0xffff && ic->fpu_top == 0,
           "the x87 starts at cw=%04x sw=%04x tag=%04x top=%u", ic->fpu_cw, ic->fpu_sw, ic->fpu_tag,
           ic->fpu_top);
     check(x86_get_eflags(ic) == 0x00000202u, "PUSHFD at process start reads %08x",
           x86_get_eflags(ic));
-    check(loader_context()->r[R_ESP] > 0x0ef00000 && loader_context()->r[R_ESP] < 0x0f000000,
+    check(loader_context()->r[R_ESP] > GUEST_STACK_TOP - GUEST_STACK_SIZE &&
+              loader_context()->r[R_ESP] < GUEST_STACK_TOP,
           "initial ESP %08x is inside the stack", loader_context()->r[R_ESP]);
 
     // A wrong image must be refused.
@@ -2407,7 +2409,7 @@ static void test_windows(X86 *c) {
     call_import(c, "USER32.dll", "ShowCursor", {1});
 
     host_set_key_state(0x41, true);
-    check(call_import(c, "USER32.dll", "GetAsyncKeyState", {0x41}) == 0x8000,
+    check(call_import(c, "USER32.dll", "GetAsyncKeyState", {0x41}) == 0x8001,
           "GetAsyncKeyState sees the host key");
     host_set_key_state(0x41, false);
     // A message box nobody can click is answered with the default button of the
@@ -3407,6 +3409,119 @@ static void test_guest_thunks(X86 *c) {
           "stack thunk executes MOV immediate/register, short JMP and indirect memory JMP");
     c->r[R_ESP] = sp;
     heap_free(code);
+}
+
+struct MmHit {
+    uint32_t id, user, thread, time;
+};
+static std::vector<MmHit> g_mm_hits;
+static uint32_t g_mm_test_callback = 0;
+static void mm_test_callback(X86 *c) {
+    const uint32_t id = arg(c, 0), user = arg(c, 2);
+    g_mm_hits.push_back({id, user, guest_current_thread_id(), host_pinned_clock_value()});
+    if (user == 1) {
+        call_import(c, "WINMM.dll", "timeKillEvent", {id});
+        call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 2, 0});
+    } else if (user == 3) {
+        call_import(c, "WINMM.dll", "timeKillEvent", {id});
+        call_import(c, "KERNEL32.dll", "ExitThread", {0});
+    }
+    set_eax(c, 0);
+}
+static void mm_await(size_t hits) {
+    const uint64_t until = os_monotonic_ns() + 1000000000ull;
+    while (g_mm_hits.size() < hits && os_monotonic_ns() < until)
+        guest_sleep_ms(2);
+}
+static void test_mm_timer_thread(X86 *c) {
+    section("cooperative multimedia timer worker");
+    host_mm_timer_thread_for_test(true);
+    g_mm_test_callback = imports_alloc_trampoline("test", "mm_callback", mm_test_callback, 5);
+    g_mm_hits.clear();
+    uint32_t id = call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 0x99, 0});
+    mm_await(1);
+    check(g_mm_hits.size() == 1 && g_mm_hits[0].id == id && g_mm_hits[0].user == 0x99 &&
+              g_mm_hits[0].thread != guest_current_thread_id(),
+          "callback fires on a cooperative worker without a message pump");
+    host_pump_timers(c);
+    guest_sleep_ms(5);
+    check(g_mm_hits.size() == 1, "message pumping does not double-fire a worker timer");
+
+    // Callback code may erase itself and install another timer while firing.
+    call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 1, 1});
+    mm_await(3);
+    check(g_mm_hits.size() == 3 && g_mm_hits[1].user == 1 && g_mm_hits[2].user == 2,
+          "kill and set from inside a callback are safe");
+
+    // A callback can end its worker, exactly like arbitrary guest code. A
+    // later timer must create a fresh worker rather than trust a stale handle.
+    call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 3, 1});
+    mm_await(4);
+    guest_sleep_ms(5);
+    uint32_t dead_thread = g_mm_hits.empty() ? 0 : g_mm_hits.back().thread;
+    call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 4, 0});
+    mm_await(5);
+    check(g_mm_hits.size() == 5 && g_mm_hits.back().thread != dead_thread,
+          "a worker ended by ExitThread is replaced");
+
+    // A counting host source must not override a process pin. Frozen pinned
+    // time stays frozen even while real scheduler deadlines keep progressing.
+    host_set_time_source_pinned(2000, 10);
+    g_fake_time = 999999;
+    host_set_time_source(fake_clock);
+    const size_t before = g_mm_hits.size();
+    id = call_import(c, "WINMM.dll", "timeSetEvent", {10, 0, g_mm_test_callback, 5, 1});
+    guest_sleep_ms(25);
+    check(g_mm_hits.size() == before, "timer creation and firing both respect the pin");
+    host_pinned_clock_advance();
+    mm_await(before + 1);
+    check(g_mm_hits.size() == before + 1 && g_mm_hits.back().time == 2010,
+          "advancing the pin releases the due callback");
+    host_pinned_clock_advance();
+    mm_await(before + 2);
+    host_set_time_source_pinned(2095, 5);
+    mm_await(before + 3);
+    guest_sleep_ms(25);
+    check(g_mm_hits.size() == before + 3, "a stall produces one callback, not a burst");
+    host_pinned_clock_advance();
+    mm_await(before + 4);
+    check(g_mm_hits.size() == before + 4 && g_mm_hits.back().time == 2100,
+          "periodic deadlines retain their original phase after a stall");
+    call_import(c, "WINMM.dll", "timeKillEvent", {id});
+    host_clear_time_source();
+    guest_sleep_ms(20);
+
+    // An event timer can release a wait without a PeekMessage/GetMessage call.
+    uint32_t event = win32_create_event(false, false);
+    call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, event, 0, 0x10});
+    check(guest_wait_objects(&event, 1, false, 1000) == 0,
+          "event-mode timer releases a guest wait");
+    win32_close_handle(event);
+    id = call_import(c, "WINMM.dll", "timeSetEvent", {100, 0, g_mm_test_callback, 6, 1});
+    host_stop_mm_timer_thread();
+    const size_t stopped = g_mm_hits.size();
+    guest_sleep_ms(120);
+    host_pump_timers(c);
+    guest_sleep_ms(20);
+    check(g_mm_hits.size() == stopped, "host shutdown stops future callbacks");
+    call_import(c, "WINMM.dll", "timeKillEvent", {id});
+    call_import(c, "WINMM.dll", "timeSetEvent", {1, 0, g_mm_test_callback, 7, 0});
+    mm_await(stopped + 1);
+    check(g_mm_hits.size() == stopped + 1 && g_mm_hits.back().user == 7,
+          "a new timer can respawn after stop");
+    host_stop_mm_timer_thread();
+    guest_sleep_ms(20);
+    host_mm_timer_thread_for_test(false);
+    g_fake_time = 1000;
+    host_set_time_source(fake_clock);
+    const size_t default_before = g_mm_hits.size();
+    call_import(c, "WINMM.dll", "timeSetEvent", {10, 0, g_mm_test_callback, 8, 0});
+    g_fake_time = 1010;
+    guest_sleep_ms(20);
+    check(g_mm_hits.size() == default_before, "default mode still waits for the message pump");
+    host_pump_timers(c);
+    check(g_mm_hits.size() == default_before + 1, "default message pump still fires the due timer");
+    host_clear_time_source();
 }
 
 static void test_callbacks(X86 *c) {
@@ -6678,15 +6793,19 @@ int main(int argc, char **argv) {
     os_setenv("RECOMP_REGISTRY", "build/recomp/registry-test.json");
     if (!recomp_env("LOG"))
         os_setenv("RECOMP_LOG", "1");
-    if (argc == 2 && strcmp(argv[1], "--pulse-only") == 0) {
+    if (argc == 2 &&
+        (strcmp(argv[1], "--pulse-only") == 0 || strcmp(argv[1], "--mm-timers-only") == 0)) {
         mem_init();
         imports_init();
         win32_init(".");
         X86 *c = loader_context();
         loader_init_context(c);
         scratch = 0x0ee00000;
-        test_pulse_events(c);
-        printf("PulseEvent: %d checks, %d failures\n", g_checks, g_failures);
+        if (strcmp(argv[1], "--pulse-only") == 0)
+            test_pulse_events(c);
+        else
+            test_mm_timer_thread(c);
+        printf("runtime focused: %d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;
     }
     // The suite loads the developer's game image; without one (the kit's

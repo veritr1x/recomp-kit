@@ -35,7 +35,7 @@ PY=${PY:-$ROOT/.venv/bin/python}
 "$PY" tools/build.py --game-dir "$GAME" --target plugins
 "$PY" tools/build.py --game-dir "$GAME" --target smoke
 
-RECOMP_MODS_DIR=mods/examples RECOMP_PROFILE_DIR="$PROFILE" \
+RECOMP_MODS_DIR="$ROOT/mods/examples" RECOMP_PROFILE_DIR="$PROFILE" \
 RECOMP_SCRIPT=$GAME/smoke/mods.script \
 RECOMP_HOST_DUMP_DIR=$BUILD/recomp/mods/frames \
 RECOMP_RUN_RECORD="$RECORD" \

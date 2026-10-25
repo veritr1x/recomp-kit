@@ -2,6 +2,7 @@
 #pragma once
 #include "imports.h"
 #include <string>
+#include <vector>
 
 void kernel32_wide_register();
 void create_file_named(X86 *c, const std::string &name);
@@ -28,6 +29,10 @@ void open_mutex_named(X86 *c, const std::string &name);
 void kernel32_wide_reset();
 
 void get_command_line(X86 *c);
+void get_command_line_w(X86 *c);
+std::vector<std::string> win32_environment();
+uint32_t win32_environment_block_w();
+bool win32_set_environment(const std::string &name, const std::string *value);
 void startup_info(X86 *c);
 void wait_multiple_objects(X86 *c);
 void kernel32_wide_reset_command_line();

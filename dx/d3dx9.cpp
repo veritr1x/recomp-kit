@@ -1256,14 +1256,10 @@ static void apply_pass(FxEffect &fx) {
             o->shared = std::make_shared<const std::vector<uint8_t>>(o->data);
         return o->shared;
     };
-    if (vkey != pl.vs_key || (vso ? vso->data.size() : 0) != pl.vs.size()) {
-        pl.vs.bytes = shared_of(vso);
-        pl.vs_key = vkey;
-    }
-    if (pkey != pl.ps_key || (pso ? pso->data.size() : 0) != pl.ps.size()) {
-        pl.ps.bytes = shared_of(pso);
-        pl.ps_key = pkey;
-    }
+    if (pl.vs_object || vkey != pl.vs_key || (vso ? vso->data.size() : 0) != pl.vs.size())
+        d9_bind_shader(fx.device, false, D9ShaderBytes{shared_of(vso)}, vkey);
+    if (pl.ps_object || pkey != pl.ps_key || (pso ? pso->data.size() : 0) != pl.ps.size())
+        d9_bind_shader(fx.device, true, D9ShaderBytes{shared_of(pso)}, pkey);
     if (pass.label.empty())
         pass.label = fx.resource + "/" + tech.name + "/" + pass.name;
     pl.label = pass.label.c_str();

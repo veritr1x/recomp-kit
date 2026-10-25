@@ -45,6 +45,12 @@ VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 FUNCTION_ALIGNMENT = 16
+UNTRANSLATED_RANGES = ()
+
+
+def untranslated_policy(address):
+    return next((policy for start, end, policy in UNTRANSLATED_RANGES
+                 if start <= address < end), None)
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
 #: free address, and the words the loader seeds before the game runs.
@@ -82,6 +88,9 @@ def configure_module(cfg, key):
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
     global RESUMABLE_STACKS
+    global UNTRANSLATED_RANGES
+    UNTRANSLATED_RANGES = ()  # Executable address exclusions do not describe a DLL.
+    configure_guest_layout(cfg)
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
@@ -98,6 +107,7 @@ def configure_module(cfg, key):
     FUNCTION_ALIGNMENT = mod["function_alignment"]
     SYMBOL_PREFIX = "recomp_%s_" % key
     AUX_MODULE = mod
+    configure_intrinsics({})  # An executable's CRT addresses do not belong to its DLLs.
 
 
 def read_discovered(path):
@@ -120,6 +130,9 @@ def read_discovered(path):
 def configure(cfg):
     """Point the translator at one game's listings, binary and audited reads."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
+    global SYMBOL_PREFIX, AUX_MODULE
+    SYMBOL_PREFIX, AUX_MODULE = "recomp_", None
+    configure_guest_layout(cfg)
     listings = str(cfg["listings_path"])
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
@@ -129,6 +142,10 @@ def configure(cfg):
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
     global RESUMABLE_STACKS
+    global UNTRANSLATED_RANGES
+    UNTRANSLATED_RANGES = tuple((r["start"], r["end"], r["on_branch"])
+                               for r in cfg["translate"].get("untranslated_ranges", ()))
+    configure_intrinsics(cfg["translate"].get("intrinsics"))
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
@@ -144,6 +161,13 @@ def configure(cfg):
         else:
             value = int(r["value"]) & 0xFFFFFFFF
         DATA_SEEDS.append((int(r["addr"]), value))
+
+
+def configure_guest_layout(cfg):
+    """The shim range must agree with x86.h for expanded guest arenas."""
+    global GUEST_SHIM_BASE, GUEST_SHIM_END
+    GUEST_SHIM_END = cfg["game"].get("guest_size", game_config.GUEST_SIZE_DEFAULT)
+    GUEST_SHIM_BASE = GUEST_SHIM_END - 0x100000
 
 
 def visual_animation_read(addr, body):
@@ -301,6 +325,25 @@ INTRINSIC_BODY = {
     INTRINSIC_LONGJMP: "recomp_longjmp(c);",
     INTRINSIC_SETJMP:  "recomp_setjmp(c);",   # single-call fallback, indirect only
 }
+LEGACY_INTRINSICS = {"setjmp": INTRINSIC_SETJMP, "longjmp": INTRINSIC_LONGJMP}
+
+
+def configure_intrinsics(values):
+    """Select an audited CRT pair; omission retains existing-port defaults.
+
+    An explicit empty map disables substitutions. Always reset both addresses
+    so configuring another executable or auxiliary module cannot leak a pair.
+    """
+    global INTRINSIC_SETJMP, INTRINSIC_LONGJMP, INTRINSIC_BODY
+    values = LEGACY_INTRINSICS if values is None else values
+    INTRINSIC_SETJMP = values.get("setjmp")
+    INTRINSIC_LONGJMP = values.get("longjmp")
+    INTRINSIC_BODY = {address: "recomp_%s(c);" % name for name, address in values.items()}
+
+
+def intrinsic_alternates_removed(entries):
+    """A replaced CRT body has only its canonical entry, with no labels inside."""
+    return {address: fn for address, fn in entries.items() if fn.addr not in INTRINSIC_BODY}
 
 # --------------------------------------------------------------- registers --
 
@@ -640,6 +683,13 @@ class Insn(object):
 
     def __init__(self, addr, mnem, rep, opstrs, raw):
         self.addr = addr
+        mnem = {"SAL":"SHL", "FCOMPI":"FCOMIP", "FUCOMPI":"FUCOMIP"}.get(mnem, mnem)
+        # Capstone prints the predicate in the SSE compare mnemonic; exported
+        # listings can spell the generic immediate form instead. Normalize both.
+        match = re.fullmatch(r"CMP(EQ|LT|LE|UNORD|NEQ|NLT|NLE|ORD)(PS|SS|PD|SD)", mnem)
+        if match:
+            predicate = ("EQ", "LT", "LE", "UNORD", "NEQ", "NLT", "NLE", "ORD").index(match[1])
+            mnem, opstrs = "CMP" + match[2], list(opstrs) + [str(predicate)]
         self.mnem = mnem
         self.rep = rep
         self.ops = opstrs
@@ -713,6 +763,9 @@ JCC["JECXZ"] = ("c->r[1] == 0", ())
 JCC["LOOP"] = ("(c->r[1] = c->r[1] - 1u) != 0u", ())
 SETCC = {"SET" + k: v for k, v in COND.items()}
 CMOVCC = {"CMOV" + k: v for k, v in COND.items()}
+FCMOVCC = {"FCMOV" + k: COND[v] for k,v in
+           (("B","B"),("E","Z"),("BE","BE"),("U","P"),
+            ("NB","NC"),("NE","NZ"),("NBE","A"),("NU","NP"))}
 
 ARITH_ALL = ALL_FLAGS
 LOGIC_DEF = ALL_FLAGS           # AF is architecturally undefined; treat as killed
@@ -805,6 +858,12 @@ def flag_effect(insn):
         return (NO_FLAGS, frozenset(SETCC[m][1]))
     if m in CMOVCC:
         return (NO_FLAGS, frozenset(CMOVCC[m][1]))
+    if m in FCMOVCC:
+        return (NO_FLAGS, frozenset(FCMOVCC[m][1]))
+    if m in ("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP", "COMISS", "UCOMISS", "COMISD", "UCOMISD"):
+        return (ALL_FLAGS, NO_FLAGS)
+    if m == "CMPSD" and names_an_xmm(insn):
+        return (NO_FLAGS, NO_FLAGS)
     if insn.rep and m in ("SCASB", "SCASW", "SCASD", "CMPSB", "CMPSW", "CMPSD"):
         return (NO_FLAGS, NO_FLAGS)
     if m in SHIFT_MAYDEF:
@@ -819,11 +878,14 @@ def flag_effect(insn):
 # ------------------------------------------------------------------- image --
 
 class Image(object):
-    def __init__(self, path):
+    def __init__(self, path, base=None):
         import pefile
-        pe = pefile.PE(path, fast_load=True)
-        self.base = pe.OPTIONAL_HEADER.ImageBase
+        pe = pefile.PE(data=Path(path).read_bytes(), fast_load=True)
+        self.preferred_base = pe.OPTIONAL_HEADER.ImageBase
+        self.base = self.preferred_base if base is None else base
         self.size = pe.OPTIONAL_HEADER.SizeOfImage
+        if pe.OPTIONAL_HEADER.Magic != 0x10b or not 0 <= self.base < self.base + self.size <= 0x100000000:
+            raise TranslateError("relocation requires a PE32 image at a valid 32-bit base")
         data = pe.get_memory_mapped_image()
         # get_memory_mapped_image() stops at the last section's raw end, which
         # is short of SizeOfImage; the architectural image runs to
@@ -834,6 +896,14 @@ class Image(object):
         self.end = self.base + self.size
         rel = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]      # IMAGE_DIRECTORY_BASERELOC
         self.reloc_dir = (rel.VirtualAddress, rel.Size)
+        self.rebase_delta = self.base - self.preferred_base
+        if self.rebase_delta:
+            self.data = self.rebase(self.data, self.reloc_dir, self.rebase_delta)
+            # Keep headers consistent with the bytes mapped by the runtime.
+            data = bytearray(self.data)
+            at = pe.OPTIONAL_HEADER.get_field_absolute_offset("ImageBase")
+            data[at:at + 4] = self.base.to_bytes(4, "little")
+            self.data = bytes(data)
         #: Import address table slots by address, as the imported name.
         #: noreturn_callees_from reads it to see that a function ending in
         #: RaiseException - MSVC's _CxxThrowException - does not return, and
@@ -846,7 +916,7 @@ class Image(object):
             for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
                 for imp in entry.imports:
                     if imp.name:
-                        self.iat_names[imp.address] = imp.name.decode("ascii", "replace")
+                        self.iat_names[imp.address + self.rebase_delta] = imp.name.decode("ascii", "replace")
         except Exception:                 # a malformed table only loses names
             pass
         pe.close()
@@ -880,6 +950,63 @@ class Image(object):
             self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         except ImportError:            # length checking is optional
             self.md = None
+
+    @staticmethod
+    def rebase(data, directory, delta):
+        """Validate all HIGHLOW sites before changing bytes; ABSOLUTE is padding."""
+        rva, size = directory
+        if not rva or size < 8 or rva + size > len(data):
+            raise TranslateError("missing or out-of-image base relocation directory")
+        sites, seen = [], set()
+        end, off = rva + size, rva
+        while off < end:
+            if off + 8 > end:
+                raise TranslateError("truncated base relocation block")
+            page = int.from_bytes(data[off:off + 4], "little")
+            block = int.from_bytes(data[off + 4:off + 8], "little")
+            if block < 8 or block % 2 or off + block > end:
+                raise TranslateError("invalid base relocation block size")
+            for at in range(off + 8, off + block, 2):
+                entry = int.from_bytes(data[at:at + 2], "little")
+                kind, site = entry >> 12, page + (entry & 0xfff)
+                if kind == 0:
+                    continue
+                if kind != 3 or site + 4 > len(data):
+                    raise TranslateError("unsupported or out-of-image base relocation")
+                if site in seen:
+                    raise TranslateError("duplicate base relocation site")
+                seen.add(site)
+                sites.append(site)
+            off += block
+        out = bytearray(data)
+        for site in sites:
+            value = int.from_bytes(data[site:site + 4], "little")
+            out[site:site + 4] = ((value + delta) & 0xffffffff).to_bytes(4, "little")
+        return bytes(out)
+
+    def rebase_listing(self, insns):
+        """Re-decode listed instruction starts from relocated bytes, not address-shaped
+        literals in text (which could be non-pointer constants)."""
+        delta = getattr(self, "rebase_delta", 0)
+        if not delta:
+            return insns
+        if self.md is None:
+            raise TranslateError("capstone is required to rebase listings")
+        out = []
+        old_detail = self.md.detail
+        self.md.detail = True
+        try:
+            for ins in insns:
+                va = ins.addr + delta
+                if not self.base <= va < self.end:
+                    raise TranslateError("listed instruction outside relocated image")
+                ci = next(self.md.disasm(self.data[va - self.base:va - self.base + 16], va, count=1), None)
+                if ci is None:
+                    raise TranslateError("cannot decode relocated instruction at %08x" % va)
+                out.append(self.to_insn(ci))
+        finally:
+            self.md.detail = old_detail
+        return out
 
     def relocated_pointers(self):
         """Every address named by a dword the loader rewrites, and where.
@@ -918,6 +1045,113 @@ class Image(object):
 
     def is_exec(self, va):
         return any(lo <= va < hi for lo, hi, _ in self.exec_ranges)
+
+    def msvc_func_info(self, stub):
+        """VC8 x86 MOV EAX,FuncInfo / JMP imported __CxxFrameHandler3.
+
+        Prove the handler's identity through the IAT before interpreting any
+        tables; arbitrary MOV immediates are not exception metadata.
+        """
+        cache = self.__dict__.setdefault("_msvc_info", {})
+        if stub in cache:
+            return cache[stub]
+        def handler(va, depth=0):
+            if depth > 2:
+                return False
+            if self.rd8(va) == 0xe9:
+                rel = self.rd32(va + 1)
+                return rel is not None and handler((va + 5 + rel) & 0xffffffff, depth + 1)
+            if self.rd8(va) == 0xff and self.rd8(va + 1) == 0x25:
+                return getattr(self, "iat_names", {}).get(self.rd32(va + 2)) == "__CxxFrameHandler3"
+            return False
+        if self.rd8(stub) != 0xb8 or not handler(stub + 5):
+            cache[stub] = None
+            return None
+        info = self.rd32(stub + 1)
+        fields = [self.rd32(info + i * 4) if info else None for i in range(5)]
+        if (None in fields or not 0x19930520 <= fields[0] & 0x1fffffff <= 0x19930522
+                or fields[1] > 4096 or fields[3] > 4096):
+            raise TranslateError("invalid MSVC FuncInfo at handler %08x" % stub)
+        _, states, unwind, count, tries = fields
+        funclets, ranges = set(), {(info, info + 36)}
+        if states:
+            ranges.add((unwind, unwind + states * 8))
+        for i in range(states):
+            target = self.rd32(unwind + i * 8 + 4)
+            if target is None or (target and not self.is_exec(target)):
+                raise TranslateError("invalid MSVC unwind map at %08x" % info)
+            if target:
+                funclets.add(target)
+        if count:
+            ranges.add((tries, tries + count * 20))
+        catch_funclets = set()
+        for i in range(count):
+            entry = [self.rd32(tries + i * 20 + j * 4) for j in range(5)]
+            if (None in entry or entry[0] > entry[1] or entry[1] >= states
+                    or not 1 <= entry[3] <= 256):
+                raise TranslateError("invalid MSVC try map at %08x" % info)
+            ranges.add((entry[4], entry[4] + entry[3] * 16))
+            for j in range(entry[3]):
+                target = self.rd32(entry[4] + j * 16 + 12)
+                if target is None or not self.is_exec(target):
+                    raise TranslateError("invalid MSVC catch handler at %08x" % info)
+                catch_funclets.add(target)
+        funclets.update(catch_funclets)
+        landings = set()
+        for target in catch_funclets:
+            # A catch funclet returns a continuation in EAX. Recover both arms
+            # of its CFG; the continuation need not fit the parent's listing.
+            instructions = {ins.addr: ins for ins in self.recover(target, set(), limit=4096)}
+            import capstone
+            decoder = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+            decoder.detail = True
+            writes_eax, ends = set(), {}
+            for va, ins in instructions.items():
+                decoded = next(decoder.disasm(self.data[va-self.base:va-self.base+15], va, count=1), None)
+                if decoded is None:
+                    writes_eax.add(va)
+                    continue
+                ends[va] = va + decoded.size
+                _, written = decoded.regs_access()
+                if any(decoded.reg_name(reg) in ("eax", "ax", "al", "ah") for reg in written):
+                    writes_eax.add(va)
+            incoming, pending = {target: {None}}, [target]
+            while pending:
+                va = pending.pop()
+                ins = instructions.get(va)
+                if ins is None:
+                    continue
+                values = set(incoming[va])
+                if ins.mnem == "RET":
+                    landings.update(value for value in values if value is not None)
+                    continue
+                if ins.mnem == "CALL" or va in writes_eax:
+                    values = {None}
+                    if ins.mnem in ("MOV", "LEA") and len(ins.ops) == 2:
+                        dst, src = (parse_operand(op) for op in ins.ops)
+                        address = src.imm if src.kind == "imm" else (
+                            src.disp if src.kind == "mem" and src.base is None and src.index is None else None)
+                        if dst.size == 32 and address is not None and self.is_exec(address):
+                            values = {address}
+                        elif src.kind == "reg" and src.reg == R_EAX and src.size == 32:
+                            values = set(incoming[va])
+                successors = []
+                if (ins.mnem == "JMP" or ins.mnem in JCC or ins.mnem.startswith("LOOP")
+                        or ins.mnem in ("JECXZ", "JCXZ")):
+                    successors.append(Translator.branch_target(ins))
+                if ins.mnem != "JMP":
+                    successors.append(ends.get(va))
+                for successor in successors:
+                    if successor not in instructions:
+                        continue
+                    known = incoming.setdefault(successor, set())
+                    if not values <= known:
+                        known.update(values)
+                        pending.append(successor)
+        result = {"address": info, "tries": count, "funclets": funclets,
+                  "landings": landings, "ranges": ranges}
+        cache[stub] = result
+        return result
 
     def seh_landings(self, stub):
         """Classify a Delphi handler stub by structure, never by its target's name.
@@ -962,6 +1196,9 @@ class Image(object):
         landing block to discover behind one, so discovery skips it; the
         frame itself is still modelled, because seh_frame_sites keeps it.
         """
+        msvc = self.msvc_func_info(stub)
+        if msvc is not None:
+            return sorted(msvc["funclets"] | msvc["landings"]), None
         try:
             return self.seh_landings(stub)
         except TranslateError:
@@ -1184,7 +1421,23 @@ class Image(object):
         alignment, padding, string or shape test gets a say.
         """
         walkers = set()
+        def imported_walker(ins):
+            if not ins.ops:
+                return False
+            try:
+                op = parse_operand(ins.ops[0])
+            except TranslateError:
+                return False
+            return (op.kind == "mem" and op.base is None and op.index is None
+                    and getattr(self, "iat_names", {}).get(op.disp)
+                    in {"_initterm", "_initterm_e"})
+
         for fn in functions:
+            # DLL-linked CRTs expose the same walker through a pure IAT jump
+            # thunk. Do not infer a walker from an arbitrary indirect jump.
+            body = [ins for ins in fn.insns if ins.mnem != "NOP"]
+            if len(body) == 1 and body[0].mnem == "JMP" and imported_walker(body[0]):
+                walkers.add(fn.addr)
             # The shape, not one compiler's register allocation. __initterm
             # walks an array of function pointers and calls each non-null one,
             # which is an indirect CALL and a step of four however the
@@ -1207,15 +1460,14 @@ class Image(object):
                     step = True
             if indirect_call and step:
                 walkers.add(fn.addr)
-        if not walkers:
-            return [], set()
-
         ranges, entries = [], set()
         for fn in functions:
             for i, ins in enumerate(fn.insns):
                 if ins.mnem != "CALL" or not ins.ops:
                     continue
-                if not ins.ops[0].startswith("0x") or int(ins.ops[0], 16) not in walkers:
+                through_thunk = (ins.ops[0].startswith("0x")
+                                 and int(ins.ops[0], 16) in walkers)
+                if not through_thunk and not imported_walker(ins):
                     continue
                 if i < 2 or fn.insns[i - 1].mnem != "PUSH" or fn.insns[i - 2].mnem != "PUSH":
                     continue
@@ -1267,6 +1519,25 @@ class Image(object):
         """
         starts, interior = set(), set()
         skip = list(exclude)
+        # Relative control-flow operands encode offsets, never absolute code
+        # pointers. Mark their storage from known instruction starts before
+        # classifying destinations, including ones already known as code.
+        # Keep ordinary PUSH/MOV/LEA address immediates eligible for discovery.
+        relative_storage = set()
+        prefixes = {0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3}
+        for start in covered:
+            at, word_operand = start, False
+            while at < min(start + 15, self.end) and self.rd8(at) in prefixes:
+                word_operand |= self.rd8(at) == 0x66
+                at += 1
+            opcode = self.rd8(at)
+            if opcode in (0xe8, 0xe9):
+                operand = at + 1
+            elif opcode == 0x0f and self.rd8(at + 1) in range(0x80, 0x90):
+                operand = at + 2
+            else:
+                continue
+            relative_storage.update(range(start + 1, min(operand + (2 if word_operand else 4), self.end)))
 
         def excluded(va):
             return any(lo <= va < hi for lo, hi in skip)
@@ -1275,6 +1546,9 @@ class Image(object):
             blob = self.data[lo - self.base:hi - self.base]
             # len(blob) - 3 so the section's final dword is examined too.
             for off in range(len(blob) - 3):
+                source = lo + off
+                if source in covered or source in relative_storage:
+                    continue
                 quad = blob[off:off + 4]
                 va = int.from_bytes(quad, "little")
                 if va in starts or va in interior:
@@ -1328,7 +1602,7 @@ class Image(object):
     #: x87 mnemonics whose memory operand is an integer or a control/status
     #: word rather than a float, so its width names itself (`word ptr`) instead
     #: of being spelled `float`/`double`/`extended double`.
-    X87_INT = frozenset(("FILD", "FIST", "FISTP", "FIADD", "FISUB", "FISUBR",
+    X87_INT = frozenset(("FILD", "FIST", "FISTP", "FISTTP", "FIADD", "FISUB", "FISUBR",
                          "FIMUL", "FIDIV", "FIDIVR", "FICOM", "FICOMP",
                          "FNSTSW", "FSTSW", "FNSTCW", "FSTCW", "FLDCW",
                          "FNSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR"))
@@ -1341,10 +1615,12 @@ class Image(object):
                   "IRETD": "IRET"}
 
     def _size_word(self, nbytes, mnem):
+        if mnem in ("FNSTENV", "FSTENV", "FLDENV", "FSAVE", "FNSAVE", "FRSTOR") and nbytes in (28, 108):
+            return "dword"
         if mnem.startswith("F") and mnem not in self.X87_INT:
             return {4: "float", 8: "double", 10: "extended double"}.get(nbytes)
         return {1: "byte", 2: "word", 4: "dword", 8: "qword",
-                10: "extended double"}.get(nbytes)
+                10: "extended double", 16: "xmmword"}.get(nbytes)
 
     def _op_text(self, ci, op, mnem):
         import capstone.x86_const as X
@@ -1382,7 +1658,7 @@ class Image(object):
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
         ops = [self._op_text(ci, o, mnem) for o in ci.operands]
-        if rep or mnem in Translator.STRING_MNEM:
+        if rep or (mnem in Translator.STRING_MNEM and not any(XMM_RE.match(o) for o in ops)):
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (ci.address, mnem, "." + rep if rep else "",
                                  (" " + ",".join(ops)) if ops else "")
@@ -1438,7 +1714,8 @@ class Image(object):
             va = pending.pop()
             while len(seen) < limit:
                 claimed = va in listed and not (may_pass is not None and may_pass(va))
-                if va in seen or claimed or va in boundary_set or not (lo <= va < hi):
+                if (va in seen or claimed or va in boundary_set or not (lo <= va < hi)
+                        or untranslated_policy(va)):
                     break
                 got = list(self.md.disasm(self.data[va - self.base:va - self.base + 16],
                                           va, count=1))
@@ -1472,8 +1749,9 @@ class Image(object):
                         pending.append(t)
                 if ci.mnemonic in ("ret", "retn", "jmp"):
                     break
-                if (ci.mnemonic == "call" and ci.op_str.startswith("0x")
-                        and int(ci.op_str, 16) in self.noreturn_callees):
+                if (ci.mnemonic == "call" and (
+                        (ci.op_str.startswith("0x") and int(ci.op_str, 16) in self.noreturn_callees)
+                        or noreturn_import(seen[va], getattr(self, "iat_names", {})))):
                     break
                 va = nxt
             else:
@@ -1649,11 +1927,97 @@ def seh_frame_sites(fn, image=None):
                     break
         except TranslateError:
             continue
+    # VC8 publishes a registration through LEA reg,[EBP-12], or directly
+    # through ESP before allocating locals. Prove the fixed prologue layout:
+    # state at EBP-4, handler at EBP-8 and previous chain at EBP-12.
+    classifier = getattr(image, "msvc_func_info", None)
+    if classifier is not None:
+        for i, ins in enumerate(fn.insns):
+            if ins.mnem != "MOV" or len(ins.ops) != 2:
+                continue
+            dst, src = (parse_operand(op) for op in ins.ops)
+            if (not seh_chain_operand(dst, dst.base) or not seh_zero_base(fn, i, dst.base)
+                    or src.kind != "reg" or src.size != 32):
+                continue
+            lea, address = i, Op("mem", base=R_ESP, disp=0)
+            if src.reg != R_ESP:
+                lea = None
+                for j in range(i - 1, max(-1, i - 32), -1):
+                    prev = fn.insns[j]
+                    if (not fn.contiguous[j] or prev.mnem in TERMINATORS
+                            or prev.mnem in JCC or prev.mnem == "CALL"):
+                        break
+                    if not Translator.writes_reg32(prev, src.reg):
+                        continue
+                    if prev.mnem == "LEA" and len(prev.ops) == 2:
+                        candidate = parse_operand(prev.ops[1])
+                        if (candidate.kind == "mem" and candidate.base in (R_EBP, R_ESP)
+                                and candidate.index is None):
+                            lea, address = j, candidate
+                    break
+            if lea is None:
+                continue
+            anchor = None
+            for j in range(lea - 1, max(-1, lea - 64), -1):
+                prev = fn.insns[j]
+                if (not fn.contiguous[j] or prev.mnem in TERMINATORS
+                        or prev.mnem in JCC or prev.mnem == "CALL"):
+                    break
+                if prev.mnem == "MOV" and prev.ops == ["EBP", "ESP"]:
+                    anchor = j
+                    break
+                if Translator.writes_reg32(prev, R_EBP):
+                    break
+            if anchor is None:
+                continue
+            delta, handler, record = 0, None, False
+            for j in range(anchor + 1, i + 1):
+                prev = fn.insns[j]
+                if j == lea:
+                    record = (address.disp == -12 if address.base == R_EBP else
+                              delta is not None and delta + address.disp == -12)
+                if prev.mnem == "PUSH":
+                    value = parse_operand(prev.ops[0])
+                    if delta == -4 and value.kind == "imm" and j > 0:
+                        before = fn.insns[j - 1]
+                        state = parse_operand(before.ops[0]) if before.mnem == "PUSH" else None
+                        if (state is not None and state.kind == "imm"
+                                and state.imm & 0xffffffff == 0xffffffff
+                                and classifier(value.imm) is not None):
+                            handler = value.imm
+                    delta = delta - 4 if delta is not None else None
+                elif prev.mnem == "POP":
+                    delta = delta + 4 if delta is not None else None
+                elif prev.mnem in ("ADD", "SUB") and len(prev.ops) == 2:
+                    dest, amount = (parse_operand(op) for op in prev.ops)
+                    if dest.kind == "reg" and dest.reg == R_ESP:
+                        delta = (delta + (amount.imm if prev.mnem == "ADD" else -amount.imm)
+                                 if delta is not None and amount.kind == "imm" else None)
+                elif Translator.writes_reg32(prev, R_ESP):
+                    delta = None
+            if record and handler is not None:
+                sites[i] = handler
     return sites
 
 
 NORETURN_IMPORTS = frozenset(("RaiseException", "ExitProcess", "TerminateProcess",
-                              "ExitThread", "FatalAppExitA", "FatalExit"))
+                              "ExitThread", "FatalAppExitA", "FatalExit", "_CxxThrowException"))
+
+
+def noreturn_import(ins, iat_names):
+    """Recognize a call through a fixed import slot, never an object field."""
+    if ins.mnem != "CALL" or not ins.ops:
+        return False
+    try:
+        op = parse_operand(ins.ops[0])
+    except TranslateError:
+        return False
+    # RaiseException can resume after a continuable exception; terminating
+    # another process can return too. Only unconditional local exits end a
+    # raw import call without further argument/control-flow evidence.
+    exits = {"ExitProcess", "ExitThread", "FatalAppExitA", "FatalExit", "_CxxThrowException"}
+    return (op.kind == "mem" and op.base is None and op.index is None
+            and iat_names.get(op.disp) in exits)
 
 
 def noreturn_callees_from(parsed, iat_names, image=None):
@@ -1796,7 +2160,9 @@ class Translator(object):
         if ins.mnem != "CALL":
             return False
         t = self.branch_target(ins)
-        return t is not None and t in self.noreturn_callees
+        return ((t is not None and t in self.noreturn_callees)
+                or (t is not None and untranslated_policy(t) == "trap")
+                or noreturn_import(ins, getattr(self.image, "iat_names", {})))
 
     @staticmethod
     def closed_noreturn_loop(fn):
@@ -2238,6 +2604,16 @@ class Translator(object):
             self.table_ranges.add((dword_base, dword_base + 4 * info))
             self.stats["_jmp_table_bounded"] += 1
             return targets
+        if kind == "bounded_offset":
+            first, count = info
+            targets = []
+            for k in range(first, first + count):
+                t = self.image.rd32(dword_base + 4 * k)
+                self.want_target(fn, ins, t, k)
+                targets.append(t)
+            self.table_ranges.add((dword_base + 4 * first, dword_base + 4 * (first + count)))
+            self.stats["_jmp_table_bounded"] += 1
+            return targets
 
         ranged = None if byte_offset else self.index_range(fn, i, op.index)
         if ranged is not None:
@@ -2459,6 +2835,8 @@ class Translator(object):
 
     def want_target(self, fn, ins, target, k, strict=None):
         """Validate a jump-table entry, deferring recovery on pass 1."""
+        if target is not None and untranslated_policy(target):
+            return  # The emitter enforces this explicit range's branch policy.
         if target is not None and self.is_block_entry(fn, target):
             return
         if strict is False:
@@ -2469,7 +2847,8 @@ class Translator(object):
         # body, so bound recovery by a generous window past the entry rather
         # than by fn.end.
         if (not self.strict and target is not None
-                and fn.addr <= target < fn.addr + 0x10000):
+                and min(fn.addr, fn.insns[0].addr) <= target < max(fn.end, fn.addr + 0x10000)
+                and self.image.is_exec(target)):
             self.unlisted_targets.add(target)
             return
         raise TranslateError(
@@ -2488,7 +2867,14 @@ class Translator(object):
             ins = fn.insns[j]
             if ins.mnem == "CMP" and len(ins.ops) == 2:
                 b = self.cmp_bound_here(fn, j, idx_reg)
-                return ("bounded", b) if b is not None else (None, None)
+                if b is not None:
+                    return ("bounded", b)
+                alias = self.lea_bound_here(fn, j, idx_reg)
+                if alias is not None:
+                    return ("bounded_offset", alias)
+                # An unrelated compare is not the producer of this index.
+                # Earlier guards still validate their own flags through it.
+                continue
             if not self.writes_reg32(ins, idx_reg):
                 continue
             if ins.mnem in ("MOV", "MOVZX", "MOVSX") and len(ins.ops) == 2:
@@ -2497,13 +2883,76 @@ class Translator(object):
                 except TranslateError:
                     return (None, None)
                 if (dst.kind == "reg" and dst.reg == idx_reg and src.kind == "mem"
+                        and src.size == 32 and src.base == 5 and src.index is None):
+                    count = self.stack_slot_bound(fn, j, src)
+                    if count is not None:
+                        return ("bounded", count)
+                if (dst.kind == "reg" and dst.reg == idx_reg and src.kind == "mem"
                         and src.size == 8 and src.index is None
                         and src.base is not None and src.disp):
                     inner = self.index_source(fn, j, src.base)
                     if inner[0] == "bounded":
                         return ("byte_table", (src.disp, inner[1]))
+                    if inner[0] == "bounded_offset":
+                        first, count = inner[1]
+                        return ("byte_table", (src.disp + first, count))
             return (None, None)
         return (None, None)
+
+    def stack_slot_bound(self, fn, load, slot):
+        """Follow an EBP local only across a guarded, unmodified stack slot.
+
+        ESP locals change meaning across pushes/calls. Even an EBP slot loses
+        its proof at an indirect write or a call that could alias the local.
+        """
+        for j in range(load - 1, max(-1, load - 16), -1):
+            ins = fn.insns[j]
+            if self.writes_reg32(ins, 5) or ins.mnem == "CALL":
+                return None
+            try:
+                op = parse_operand(ins.ops[0]) if ins.ops else None
+            except TranslateError:
+                return None
+            if (ins.mnem == "CMP" and len(ins.ops) == 2 and op.kind == "mem"
+                    and op.size == 32 and op.base == 5 and op.index is None
+                    and op.disp == slot.disp):
+                return self.cmp_bound_here(fn, j, None, slot=slot)
+            if (op is not None and op.kind == "mem"
+                    and ins.mnem not in ("CMP", "TEST", "PUSH") and ins.mnem not in JCC):
+                return None
+        return None
+
+    def lea_bound_here(self, fn, j, idx_reg):
+        """CMP of a prior LEA alias bounds the original index at an offset.
+
+        LEA bound,[index-5]; CMP bound,2; JA default leaves index in 5..7.
+        Stop at either register's intervening write rather than applying a
+        stale alias to a byte/dword table read.
+        """
+        try:
+            compared = parse_operand(fn.insns[j].ops[0])
+        except TranslateError:
+            return None
+        if compared.kind != "reg" or compared.reg == idx_reg:
+            return None
+        count = self.cmp_bound_here(fn, j, compared.reg)
+        if count is None:
+            return None
+        for k in range(j - 1, max(-1, j - 16), -1):
+            candidate = fn.insns[k]
+            if self.writes_reg32(candidate, idx_reg):
+                return None
+            if not self.writes_reg32(candidate, compared.reg):
+                continue
+            if candidate.mnem == "LEA" and len(candidate.ops) == 2:
+                try:
+                    source = parse_operand(candidate.ops[1])
+                except TranslateError:
+                    return None
+                if source.kind == "mem" and source.base == idx_reg and source.index is None:
+                    return (-source.disp, count)
+            return None
+        return None
 
     #: How many index values reach the table, given `CMP idx,N` and the guard
     #: that follows it.  Only a guard that branches AWAY on out-of-range values
@@ -2513,16 +2962,26 @@ class Translator(object):
     #: index is out of range and the compare bounds nothing.
     GUARD_BOUND = {"JA": 1, "JNBE": 1, "JAE": 0, "JNC": 0, "JNB": 0}
 
-    def cmp_bound_here(self, fn, j, idx_reg):
+    def cmp_bound_here(self, fn, j, idx_reg, slot=None):
         """`CMP idx,N` guarded by an away-branching JA/JAE -> reachable count."""
         ins = fn.insns[j]
         try:
             a, b = parse_operand(ins.ops[0]), parse_operand(ins.ops[1])
         except TranslateError:
             return None
-        if not (a.kind == "reg" and a.reg == idx_reg and b.kind == "imm"):
+        matches = (a.kind == "reg" and a.reg == idx_reg) if slot is None else (
+            a.kind == "mem" and a.size == slot.size and a.base == slot.base
+            and a.index == slot.index and a.disp == slot.disp)
+        if not (matches and b.kind == "imm"):
             return None
         if b.imm < 0 or b.imm > 0xFFFF:
+            return None
+        # Every path reaching the dispatch must execute the comparison.
+        # A branch into its suffix invalidates a textual compare/guard match.
+        end = fn.insns[self.jmp_index].addr
+        if any((target := self.branch_target(other)) is not None
+               and ins.addr < target <= end
+               for other in fn.insns if other.mnem == "JMP" or other.mnem in JCC):
             return None
         # The guard is the first later instruction that reads the flags, not
         # necessarily the next one: MSVC schedules unrelated moves in between.
@@ -2571,9 +3030,33 @@ class Translator(object):
         is strict and a target that is still not an instruction boundary is an
         error."""
         fn.index = {ins.addr: k for k, ins in enumerate(fn.insns)}
+        if fn.addr in INTRINSIC_BODY:
+            self.strict = strict
+            fn.pushed_continuations = set()
+            fn.seh_sites = fn.seh_restores = {}
+            fn.msvc_sites = fn.msvc_restores = {}
+            fn.msvc_landings = set()
+            return
         fn.pushed_continuations = self.live_continuations(fn)
         fn.seh_sites = seh_frame_sites(fn, self.image)
         fn.seh_restores = seh_restore_sites(fn)
+        fn.msvc_sites, fn.msvc_landings = {}, set()
+        recognized = False
+        classifier = getattr(self.image, "msvc_func_info", None)
+        for i, stub in list(fn.seh_sites.items()):
+            info = classifier(stub) if classifier else None
+            if info is None:
+                continue
+            recognized = True
+            del fn.seh_sites[i]
+            if info["tries"]:
+                fn.msvc_sites[i] = (stub, info["address"])
+                fn.msvc_landings.update(info["landings"])
+        fn.msvc_restores = seh_restore_sites(fn) if fn.msvc_sites else set()
+        if fn.msvc_sites and RESUMABLE_STACKS:
+            raise TranslateError("MSVC C++ checkpoints require preserved native call frames")
+        if recognized and not fn.seh_sites:
+            fn.seh_restores = set()
         self.strict = strict
         for i, ins in enumerate(fn.insns):
             if ins.mnem == "JMP" and ins.ops and not ins.ops[0].startswith("0x"):
@@ -2594,7 +3077,11 @@ class Translator(object):
         of those, the body becomes `static void body_ADDR(X86 *, uint32_t)`
         preceded by a dispatch switch, and every entry is a three-line wrapper,
         so no code is duplicated."""
-        entries = sorted(set(entries))
+        if fn.addr in INTRINSIC_BODY:
+            self.stats["_intrinsic_body"] += 1
+            return ["/* runtime intrinsic */",
+                    "void fn_%08x(X86 *c) { %s }" % (fn.addr, INTRINSIC_BODY[fn.addr])]
+        entries = sorted(set(entries) | (fn.msvc_landings & fn.addrs))
         # An alternate entry must be an instruction in THIS body.  A block can
         # be re-recovered between the discovery rounds and the final pass -
         # recursive descent makes them grow - so an entry registered against
@@ -2617,6 +3104,7 @@ class Translator(object):
         self.dead_after_noreturn_addrs.update(fn.dead_addrs)
 
         labels = set(fn.pushed_continuations)
+        labels.update(fn.msvc_landings & fn.addrs)
         # RTL fill/move routines compute addresses within unrolled code rather
         # than loading a table. Only bodies with such jumps need every label.
         if any(ins.mnem == "JMP" and self.branch_target(ins) is None
@@ -2651,10 +3139,6 @@ class Translator(object):
             labels.add(e)
 
         out = []
-        if fn.addr in INTRINSIC_BODY:
-            self.stats["_intrinsic_body"] += 1
-            return ["/* runtime intrinsic */",
-                    "void fn_%08x(X86 *c) { %s }" % (fn.addr, INTRINSIC_BODY[fn.addr])]
         # Following branches can pull in addresses BELOW the entry, so the
         # first instruction in address order is not necessarily where this
         # function starts.  Jump to the entry explicitly rather than falling
@@ -2670,8 +3154,8 @@ class Translator(object):
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
             for e in entries:
-                out.append("    case %s: goto L_%08x;" % (hexlit(e), e))
-            out.append("    default: goto L_%08x;" % fn.addr if head else
+                out.append("    case %s: %s" % (hexlit(e), self.goto_label(e)))
+            out.append("    default: " + self.goto_label(fn.addr) if head else
                        "    default: break;")
             out.append("    }")
         else:
@@ -2679,7 +3163,7 @@ class Translator(object):
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
-                out.append("    goto L_%08x;" % fn.addr)
+                out.append("    " + self.goto_label(fn.addr))
         prologue = len(out)          # everything emitted so far is dispatch
         for i, ins in enumerate(fn.insns):
             if i in dead:
@@ -2718,7 +3202,7 @@ class Translator(object):
         if fn.addr not in fn.index:
             raise TranslateError("fn_%08x does not contain its own entry" % fn.addr)
         if head:
-            want = ("goto L_%08x;" % fn.addr, "default: goto L_%08x;" % fn.addr)
+            want = (self.goto_label(fn.addr), "default: " + self.goto_label(fn.addr))
             if not any(line.strip() in want for line in out[:prologue]):
                 raise TranslateError(
                     "fn_%08x starts at %08x, not at its own address; prologue "
@@ -2791,6 +3275,9 @@ class Translator(object):
         # four bytes short of the real rel32 continuation. Listing gaps can
         # also skip past it. The return address belongs to the instruction.
         nxt = fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end)
+        target = self.branch_target(ins) if ins.mnem in JCC or ins.mnem in ("CALL", "JMP") else None
+        if target is not None and untranslated_policy(target) == "fail":
+            self.excluded_branch(target)  # An explicit config gate survives --allow-unmodelled.
         try:
             body = self._emit(fn, i, ins, m, nxt, live)
             body = visual_animation_read(ins.addr, body)
@@ -2824,6 +3311,11 @@ class Translator(object):
                              "INSB", "INSW", "INSD", "OUTSB", "OUTSW", "OUTSD"))
 
     def _emit(self, fn, i, ins, m, nxt, live):
+        target = self.branch_target(ins) if m == "CALL" or m == "JMP" or m in JCC else None
+        if target is not None and untranslated_policy(target):
+            trap = self.excluded_branch(target)
+            if m == "CALL":
+                return trap
         if any(AVX_OPERAND_RE.search(o) for o in ins.ops or ()):
             # Never modelled, and its operands do not parse: trap it here,
             # before parsing refuses the whole function over a path CPUID
@@ -2846,6 +3338,15 @@ class Translator(object):
                 # These come from data Ghidra decoded as code.
                 return ["recomp_int(c, 6u);"] if dst.imm == SEGMENT_SELECTOR["CS"] else [";"]
             L.append(write_op(dst, size, read_op(src, size)))
+            if i in fn.msvc_sites:
+                stub, info = fn.msvc_sites[i]
+                L.append("{ jmp_buf *b_ = recomp_msvc_frame_enter(c, %s, %s);" % (hexlit(stub), hexlit(info)))
+                L.append("if (setjmp(*b_)) { uint32_t target_ = recomp_msvc_frame_land(c); switch (target_) {")
+                for target in sorted(fn.msvc_landings & fn.addrs):
+                    L.append("case %s: %s" % (hexlit(target), self.goto_label(target)))
+                L.append("default: recomp_jump(c, target_); return; } } }")
+            elif i in fn.msvc_restores:
+                L.append("recomp_msvc_frame_leave(c);")
             if (fn.seh_sites and (seh_chain_operand(dst) or i in fn.seh_sites)
                     and src.kind == "reg" and src.size == 32):
                 L.append("c->eip = %s;" % hexlit(ins.addr))
@@ -2953,6 +3454,8 @@ class Translator(object):
             L.append(write_op(ops[0], 32, "v_"))
             if i in fn.seh_restores:
                 L.append("c->eip = %s; recomp_seh_frame_leave(c);" % hexlit(ins.addr))
+            if i in fn.msvc_restores:
+                L.append("recomp_msvc_frame_leave(c);")
             return L
 
         if m == "PUSHAD":
@@ -2992,12 +3495,11 @@ class Translator(object):
         if m == "CWDE":
             return ["c->r[0] = (uint32_t)(int32_t)(int16_t)c->r[0];"]
         if m in ("LDMXCSR", "STMXCSR"):
-            # The SSE control word. This kit models one rounding mode and
-            # masks every exception, which is what a guest sets it to; a store
-            # hands back exactly that.
+            # Keep guest rounding control per CPU, independently of the host
+            # floating-point environment and the x87 control word.
             if m == "STMXCSR":
-                return [write_op(ops[0], 32, "0x1f80u")]
-            return [";"]
+                return [write_op(ops[0], 32, "sse_mxcsr(c)")]
+            return ["c->mxcsr_xor = %s ^ 0x1f80u;" % read_op(ops[0], 32)]
 
         # ------------------------------------------------------- arith ----
         if m in ("ADD", "ADC", "SUB", "SBB", "CMP"):
@@ -3188,7 +3690,7 @@ class Translator(object):
                     # one; inside another call's argument list it is undefined.
                     L.append("jmp_buf *b_ = recomp_setjmp_prepare(c);")
                     L.append("if (setjmp(*b_) == 0) recomp_setjmp_return(c, 0);")
-                    L.append("else recomp_setjmp_return(c, 1);")
+                    L.append("else recomp_setjmp_return(c, (int32_t)c->r[R_EAX]);")
                 elif t in self.func_addrs:
                     L.append("CALL_FN(%08x);" % t)
                 else:
@@ -3214,6 +3716,9 @@ class Translator(object):
             if RESUMABLE_STACKS:
                 L.append("if (c->eip != %s) return;" % hexlit(nxt))
             self.stats["_call_indirect"] += 1
+            if self.never_returns(ins):
+                self.stats["_noreturn_trap"] += 1
+                L.append("recomp_unknown_call(c, %s); return;" % hexlit(nxt))
             return L
 
         if m == "RET":
@@ -3225,7 +3730,7 @@ class Translator(object):
                 # its own return address and takes the default arm instead.
                 L = ["uint32_t r_ = rd32(c->r[4]); c->r[4] += %du;" % (4 + n),
                      "switch (r_) {"]
-                L.extend("case %s: goto L_%08x;" % (hexlit(t), t)
+                L.extend("case %s: %s" % (hexlit(t), self.goto_label(t, ins.addr))
                          for t in sorted(fn.pushed_continuations))
                 L.extend(["default: c->eip = r_; " + orphan + "recomp_return(c); return;", "}"])
                 return L
@@ -3240,6 +3745,9 @@ class Translator(object):
         # set, and stay traps nobody reaches.
         # MMX first: is_mmx_insn only matches an MMn operand with no XMM one,
         # so the SSE2 path below still takes every xmm form of MOVQ/MOVD.
+        sse = self.emit_sse_float(ins, m, ops)
+        if sse is not None:
+            return sse
         if is_mmx_insn(m, ins.ops):
             return self.emit_mmx(ins, m)
         # Lane-wise integer, logical and unpack forms. Every one of them has
@@ -3325,7 +3833,7 @@ class Translator(object):
         SSE_SCALAR_FORMS = ("MOVSD", "MOVSS", "SQRTSD", "SQRTSS", "MINSD", "MAXSD",
                             "MINSS", "MAXSS", "CVTSI2SD", "CVTSI2SS", "CVTTSD2SI",
                             "CVTTSS2SI", "CVTSD2SS", "CVTSS2SD", "COMISD", "UCOMISD",
-                            "COMISS", "UCOMISS")
+                            "COMISS", "UCOMISS", "CVTSS2SI", "CVTSD2SI")
         # Only MOVSD and MOVSS are shared with another instruction; the rest
         # of these mnemonics are SSE whatever their operands are, and a
         # conversion's source or destination is often memory or a register.
@@ -3335,7 +3843,7 @@ class Translator(object):
             dst, src = ops[0], ops[1]
             # Which host type this form works in. The conversions name both,
             # so they spell their own operands out instead.
-            single = m.endswith("SS") and m not in ("CVTSD2SS",)
+            single = (m.endswith("SS") and m != "CVTSD2SS") or m in ("CVTSS2SI", "CVTTSS2SI")
 
             def scalar(op, as_single):
                 if op.kind == "xmm":
@@ -3363,14 +3871,14 @@ class Translator(object):
                 keep = "<" if m in ("MINSD", "MINSS") else ">"
                 L.append("{ %s a_ = %s, b_ = %s; %s }"
                          % (t, scalar(dst, single), scalar(src, single),
-                            store_scalar(dst, "b_ %s a_ ? a_ : b_" % keep, single)))
+                            store_scalar(dst, "a_ %s b_ ? a_ : b_" % keep, single)))
             elif m in ("COMISD", "UCOMISD", "COMISS", "UCOMISS"):
                 L.append("recomp_comis(c, %s, %s);" % (scalar(dst, single), scalar(src, single)))
             elif m in ("CVTSI2SD", "CVTSI2SS"):
                 L.append(store_scalar(dst, "(%s)(int32_t)%s" % ("float" if single else "double",
                                                                 read_op(src, 32)), single))
-            elif m in ("CVTTSD2SI", "CVTTSS2SI"):
-                L.append(write_op(dst, 32, "(uint32_t)(int32_t)%s" % scalar(src, single)))
+            elif m in ("CVTTSD2SI", "CVTTSS2SI", "CVTSD2SI", "CVTSS2SI"):
+                L.append(write_op(dst, 32, "sse_i32(c, %s, %d)" % (scalar(src, single), m.startswith("CVTT"))))
             elif m == "CVTSD2SS":
                 L.append(store_scalar(dst, "(float)%s" % scalar(src, False), True))
             elif m == "CVTSS2SD":
@@ -3501,15 +4009,28 @@ class Translator(object):
             return
         raise TranslateError("call to %08x, which is outside the image" % t)
 
+    @staticmethod
+    def goto_label(target, source=None):
+        poll = "RECOMP_BACKEDGE(c); " if source is not None and target <= source else ""
+        return poll + "goto L_%08x;" % target
+
     def goto_target(self, fn, t, ins):
+        if untranslated_policy(t):
+            return self.excluded_branch(t)
         if t in fn.index:
-            return ["goto L_%08x;" % t]
+            return [self.goto_label(t, ins.addr)]
         if t in self.func_addrs:
             self.stats["_tailcall"] += 1
             return ["CALL_FN(%08x); return;" % t]
         self.stats["_tailcall_unknown"] += 1
         self.notes.append("%08x: jump to %08x outside any known function" % (ins.addr, t))
         return ["c->eip = %s; recomp_jump(c, %s); return;" % (hexlit(ins.addr), hexlit(t))]
+
+    @staticmethod
+    def excluded_branch(target):
+        if untranslated_policy(target) == "fail":
+            raise TranslateError("direct branch into untranslated range at %08x" % target)
+        return ["recomp_unknown_call(c, %s); return;" % hexlit(target)]
 
     def emit_indirect_jump(self, fn, i, ins, op):
         if i in fn.return_jumps:
@@ -3538,7 +4059,7 @@ class Translator(object):
             L.append("if (t_ >= %s && t_ < %s) {" % (hexlit(fn.insns[0].addr), hexlit(fn.end)))
             L.append("switch (t_) {")
             for t in sorted(fn.addrs - getattr(fn, "dead_addrs", set())):
-                L.append("case %s: goto L_%08x;" % (hexlit(t), t))
+                L.append("case %s: %s" % (hexlit(t), self.goto_label(t, ins.addr)))
             L.extend(["default: break;", "}", "}"])
             self.stats["_jmp_indirect_tail"] += 1
             L.append("c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
@@ -3548,7 +4069,7 @@ class Translator(object):
         L.append("switch (t_) {")
         for t in sorted(set(targets)):
             if t in fn.index:
-                L.append("case %s: goto L_%08x;" % (hexlit(t), t))
+                L.append("case %s: %s" % (hexlit(t), self.goto_label(t, ins.addr)))
             else:
                 L.append("case %s: CALL_FN(%08x); return;" % (hexlit(t), t))
         L.append("default: c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
@@ -3668,6 +4189,68 @@ class Translator(object):
             return ["c->mm[%d] = %s(c->mm[%d], %s, %du);" % (dst.reg, fn, dst.reg, src(ops[1]), bits)]
         return ["c->mm[%d] = %s(c->mm[%d], %s);" % (dst.reg, fn, dst.reg, src(ops[1]))]
 
+    def emit_sse_float(self, ins, m, ops):
+        """SSE1 lane arithmetic and compares. Snapshot inputs before writing a
+        destination that can alias either source (MOVHLPS is a common example)."""
+        math_ops = {"ADDPS":"+", "SUBPS":"-", "MULPS":"*", "DIVPS":"/"}
+        unary = ("SQRTPS", "RSQRTPS", "RCPPS", "RSQRTSS", "RCPSS")
+        compares = ("CMPPS", "CMPSS", "CMPPD", "CMPSD")
+        forms = ("MINPS", "MAXPS", "MOVHLPS", "MOVLHPS", "MOVMSKPS", "CVTPS2PI", "CVTTPS2PI", "CVTPI2PS")
+        if m not in math_ops and m not in unary and m not in compares and m not in forms:
+            return None
+        if m == "CMPSD" and not names_an_xmm(ins):
+            return None
+        dst, src = ops[:2]
+        def lane(op, i):
+            return "c->xmm[%d][%d]" % (op.reg, i) if op.kind == "xmm" else "rd32(%s + %du)" % (addr_expr(op), 4*i)
+        def value(op, i, double=False):
+            if double:
+                return "sse_double((uint64_t)%s | (uint64_t)%s << 32)" % (lane(op,2*i), lane(op,2*i+1))
+            return "sse_float(%s)" % lane(op,i)
+        if m == "MOVMSKPS":
+            return [write_op(dst, 32, " | ".join("((%s >> 31) << %d)" % (lane(src,i),i) for i in range(4)))]
+        if m in ("MOVHLPS", "MOVLHPS"):
+            half = 2 if m == "MOVHLPS" else 0
+            target = 0 if m == "MOVHLPS" else 2
+            return ["uint32_t lo_ = %s, hi_ = %s;" % (lane(src,half),lane(src,half+1)),
+                    "c->xmm[%d][%d] = lo_; c->xmm[%d][%d] = hi_;" % (dst.reg,target,dst.reg,target+1)]
+        if m == "CVTPI2PS":
+            source = "c->mm[%d]" % src.reg if src.kind == "mm" else "rd64(%s)" % addr_expr(src)
+            return ["uint64_t value_ = %s;" % source,
+                    "c->xmm[%d][0] = sse_float_bits((float)(int32_t)value_);" % dst.reg,
+                    "c->xmm[%d][1] = sse_float_bits((float)(int32_t)(value_ >> 32));" % dst.reg,
+                    "c->fpu_tag = 0;"]
+        if m in ("CVTPS2PI", "CVTTPS2PI"):
+            return ["float lo_ = %s, hi_ = %s;" % (value(src,0),value(src,1)),
+                    "uint32_t lo_i_ = sse_i32(c, lo_, %d), hi_i_ = sse_i32(c, hi_, %d);" % ((m == "CVTTPS2PI",)*2),
+                    "c->mm[%d] = (uint64_t)lo_i_ | (uint64_t)hi_i_ << 32;" % dst.reg,
+                    "c->fpu_tag = 0;"]
+        double = m in ("CMPPD", "CMPSD")
+        scalar = m.endswith(("SS", "SD"))
+        count = 1 if scalar else 2 if double else 4
+        kind = "double" if double else "float"
+        L = []
+        for i in range(count):
+            if m not in unary:
+                L.append("%s a%d_ = %s;" % (kind,i,value(dst,i,double)))
+            L.append("%s b%d_ = %s;" % (kind,i,value(src,i,double)))
+        for i in range(count):
+            if m in compares:
+                L.append("uint32_t mask%d_ = sse_compare(a%d_, b%d_, %du);" % (i,i,i,ops[2].imm))
+                for j in range(2 if double else 1):
+                    L.append("c->xmm[%d][%d] = mask%d_;" % (dst.reg,i*(2 if double else 1)+j,i))
+                continue
+            if m in math_ops:
+                result = "a%d_ %s b%d_" % (i,math_ops[m],i)
+            elif m in ("MINPS", "MAXPS"):
+                result = "a%d_ %s b%d_ ? a%d_ : b%d_" % (i,"<" if m == "MINPS" else ">",i,i,i)
+            elif m in ("SQRTPS", "RSQRTPS", "RSQRTSS"):
+                result = ("1.0f / " if m.startswith("RSQRT") else "") + "recomp_sse_sqrtf(b%d_)" % i
+            else:
+                result = "1.0f / b%d_" % i
+            L.append("c->xmm[%d][%d] = sse_float_bits(%s);" % (dst.reg,i,result))
+        return L
+
     def emit_x87(self, fn, ins, m, ops):
         L = []
         st = lambda n: "ST(c, %d)" % n
@@ -3717,7 +4300,7 @@ class Translator(object):
                 L.append("fdrop(c);")
             return L
 
-        if m in ("FIST", "FISTP"):
+        if m in ("FIST", "FISTP", "FISTTP"):
             op = ops[0]
             if op.size == 16:
                 L.append("wr16(%s, (uint16_t)fist_i16(c));" % addr_expr(op))
@@ -3727,7 +4310,9 @@ class Translator(object):
                 L.append("wr64(%s, (uint64_t)fist_i64(c));" % addr_expr(op))
             else:
                 raise TranslateError("bad %s size" % m)
-            if m == "FISTP":
+            if m == "FISTTP":
+                L = [line.replace("fist_i", "fisttp_i") for line in L]
+            if m in ("FISTP", "FISTTP"):
                 L.append("fdrop(c);")
             return L
 
@@ -3899,8 +4484,10 @@ class Translator(object):
             return ["wr16(%s, c->fpu_cw);" % addr_expr(ops[0])]
         if m == "FLDCW":
             return ["x87_set_cw(c, rd16(%s));" % addr_expr(ops[0])]
-        if m == "FFREE":
-            return [";"]
+        if m in ("FFREE", "FFREEP"):
+            return ["ftag_put(c, (c->fpu_top + %du) & 7u, 3u);" % ops[-1].sti] + (["fdrop(c);"] if m == "FFREEP" else [])
+        if m in FCMOVCC:
+            return ["if (%s) fcopy(c, 0, %d);" % (FCMOVCC[m][0], ops[-1].sti)]
         if m in ("FSAVE", "FNSAVE"):
             return ["x87_fnsave(c, %s);" % addr_expr(ops[0])]
         if m == "FRSTOR":
@@ -4033,6 +4620,15 @@ def main():
     ap.add_argument("--module", default=None, metavar="KEY",
                     help="translate the auxiliary module [modules.aux.KEY] instead of the executable")
     args = ap.parse_args()
+    try:
+        trace_addresses = {int(a.strip(),16) for a in os.environ.get("RECOMP_TRACE_DISCOVERY", "").split(",")
+                           if a.strip()}
+    except ValueError:
+        raise TranslateError("RECOMP_TRACE_DISCOVERY requires comma-separated hexadecimal addresses")
+
+    def trace(address, decision):
+        if address in trace_addresses:
+            print("discovery %08x: %s" % (address, decision), file=sys.stderr)
     cfg = game_config.load(args.game)
     configure(cfg)
     if args.module:
@@ -4044,7 +4640,7 @@ def main():
         SYMBOL_PREFIX = "recomp_%s_" % re.sub(r"[^A-Za-z0-9_]", "_", args.as_module)
         AUX_MODULE = {"name": args.as_module, "base": cfg["game"]["image_base"],
                       "size": 0}  # the image's extent, filled in once it is read
-    image = Image(BINARY)
+    image = Image(BINARY, base=AUX_MODULE["base"]) if AUX_MODULE is not None and not args.as_module else Image(BINARY)
     discovered = []
     if args.discovered:
         global EXTRA_ENTRY_POINTS
@@ -4071,16 +4667,19 @@ def main():
               % ", ".join("%08x" % a for a in sorted(forget)), file=sys.stderr)
 
     t0 = time.time()
-    entries = load_functions(set(args.only) if args.only else None)
+    delta = getattr(image, "rebase_delta", 0)
+    selected_listings = {"%08x" % (int(a, 16) - delta) for a in args.only} if args.only else None
+    entries = load_functions(selected_listings)
+    entries = [(addr + delta, name, size, path) for addr, name, size, path in entries]
     all_addrs = set()
     listed_starts = []
     with open(FUNCS_TSV) as fh:
         for l in list(fh)[1:]:
             a = int(l.split("\t")[0], 16)
-            listed_starts.append(a)
+            listed_starts.append(a + delta)
             p = os.path.join(LISTINGS, "%08x.asm" % a)
             if os.path.exists(p) and os.path.getsize(p) > 0:
-                all_addrs.add(a)
+                all_addrs.add(a + delta)
 
     if AUX_MODULE is not None and args.as_module:
         # A module of the image's own code covers the image's addresses; the
@@ -4100,8 +4699,17 @@ def main():
     parsed = []
     failures = []
     for addr, name, nbytes, path in entries:
+        if untranslated_policy(addr):
+            all_addrs.discard(addr)
+            continue
         try:
             insns = parse_listing(path)
+            if delta:
+                insns = image.rebase_listing(insns)
+            insns = [ins for ins in insns if not untranslated_policy(ins.addr)]
+            if not insns:
+                all_addrs.discard(addr)
+                continue
         except TranslateError as e:
             failures.append((addr, "parse: %s" % e))
             continue
@@ -4172,6 +4780,7 @@ def main():
     candidate_entries = set(candidate_starts)
     scan_aliases = set()
     pointer_callees = set()
+    switch_owners = {}
 
     def remember_candidate(target):
         if target not in candidate_entries:
@@ -4196,7 +4805,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     chunks = []
 
-    def accepts(fn, reached=False):
+    def accepts(fn, reached=False, reached_instructions=frozenset()):
         """Can the emitter translate every instruction of this block?
 
         A candidate address that is really data decodes into instructions this
@@ -4206,7 +4815,8 @@ def main():
 
         `reached` says an instruction of a body this translation already
         carries names this block, which is what lets it end on a fall-out
-        into another such entry; see the loop below."""
+        into another such entry. `reached_instructions` applies that evidence
+        only to decoded switch cases, without promoting a speculative prefix."""
         if fn.addr not in protected_entries:
             if image.data[fn.addr - image.base:fn.addr - image.base + 2] == b"\x00\x00":
                 # ADD byte ptr [EAX],AL is data at a speculative function start.
@@ -4237,17 +4847,23 @@ def main():
                 fall = fn.fallthrough[i]
                 if fall in fn.addrs:
                     continue
-                if reached and fall is not None and fall in all_addrs and fall in owner:
+                if ((reached or ins.addr in reached_instructions) and fall is not None
+                        and fall in all_addrs and fall in owner):
                     continue
+                trace(fn.addr, "refused fall-through %08x -> %s (%s, %s, switch=%s, callable=%s)" % (
+                    ins.addr, "%08x" % fall if fall is not None else "none", ins.mnem, fn.name,
+                    ins.addr in reached_instructions, fall in all_addrs and fall in owner))
                 return False
         notes, stats = len(tr.notes), dict(tr.stats)
         try:
             tr.prepare(fn)
             tr.translate(fn)
             return True
-        except TranslateError:
+        except TranslateError as error:
+            trace(fn.addr, "refused emission: %s" % error)
             return False
-        except Exception:                       # noqa: BLE001
+        except Exception as error:              # noqa: BLE001
+            trace(fn.addr, "refused preparation: %s: %s" % (type(error).__name__, error))
             return False
         finally:
             del tr.notes[notes:]
@@ -4401,9 +5017,9 @@ def main():
     def protected_source(home):
         return home is not None and home.addr in protected_entries
 
-    def resolve(t, listed, home=None, validate=True, why="branch", continuation=True):
+    def resolve_candidate(t, listed, home=None, validate=True, why="branch", continuation=True):
         """Make `t` an entry point.  Returns True if that changed anything."""
-        if t is None:
+        if t is None or untranslated_policy(t):
             return False
         strength = (3 if why in STRUCTURAL_PROVENANCE else
                     2 if why == "branch" and home is not None
@@ -4423,7 +5039,8 @@ def main():
             return False
         # Branches already inside the current body are its own control flow,
         # not independently proposed function starts.
-        own_interior = home is not None and t in home.addrs
+        own_interior = ((home is not None and t in home.addrs)
+                        or (t in switch_owners and owner.get(t) is switch_owners[t]))
         independent = why != "branch" or protected_source(home)
         if (t in scan_aliases and t in owner
                 and entry_strength.get(owner[t].addr, 0) > strength):
@@ -4487,6 +5104,7 @@ def main():
                 provenance[t] = why
             return True
         bounds = None
+        switch_owned, direct_targets = set(), set()
         boundaries = set()
         recovery_stops = listed - prior.addrs if separate else listed
         if protected and why == "config":
@@ -4503,6 +5121,14 @@ def main():
             section_end = next((end for lo, end, _ in image.exec_ranges if lo <= t < end), t)
             span_index = bisect_right(listed_starts, t) - 1
             span_end = span_ends[listed_starts[span_index]] if span_index >= 0 else section_end
+            # A listing starting in this first opcode cannot delimit a method.
+            # Only skip that impossible boundary; a real later entry retains
+            # its normal claim, and the completed body still has to validate.
+            first_end = image.insn_end(t, "") or t+1
+            if span_end < first_end:
+                next_index = bisect_right(listed_starts, first_end-1)
+                span_end = min(section_end, listed_starts[next_index]
+                               if next_index < len(listed_starts) else section_end)
             bounds = (t, min(section_end, span_end))
             # PUSH-named continuations and SEH landings retain body ownership;
             # their callable aliases are not new function-start boundaries.
@@ -4510,12 +5136,33 @@ def main():
             # ordinary content/terminator checks and the final pruning gate.
             probe = image.recover(t, recovery_stops, bounds=bounds)
             continuations, attempted, owned = set(), set(), set()
+            switch_targets, switch_owned = set(), set()
             fragments = {ins.addr: ins for ins in probe}
             while fragments:
                 probe_fn = Function(t, "candidate", 0, [fragments[a] for a in sorted(fragments)])
                 probe_fn.measure(image)
+                # Discover this method's own tables before relocated case
+                # labels can become competing function-start boundaries.
+                try:
+                    tr.prepare(probe_fn)
+                except TranslateError:
+                    pass
+                has_switch = False
+                for (entry, _site), targets in list(tr.jumptables.items()):
+                    if entry == t:
+                        has_switch = True
+                        switch_targets.update(a for a in targets if t < a < bounds[1])
+                        continuations.update(switch_targets)
                 stubs = set(seh_frame_sites(probe_fn, image).values())
                 for ins in probe_fn.insns:
+                    # A switch default can already be in the initial probe.
+                    # Keep its verified branch edge before pointer aliases
+                    # can split it away from cases falling into that tail.
+                    if has_switch and ins.mnem not in ("CALL", "JMP"):
+                        branch = Translator.branch_target(ins)
+                        if branch in probe_fn.addrs and t < branch < bounds[1]:
+                            direct_targets.add(branch)
+                            continuations.add(branch)
                     if ins.mnem == "PUSH" and ins.ops:
                         op = parse_operand(ins.ops[0])
                         if op.kind == "imm" and t < op.imm < bounds[1]:
@@ -4535,21 +5182,38 @@ def main():
                     # Recover its clean span-bounded bytes before judging the
                     # establishing prefix's termination, then let normal
                     # adoption transfer ownership without promoting the prefix.
-                    block = image.recover(target, stubs, bounds=bounds)
+                    # A default can also occupy a table slot. Recover its
+                    # whole tail even when the initial probe already contains
+                    # its entry, so a weaker pointer cannot split it away.
+                    case_stops = set(fragments) if target in switch_targets and target not in direct_targets else set()
+                    block = image.recover(target, stubs | case_stops, bounds=bounds)
                     fragment = Function(target, "continuation", 0, block)
                     fragment.measure(image)
-                    if not block or not accepts(fragment):
+                    merged = dict(fragments)
+                    merged.update((ins.addr, ins) for ins in block)
+                    combined = Function(t, "candidate", 0, [merged[a] for a in sorted(merged)])
+                    combined.measure(image)
+                    reached_insns = (switch_owned | fragment.addrs if target in switch_targets else
+                                     fragment.addrs if target in direct_targets else frozenset())
+                    if not block or not accepts(combined if target in switch_targets else fragment,
+                                                reached_instructions=reached_insns):
                         continue
+                    if target in switch_targets:
+                        switch_owned.update(ins.addr for ins in block)
                     owned.update(ins.addr for ins in block)
                     fragments.update((ins.addr, ins) for ins in block)
             if owned:
                 recovery_stops = set(recovery_stops) - owned
             lo_index, hi_index = bisect_right(candidate_starts, t), bisect_right(candidate_starts, bounds[1])
             boundaries = {a for a in candidate_starts[lo_index:hi_index]
-                          if a not in owned and a not in finally_owners}
+                          if a not in owned and a not in finally_owners and a >= first_end}
         insns = image.recover(t, recovery_stops, bounds=bounds, boundaries=boundaries)
         if not insns:
             return False
+        if not protected and switch_owned:
+            merged = {ins.addr: ins for ins in insns}
+            merged.update((a, fragments[a]) for a in switch_owned)
+            insns = [merged[a] for a in sorted(merged)]
         name = ("FUN_%08x" if why == "config" else "recovered_%08x") % t
         new_fn = Function(t, name, insns[-1].addr + 1 - t, insns)
         new_fn.measure(image)
@@ -4567,7 +5231,7 @@ def main():
         # translation already carries names it, which is what lets it end on
         # a fall-out into another entry; see `accepts`.
         reached = home is not None
-        if validate and not accepts(new_fn, reached=reached):
+        if validate and not accepts(new_fn, reached=reached, reached_instructions=switch_owned):
             # Two different things can have refused the body, so there are two
             # ways back, on separate axes: which boundaries may cut a body, and
             # which fall-outs are acceptable. `reached` above answers the
@@ -4631,7 +5295,7 @@ def main():
                     retry_fn = candidate
             # The wider body is judged by the same rule as the first one: a
             # block a branch reached may still end in another entry.
-            if retry_fn is not None and accepts(retry_fn, reached=reached):
+            if retry_fn is not None and accepts(retry_fn, reached=reached, reached_instructions=switch_owned):
                 new_fn = retry_fn
             else:
                 # Decoded into something this compiler never emits, so the
@@ -4644,6 +5308,9 @@ def main():
         recovered.append(new_fn)
         all_addrs.add(t)
         register(new_fn)
+        if not protected:
+            for target in (switch_targets | direct_targets) & new_fn.addrs:
+                switch_owners[target] = new_fn
         if separate:
             extra.pop(t, None)
             for ins in new_fn.insns:
@@ -4651,7 +5318,63 @@ def main():
                     owner[ins.addr] = new_fn
         return True
 
+    def resolve(t, listed, home=None, validate=True, why="branch", continuation=True):
+        trace(t, "consider %s from %s" % (why, "%08x" % home.addr if home else "scan"))
+        changed = resolve_candidate(t, listed, home, validate, why, continuation)
+        existing = owner.get(t)
+        trace(t, "%s; owner=%s evidence=%s strength=%d%s" % (
+            "changed" if changed else "unchanged",
+            "%08x" % existing.addr if existing else "none", provenance.get(t,"none"),
+            entry_strength.get(t,0), " rejected" if t in rejected else ""))
+        return changed
+
     retired_finally_bodies = set()
+
+    def extend_switch_body(fn):
+        """Adopt clean omitted cases, stopping at every existing instruction.
+
+        A case can fall into this body's listed tail. It must never consume
+        another body or an opcode interior, even when a large listed extent
+        permits a case much farther away than the near-entry recovery window.
+        """
+        changed = False
+        ceiling = max(fn.end, fn.addr + 0x10000)
+        for (entry, _site), targets in list(tr.jumptables.items()):
+            if entry != fn.addr:
+                continue
+            for target in sorted(set(targets)):
+                if (target in owner or not min(fn.addr, fn.insns[0].addr) <= target < ceiling
+                        or interior_bytes[target - image.base]):
+                    continue
+                block = image.recover(target, set(owner),
+                                      bounds=(min(fn.addr, fn.insns[0].addr), min(ceiling, image.end)))
+                if not block:
+                    continue
+                if any(interior_bytes[ins.addr - image.base] or any(
+                        address in owner or interior_bytes[address - image.base]
+                        for address in range(ins.addr, image.insn_end(ins.addr, ins.mnem) or ins.addr+1))
+                       for ins in block):
+                    continue
+                merged = {ins.addr: ins for ins in fn.insns}
+                merged.update((ins.addr, ins) for ins in block)
+                grown = Function(fn.addr, fn.name, fn.size, [merged[a] for a in sorted(merged)])
+                grown.measure(image)
+                # A decoded switch edge proves this case. Its tail may fall
+                # into an existing callable instruction boundary, as well
+                # as this function; arbitrary scan prefixes still cannot.
+                if any(ins.mnem not in TERMINATORS and not tr.never_returns(ins)
+                       and grown.fallthrough[i] not in grown.addrs
+                       and not (grown.fallthrough[i] in all_addrs and grown.fallthrough[i] in owner)
+                       for i, ins in enumerate(grown.insns) if ins.addr not in fn.addrs):
+                    continue
+                if not accepts(grown, reached_instructions={ins.addr for ins in block}):
+                    continue
+                fn.__dict__.update(grown.__dict__)
+                register(fn)
+                switch_owners[target] = fn
+                trace(target, "adopted as local case in %08x (%d instructions)" % (fn.addr,len(block)))
+                changed = True
+        return changed
 
     def extend_finally_body(fn):
         """Keep normal cleanup and its pushed epilogue in the establishing body.
@@ -4866,6 +5589,9 @@ def main():
         changed = False
         for fn in list(parsed):
             if fn not in retired_finally_bodies:
+                changed |= extend_switch_body(fn)
+        for fn in list(parsed):
+            if fn not in retired_finally_bodies:
                 changed |= extend_finally_body(fn)
         listed = set(owner)
         # Seed omitted exception blocks before ordinary branch/immediate
@@ -4879,6 +5605,9 @@ def main():
                 if stub in seh_stubs:
                     continue
                 seh_stubs.add(stub)
+                msvc = image.msvc_func_info(stub)
+                if msvc is not None:
+                    tr.table_ranges.update(msvc["ranges"])
                 # The handler is a function whatever its shape: MSVC's is an
                 # ordinary routine the prologue pushes. Adopt it first, then
                 # look for a Delphi landing block behind it.
@@ -5283,6 +6012,7 @@ def main():
                     if nxt in owner and nxt not in starts:
                         extra[nxt] = owner[nxt]
 
+    extra = intrinsic_alternates_removed(extra)
     entries_by_fn = defaultdict(set)
     for t, fn in extra.items():
         entries_by_fn[fn.addr].add(t)
@@ -5554,6 +6284,7 @@ def main():
         ok = [fn for fn in ok if fn.addr in seeds]
         bodies = {a: b for a, b in bodies.items() if a in seeds}
         extra = {t: f for t, f in extra.items() if f.addr in seeds}
+    extra = intrinsic_alternates_removed(extra)
     entry_names = sorted(set([fn.addr for fn in ok])
                          | set(t for t, f in extra.items() if f.addr in bodies))
     if args.as_module:
@@ -5683,7 +6414,7 @@ def main():
     with open(os.path.join(args.out, "funcs.h"), "w") as fh:
         fh.write("/* generated by tools/recomp/translate.py -- do not edit */\n")
         fh.write("#ifndef RECOMP_FUNCS_H\n#define RECOMP_FUNCS_H\n")
-        fh.write('#include "x86.h"\n#include "intrinsics.h"\n#include "seh.h"\n')
+        fh.write('#include "x86.h"\n#include "intrinsics.h"\n#include "seh.h"\n#include "msvc_eh.h"\n')
         fh.write("/* Task 8 replacements: define FN_<addr> to a native function in a\n"
                  " * header named by RECOMP_OVERRIDE_HEADER and every direct call site,\n"
                  " * tail call and jump-table case for that address is redirected. */\n")

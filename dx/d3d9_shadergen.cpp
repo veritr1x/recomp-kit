@@ -161,6 +161,7 @@ struct Gen {
     std::set<uint32_t> stages; // sampler stages read
     uint32_t color_outputs = 0;
     bool writes_depth = false;
+    bool uses_face = false;
     PixelVariant variant;
     int depth = 0;      // open loops and ifs
     int loop_depth = 0; // open rep/loop blocks, for break
@@ -317,6 +318,15 @@ struct Gen {
         }
         case R_LOOP:
             return F4 + (wgsl() ? "(f32(aL))" : "(float(aL))");
+        case R_MISC:
+            if (!p.pixel || p.major != 3 || glsl() || wgsl() || s.index > 1) {
+                fail("miscellaneous pixel registers require Shader Model 3 on Metal");
+                return F4 + "(0.0)";
+            }
+            if (s.index == 0)
+                return "float4(vin.pos.xy - float2(0.5), 0.0, 0.0)";
+            uses_face = true;
+            return "float4(d9_front ? 1.0 : -1.0)";
         default:
             fail("source register type " + std::to_string(s.type));
             return F4 + "(0.0)";
@@ -562,6 +572,17 @@ struct Gen {
             return;
         case OP_DP2ADD:
             write(in.dst, F4 + "(dot((" + S(0) + ").xy, (" + S(1) + ").xy) + (" + S(2) + ").x)");
+            return;
+        case OP_DSX:
+        case OP_DSY:
+            if (!p.pixel) {
+                fail("screen derivatives require a pixel shader");
+                return;
+            }
+            write(in.dst, std::string(glsl()   ? (in.op == OP_DSX ? "dFdx" : "dFdy")
+                                      : wgsl() ? (in.op == OP_DSX ? "dpdx" : "dpdy")
+                                               : (in.op == OP_DSX ? "dfdx" : "dfdy")) +
+                              "(" + S(0) + ")");
             return;
         case OP_RCP:
             write(in.dst, F4 + "(1.0 / (" + S(0) + ").x)");
@@ -919,6 +940,8 @@ bool pixel_source(const Program &p, const PixelVariant &v, std::string *out, std
     s += "};\n";
     s += "fragment D9PSOut ps_main(D9V2F vin [[stage_in]], constant float4 *c [[buffer(0)]],\n"
          "                         constant D9PSParams &P [[buffer(1)]]";
+    if (g.uses_face)
+        s += ", bool d9_front [[front_facing]]";
     for (uint32_t st : g.stages) {
         const char *type = g.kind_of(st) == S_CUBE ? "texturecube<float>"
                            : g.is_depth(st)        ? "depth2d<float>"

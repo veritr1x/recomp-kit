@@ -22,6 +22,8 @@ uint32_t recomp_seh_pending_target(void);
 void recomp_seh_intercept(X86 *c, uint32_t target);
 /* Verbose-only, bounded validation. Logs the first failure and last good point. */
 void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail);
+/* x86 integer/control CONTEXT for another guest exception dispatcher. */
+void recomp_seh_capture_context(X86 *c, uint32_t context);
 
 /* Context reuse/teardown on its owning host thread; NULL drops all its state. */
 void recomp_seh_reset(X86 *c);

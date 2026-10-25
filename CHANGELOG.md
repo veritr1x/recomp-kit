@@ -2,6 +2,151 @@
 
 ## Unreleased
 
+- Accept Windows CRLF line endings in smoke scripts, including blank lines
+  and a final line without LF, while retaining strict numeric parsing.
+
+- Report the per-key press edge from GetAsyncKeyState alongside its current
+  down state, including a press released between polls. Polling consumes the
+  edge; repeated down events do not create another press.
+
+- Keep Windows fault handling noninteractive after installing the kit's
+  diagnostics, so an intentional abort cannot wait on a crash-report dialog.
+
+- Keep pointer-discovered switch methods callable when cases share a listed
+  tail or the default also appears in the jump table. Preserve the verified
+  default body before weaker pointer candidates can split it away.
+
+- Preserve downstream ports whose auxiliary DLLs load above the runtime memory
+  regions. Derive a separate layout ceiling below the first high DLL while
+  retaining the full guarded arena; keep heap, stacks, mod memory and import
+  shims out of those module ranges. Validate both low and high module layouts.
+
+- Add OpenAL playback contexts, shared buffers, sources and queues over the
+  host mixer, with clock-driven progress, distance/pan approximation and
+  stable pitch/pan updates. Extend Bink with checked memory windows, SDK
+  frame-buffer planes, rewind/forward seek, full summary/realtime records and
+  opt-in `[bink] record = "sdk"`. This addresses the OpenAL/Bink portions of #32;
+  Epic's modified vorbisfile ABI still needs its five-argument signature.
+
+- Serve VC8 CRT memory, narrow/wide strings, numeric conversions, floating-point
+  control, bounded guest printf/scanf arguments, profile-backed files, startup
+  data, environment, locale/ctype, exit tables, threads and time. Implement the
+  28-byte VC8 char/wchar_t basic_string ABI with safe overlapping mutations and
+  catchable allocation/length/position errors. Required unsupported CRT imports
+  stop with their own name; optional missing export probes still return null.
+  Preserve Unicode argv and environment values across CRT/Win32 wide APIs.
+  Discover DLL CRT initializer tables through IAT calls and jump thunks. Fixes #25.
+
+- Handle VC8 C++ throws, typed/reference/value catches, catch copies, nested
+  cleanups, rethrows and continuation transfer with live translated checkpoints.
+  Model the VC8 std::exception layout and RTTI, type_info destruction and
+  uncaught_exception. Retire checkpoints on longjmp and thread teardown;
+  preserve full longjmp results. Reject stale checkpoints, foreign native
+  callback unwinds and unsupported matching tries inside catch bodies by name.
+  Fixes #24.
+
+- Warm accepted D3D9 shaders and saved pipeline descriptions on two Metal
+  workers, with one build shared by workers and first-use draws. Keep validated
+  session hints in the profile through atomic whole-file replacement, recover
+  damaged lines, and ignore stale shader roles. Canonical pipeline keys avoid
+  redundant declaration ids and inactive alpha state. Add warm-up and slow-frame
+  compile diagnostics; `RECOMP_D3D9_WARM=0` disables warming. Fixes #33.
+
+- Implement Direct3D 9 shader objects with bounded bytecode copies, shared
+  binding storage, GetFunction/GetDevice and reference-safe teardown. Return
+  device creation parameters and retain per-stream instance frequencies.
+  Draw instances across CPU streams 1-7 and GPU layouts; Metal supports
+  instance dividers above one, while Vulkan/WebGPU skip unsupported dividers
+  explicitly. Generate Metal SM3 pixel position/face inputs and screen
+  derivatives; derivatives also render on Vulkan. Tiny render targets no
+  longer determine the render-scale base. Fixes #31.
+
+- Reserve the native 32-bit guest address range with an inaccessible upper
+  guard and derive runtime regions from the configured arena size. Enable
+  optional null-page faults in Debug builds, gate environment-selected native
+  libraries behind an explicit developer build option, and require an overlay
+  for guest writes. Canonical paths stay within their configured roots; user
+  mods require an absolute opt-in path. Web pages enforce a strict CSP and an
+  empty-by-default environment-switch allowlist. macOS app signing enables the
+  hardened runtime; tooling and fetched native dependencies use hashed pins.
+  Fixes #34.
+
+- Keep detached and undisassembled switch cases in their owning function,
+  including cases beyond 64 KB within its listed extent. Follow guarded EBP
+  locals, reject bounds bypassed by branches, recover pointer-named methods
+  before their own case labels can split them, and terminate calls through
+  exit import slots. Add discovery tracing and explicit untranslated ranges.
+  Fixes #27.
+
+- Route window and thread messages to their receiving guest thread, including
+  WM_QUIT and PostThreadMessageA/W. Fix dotless file searches, align fresh
+  VirtualAlloc reservations to 64 KB, and serve computer-name, temporary-path
+  and CommandLineToArgvW startup calls. Quote executable paths with spaces,
+  accept debugger thread-name notifications and use the full shim region.
+  Fixes #30.
+
+- Give each cooperative guest thread its own scheduler condition and wake
+  the next baton holder directly. Translated backward branches poll every
+  4096 iterations so import-free loops let workers run; atomic stretches
+  remain protected. Waited-on timers contribute deadlines, host signals
+  drain only with guest ownership, and helper GetMessage loops avoid host
+  frame services. Fixes #29.
+
+- Model packed SSE1 arithmetic, reciprocal/square-root, comparisons, lane
+  moves and MMX conversions used without a CPUID check. Correct scalar
+  min/max and float-to-int results, preserve MXCSR rounding control, and
+  implement x87 FISTTP, conditional moves and free-register tags. Unlisted
+  SSE memory operands and FPU environments now recover correctly. Fixes #26.
+
+- Relocate auxiliary PE32 DLLs to configured load bases with validated
+  HIGHLOW relocations in both translator and loader. Map every module before
+  binding imports, attach imported DLLs before their dependents, retain their
+  references until unload, and pin static EXE imports before TLS/entry.
+  Failed attaches unwind dependencies. Auxiliary ranges must be 64 KB
+  aligned, non-overlapping and below the guest heap. Fixes #28.
+
+- Support `[game] exe_dir = "Binaries"` (including nested folders). Runtime
+  paths and DLL names retain the executable's folder while game data,
+  launcher imports, setup links and mobile/web staging use the enclosing
+  installation root. Normalize `.`/`..` in Windows full paths and current
+  directories; mismatched installs retain the legacy layout. Fixes #35.
+
+- Let ports configure desktop size and physical memory in `[system]`, and
+  GPU identity/video memory in `[d3d9.adapter]`. Direct3D 9 lists 17 display
+  modes and rejects invalid enumeration indices. USER32, GDI and D3D9
+  share the desktop mode; DirectDraw reports configured video memory while
+  D3D texture memory retains a 256 MB floor. Fixes #36.
+
+- Correct CPU Direct3D 9 depth testing and clears, integer pixel centres,
+  shared-edge fill, alpha comparisons, blending and color masks. Point and
+  linear sampling respect clamp, mirror, mirror-once and border colors;
+  pre-transformed draws clip to the viewport. Fixes #21.
+
+- Let a port name its CRT `setjmp`/`longjmp` pair in
+  `[translate] intrinsics = { setjmp = ..., longjmp = ... }`. Direct setjmp
+  calls save the host frame in the caller, and substituted bodies export no
+  invalid alternate entries. Auxiliary modules do not inherit EXE addresses.
+  Fixes #19.
+
+- Recover jump-table targets before a function's entry when its listing
+  starts earlier, and decode byte index tables guarded through a LEA-derived
+  bound. Register-clobber checks prevent stale bounds. Fixes #18.
+
+- Keep decoded opcode bytes and relative CALL/JMP/Jcc operands out of the
+  translator's data-pointer scan. Accidental address-shaped encodings no
+  longer invent entries that split real functions; absolute address
+  immediates and data pointers remain discoverable. Fixes #17.
+
+- Add `[controls.native] attached_only = true` to expose the native DirectInput
+  and XInput pad only while a physical controller is connected. It defaults
+  to false, preserving existing virtual-pad behavior. Fixes #14.
+
+- Add `[system] mm_timers = "thread"` for multimedia callbacks on a runtime
+  cooperative guest worker, including event timers. Games can wait for a timer
+  before entering their message loop. The default remains `"message_loop"`.
+  Thread mode preserves periodic cadence, honors pinned time and stops before
+  host shutdown. Fixes #16.
+
 - Add a Direct3D 8 frontend with version 8 interfaces and structure layouts,
   FVF and vertex-declaration conversion, vs_1_1/ps_1_1 shader handles, and
   generated unlit fixed-function programs shared by the CPU and GPU renderers.

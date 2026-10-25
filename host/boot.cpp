@@ -436,7 +436,7 @@ void fault_handler(const char *name) {
 // consulted first, so a module can only answer for addresses the build did
 // not carry. Desktop only: iOS runs no code that was not signed into the app.
 void load_extra_code() {
-    const char *list = recomp_env("EXTRA_CODE");
+    const char *list = recomp_dev_env("EXTRA_CODE");
     if (!list || !*list)
         return;
     std::string paths(list);
@@ -505,6 +505,7 @@ bool boot_load(const BootOptions &opts) {
     // are real, and before the entry point, so a hook is installed before the
     // code it hooks can run.
     const bool mods_enabled = g_opt.load_mods && !recomp_env("NO_MODS");
+    mods_overlay_reset(); // Saves retain a writable profile even with mods disabled.
     bool page_enabled = false;
     if (mods_enabled) {
         // The host-only APIs belong to the thread that boots.
@@ -576,6 +577,7 @@ void boot_run() {
         mods_write_run_record(host_state_file("mods/run.json").c_str());
 
     mods_shutdown_request();
+    host_stop_mm_timer_thread();
     // The abandoned frames go FIRST, and unconditionally: this thread has left
     // guest code, so any mod invocation still recorded for it was abandoned by
     // a longjmp - a guest ExitProcess inside a hooked call is the case that

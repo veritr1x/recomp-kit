@@ -605,6 +605,7 @@ void dx_register_shims() {
     soundlib_register();
     galaxy_stub_register();
     bink_register();
+    openal_register();
     weanetr_register();
     mf_register();
     // The audio shims need a tick on the main guest thread: the game drives
@@ -637,6 +638,7 @@ void dx_reset() {
     dshow_reset();
     dinput_reset();
     bink_reset();
+    openal_reset();
     mf_reset();
     audio_channels().clear();
     com_reset();

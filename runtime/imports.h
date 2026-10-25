@@ -89,6 +89,9 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
 // guest memory the first time, and 0 when dll!name is not a known data import.
 // ---------------------------------------------------------------------------
 void imports_register_data(const char *dll, const char *name, uint32_t size);
+// Initialize once per arena allocation. A prefix supports RTTI vtable[-1].
+void imports_register_data_init(const char *dll, const char *name, uint32_t size,
+                                void (*init)(uint32_t), uint32_t prefix = 0);
 uint32_t imports_alloc_data(const char *dll, const char *name);
 uint32_t imports_data_address(const char *dll, const char *name);
 uint32_t imports_data_count();
@@ -114,6 +117,8 @@ static inline bool imports_is_trampoline(uint32_t a) {
 }
 // "DLL!name" for a trampoline address, or nullptr.
 const char *imports_describe(uint32_t target);
+// Description of the import currently executing on this native thread.
+const char *imports_current_description();
 // Stdcall argument count for an allocated trampoline, or 0 otherwise.
 uint8_t imports_argc(uint32_t trampoline);
 

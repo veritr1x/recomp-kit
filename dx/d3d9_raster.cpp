@@ -10,6 +10,7 @@
 #include "com.h"
 #include "d3d9_pipeline.h"
 #include "d3d9_shader.h"
+#include "host_d9.h"
 #include "../runtime/guest.h"
 
 #include <algorithm>
@@ -193,20 +194,6 @@ const Decoded *texture_rgba(uint32_t texture_id) {
     return &(decoded()[level0] = std::move(d));
 }
 
-float wrap_coord(float t, uint32_t mode) {
-    switch (mode) {
-    case 3: // clamp
-    case 4: // border, treated as clamp
-        return std::min(std::max(t, 0.0f), 1.0f);
-    case 2: { // mirror
-        float f = t - 2.0f * std::floor(t / 2.0f);
-        return f > 1.0f ? 2.0f - f : f;
-    }
-    default: // wrap
-        return t - std::floor(t);
-    }
-}
-
 V4 sample(const D9Pipeline &pl, uint32_t stage, const V4 &uv) {
     V4 out;
     out[0] = out[1] = out[2] = out[3] = 1.0f;
@@ -217,17 +204,56 @@ V4 sample(const D9Pipeline &pl, uint32_t stage, const V4 &uv) {
         out[0] = out[1] = out[2] = 0.0f;
         return out;
     }
+    if (!t->width || !t->height || !std::isfinite(uv[0]) || !std::isfinite(uv[1]))
+        return V4{};
     uint32_t au = pl.sampler_state[stage][1], av = pl.sampler_state[stage][2];
-    float u = wrap_coord(uv[0], au) * t->width - 0.5f;
-    float v = wrap_coord(uv[1], av) * t->height - 0.5f;
+    auto coordinate = [](float value, uint32_t mode) {
+        if (mode == 5)
+            return std::min(std::fabs(value), 1.0f); // MIRRORONCE
+        if (mode == 3)
+            return std::clamp(value, 0.0f, 1.0f);
+        if (mode == 2) {
+            float f = value - 2 * std::floor(value / 2);
+            return f > 1 ? 2 - f : f;
+        }
+        if (mode == 1 || !mode)
+            return value - std::floor(value);
+        return std::clamp(value, -1.0f, 2.0f); // distant BORDER taps stay outside
+    };
+    const float cu = coordinate(uv[0], au), cv = coordinate(uv[1], av);
+    float u = cu * t->width - 0.5f, v = cv * t->height - 0.5f;
     int x0 = (int)std::floor(u), y0 = (int)std::floor(v);
     float fx = u - x0, fy = v - y0;
+    auto address = [](int value, int size, uint32_t mode) {
+        if (mode == 4)
+            return value < 0 || value >= size ? -1 : value;
+        if (mode == 3 || mode == 5)
+            return std::clamp(value, 0, size - 1);
+        if (mode == 2) {
+            value = (value % (size * 2) + size * 2) % (size * 2);
+            return value < size ? value : 2 * size - 1 - value;
+        }
+        return (value % size + size) % size;
+    };
     auto texel = [&](int x, int y, int k) -> float {
-        x = ((x % (int)t->width) + (int)t->width) % (int)t->width;
-        y = ((y % (int)t->height) + (int)t->height) % (int)t->height;
+        x = address(x, int(t->width), au);
+        y = address(y, int(t->height), av);
+        if (x < 0 || y < 0) {
+            const int shifts[] = {16, 8, 0, 24};
+            return ((pl.sampler_state[stage][4] >> shifts[k]) & 255) / 255.0f;
+        }
         return t->rgba[((size_t)y * t->width + (size_t)x) * 4 + k] / 255.0f;
     };
     for (int k = 0; k < 4; ++k) {
+        if (pl.sampler_state[stage][5] == 1) {
+            int x = int(std::floor(cu * t->width)), y = int(std::floor(cv * t->height));
+            if (au == 4 && cu == 1)
+                x = int(t->width) - 1;
+            if (av == 4 && cv == 1)
+                y = int(t->height) - 1;
+            out[k] = texel(x, y, k);
+            continue;
+        }
         float a = texel(x0, y0, k) * (1 - fx) + texel(x0 + 1, y0, k) * fx;
         float b = texel(x0, y0 + 1, k) * (1 - fx) + texel(x0 + 1, y0 + 1, k) * fx;
         out[k] = a * (1 - fy) + b * fy;
@@ -661,7 +687,7 @@ struct Machine {
 // Vertex fetch
 // ---------------------------------------------------------------------------
 struct Elem {
-    uint16_t offset;
+    uint16_t offset, stream;
     uint8_t type, usage, index;
 };
 
@@ -671,12 +697,20 @@ std::vector<Elem> elements(const std::vector<uint8_t> &decl) {
         uint16_t stream = (uint16_t)(decl[i] | decl[i + 1] << 8);
         if (stream == 0xff)
             break;
-        if (stream != 0)
+        if (stream >= 8)
             continue;
-        out.push_back(Elem{(uint16_t)(decl[i + 2] | decl[i + 3] << 8), decl[i + 4], decl[i + 6],
-                           decl[i + 7]});
+        out.push_back(Elem{(uint16_t)(decl[i + 2] | decl[i + 3] << 8), stream, decl[i + 4],
+                           decl[i + 6], decl[i + 7]});
     }
     return out;
+}
+
+uint32_t element_bytes(uint8_t type) {
+    if (type <= 3)
+        return 4u * (type + 1u);
+    if (type == 4 || type == 5 || type == 6 || type == 8)
+        return 4;
+    return type == 7 ? 8 : 0;
 }
 
 V4 fetch(const uint8_t *vp, const Elem &e) {
@@ -741,7 +775,7 @@ struct Out {
 // ---------------------------------------------------------------------------
 // Rasterization
 // ---------------------------------------------------------------------------
-float blend_factor(uint32_t mode, const V4 &src, const float dst[4], int k) {
+float blend_factor(uint32_t mode, const V4 &src, const float dst[4], int k, uint32_t constant) {
     switch (mode) {
     case 1:
         return 0.0f; // ZERO
@@ -763,15 +797,185 @@ float blend_factor(uint32_t mode, const V4 &src, const float dst[4], int k) {
         return dst[k]; // DESTCOLOR
     case 10:
         return 1.0f - dst[k]; // INVDESTCOLOR
+    case 11:
+        return k == 3 ? 1.0f : std::min(src[3], 1.0f - dst[3]);
+    case 14:
+    case 15: {
+        const int shifts[] = {16, 8, 0, 24};
+        const float factor = ((constant >> shifts[k]) & 255) / 255.0f;
+        return mode == 14 ? factor : 1.0f - factor;
+    }
     default:
         return 1.0f;
     }
 }
 
+template <class T> bool compare(uint32_t mode, T a, T b) {
+    switch (mode) {
+    case 1:
+        return false;
+    case 2:
+        return a < b;
+    case 3:
+        return a == b;
+    case 4:
+        return a <= b;
+    case 5:
+        return a > b;
+    case 6:
+        return a != b;
+    case 7:
+        return a >= b;
+    case 8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Keep depth in the surface's actual storage so Clear, locks and subsequent
+// draws observe one value. Integer formats compare quantized fragment values;
+// stencil/unused bits survive a depth-only write.
+struct Depth {
+    D9SurfaceInfo surface;
+    uint32_t bytes = 0, bits = 0, shift = 0, stencil_mask = 0;
+    bool floating = false;
+    bool load(uint32_t id) {
+        if (!d9_surface_info(id, &surface) || !surface.data)
+            return false;
+        switch (surface.format) {
+        case 70:
+        case 80:
+            bytes = 2;
+            bits = 16;
+            break;
+        case 73:
+            bytes = 2;
+            bits = 15;
+            shift = 1;
+            stencil_mask = 1;
+            break;
+        case 71:
+            bytes = 4;
+            bits = 32;
+            break;
+        case 75:
+            bytes = 4;
+            bits = 24;
+            shift = 8;
+            stencil_mask = 255;
+            break;
+        case 77:
+            bytes = 4;
+            bits = 24;
+            shift = 8;
+            break;
+        case 79:
+            bytes = 4;
+            bits = 24;
+            shift = 8;
+            stencil_mask = 15;
+            break;
+        case 82:
+            bytes = 4;
+            floating = true;
+            break;
+        default:
+            return false;
+        }
+        return surface.pitch >= uint64_t(surface.width) * bytes &&
+               surface.size >= uint64_t(surface.pitch) * surface.height;
+    }
+    uint8_t *at(uint32_t x, uint32_t y) const {
+        return surface.data + size_t(y) * surface.pitch + size_t(x) * bytes;
+    }
+    uint32_t raw(const uint8_t *p) const {
+        uint32_t value = 0;
+        std::memcpy(&value, p, bytes);
+        return value;
+    }
+    uint32_t mask() const {
+        return bits == 32 ? 0xffffffffu : ((1u << bits) - 1);
+    }
+    double value(const uint8_t *p) const {
+        if (floating) {
+            float z;
+            std::memcpy(&z, p, 4);
+            return z;
+        }
+        return (raw(p) >> shift) & mask();
+    }
+    double fragment(float z) const {
+        return floating ? double(z) : std::floor(double(std::clamp(z, 0.0f, 1.0f)) * mask() + 0.5);
+    }
+    void write(uint8_t *p, double z) const {
+        if (floating) {
+            float f = float(z);
+            std::memcpy(p, &f, 4);
+        } else {
+            uint32_t value = (raw(p) & ~(mask() << shift)) | (uint32_t(z) << shift);
+            std::memcpy(p, &value, bytes);
+        }
+    }
+};
+
 } // namespace
 
 void d9_raster_invalidate(uint32_t surface_id) {
     decoded().erase(surface_id);
+}
+
+bool d9_raster_clear(ComObj *device, ComObj *target, uint32_t count, uint32_t rects, uint32_t flags,
+                     uint32_t color, float z, uint32_t stencil) {
+    if (!device || !target || (count && (!rects || !gm_fits_n(rects, count, 16))) ||
+        ((flags & 2) && (!std::isfinite(z) || z < 0 || z > 1)))
+        return false;
+    D9SurfaceInfo rt;
+    if (!d9_surface_info(target->id, &rt) || !rt.data || rt.size < uint64_t(rt.pitch) * rt.height ||
+        rt.pitch < uint64_t(rt.width) * 4 || (rt.format != 21 && rt.format != 22))
+        return false;
+    Depth depth;
+    if ((flags & 6) && !depth.load(device->zbuffer_obj))
+        return false;
+    const D9Pipeline &pl = d9_pipeline(device->id);
+    int left = 0, top = 0, right = int(rt.width), bottom = int(rt.height);
+    if (pl.viewport_set) {
+        left = int(std::min(pl.viewport[0], rt.width));
+        top = int(std::min(pl.viewport[1], rt.height));
+        right = int(std::min(uint64_t(pl.viewport[0]) + pl.viewport[2], uint64_t(rt.width)));
+        bottom = int(std::min(uint64_t(pl.viewport[1]) + pl.viewport[3], uint64_t(rt.height)));
+    }
+    for (uint32_t r = 0; r < std::max(count, 1u); ++r) {
+        int x0 = left, y0 = top, x1 = right, y1 = bottom;
+        if (count) {
+            const uint32_t p = rects + r * 16;
+            x0 = std::max(x0, int32_t(rd32(p)));
+            y0 = std::max(y0, int32_t(rd32(p + 4)));
+            x1 = std::min(x1, int32_t(rd32(p + 8)));
+            y1 = std::min(y1, int32_t(rd32(p + 12)));
+        }
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) {
+                if (flags & 1)
+                    std::memcpy(rt.data + size_t(y) * rt.pitch + size_t(x) * 4, &color, 4);
+                if ((flags & 6) && uint32_t(x) < depth.surface.width &&
+                    uint32_t(y) < depth.surface.height) {
+                    uint8_t *p = depth.at(uint32_t(x), uint32_t(y));
+                    if (flags & 2)
+                        depth.write(p, depth.fragment(z));
+                    if ((flags & 4) && depth.stencil_mask) {
+                        uint32_t value =
+                            (depth.raw(p) & ~depth.stencil_mask) | (stencil & depth.stencil_mask);
+                        std::memcpy(p, &value, depth.bytes);
+                    }
+                }
+            }
+    }
+    if (flags & 1)
+        d9_raster_invalidate(target->id);
+    if (flags & 6)
+        d9_raster_invalidate(device->zbuffer_obj);
+    return true;
 }
 
 void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &declaration,
@@ -780,7 +984,7 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
         return;
     D9SurfaceInfo rt;
     if (!d9_surface_info(target->id, &rt) || !rt.data || rt.format == 0 ||
-        rt.size < (size_t)rt.pitch * rt.height)
+        rt.size < uint64_t(rt.pitch) * rt.height || rt.pitch < uint64_t(rt.width) * 4)
         return;
     if (rt.format != 21 && rt.format != 22)
         return; // only 32-bit colour targets are drawn into
@@ -795,11 +999,16 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
     }
     const Program &vs = program_for(pl.vs.vec());
     const Program &ps = program_for(pl.ps.vec());
-    if (!vs.ok || !ps.ok || vs.major >= 3 || ps.major >= 3) {
-        const std::string why = (!vs.ok || !ps.ok)
-                                    ? std::string(!vs.ok ? "vertex" : "pixel") +
-                                          " shader: " + (!vs.ok ? vs.why : ps.why)
-                                    : std::string("shader model 3 runs on the GPU renderer only");
+    const auto derivative = [](const Inst &in) { return in.op == OP_DSX || in.op == OP_DSY; };
+    const bool derivatives = std::any_of(ps.code.begin(), ps.code.end(), derivative) ||
+                             std::any_of(vs.code.begin(), vs.code.end(), derivative);
+    if (!vs.ok || !ps.ok || vs.major >= 3 || ps.major >= 3 || derivatives) {
+        const std::string why =
+            (!vs.ok || !ps.ok)
+                ? std::string(!vs.ok ? "vertex" : "pixel") +
+                      " shader: " + (!vs.ok ? vs.why : ps.why)
+                : std::string(derivatives ? "screen derivatives run on the GPU renderer only"
+                                          : "shader model 3 runs on the GPU renderer only");
         log_once(("d3d9.raster.skip." + why).c_str(), "d3d9 raster: skipped a draw: %s",
                  why.c_str());
         return;
@@ -841,6 +1050,7 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
 
     // Run the vertex shader once per used vertex.
     std::unordered_map<int64_t, Out> transformed;
+    uint32_t instance = 0;
     auto shade_vertex = [&](int64_t vi) -> const Out & {
         auto it = transformed.find(vi);
         if (it != transformed.end())
@@ -848,22 +1058,42 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
         Machine m;
         m.p = &vs;
         m.pl = &pl;
-        const uint8_t *vp = nullptr;
-        if (vi >= 0 && call.vertex_data) {
-            size_t off = (size_t)vi * call.stride;
-            if (off + call.stride <= call.vertex_bytes)
-                vp = call.vertex_data + off;
-        } else if (vi >= 0) {
-            uint32_t addr = call.vertices + (uint32_t)vi * call.stride;
-            if (gm_fits(addr, call.stride))
-                vp = gm_ptr(addr);
-        }
-        if (vp)
+        if (vi >= 0)
             for (const DclIn &d : vs.inputs)
                 for (const Elem &e : elems)
-                    if (e.usage == d.usage && e.index == d.usage_index &&
-                        e.offset + 4u <= call.stride)
-                        m.in[d.index & 15] = fetch(vp, e);
+                    if (e.usage == d.usage && e.index == d.usage_index) {
+                        const auto &stream = pl.stream[e.stream];
+                        const uint32_t rate = host_d9_stream_rate(stream.frequency);
+                        const uint64_t index = (stream.frequency & HOST_D9_STREAM_INSTANCE)
+                                                   ? instance / rate
+                                                   : uint64_t(vi) / rate;
+                        const uint8_t *data = nullptr;
+                        uint64_t size = 0, offset = 0;
+                        uint32_t stride = call.stride;
+                        if (!e.stream) {
+                            data = call.vertex_data;
+                            size = call.vertex_bytes;
+                            if (!data && call.vertices < GUEST_SIZE) {
+                                data = gm_ptr(call.vertices);
+                                size = GUEST_SIZE - call.vertices;
+                            }
+                        } else if (ComObj *vb = com_get(stream.vb); vb && vb->kind == K_D3D9VB) {
+                            data = vb->pixels && vb->lock_count > 0 ? gm_ptr(vb->pixels)
+                                                                    : vb->blob.data();
+                            size = vb->blob.size();
+                            offset = stream.offset;
+                            stride = stream.stride;
+                        }
+                        const uint32_t bytes = element_bytes(e.type);
+                        if (!data || !bytes || (stride && e.offset + bytes > stride) ||
+                            offset > size || e.offset + bytes > size - offset)
+                            continue;
+                        const uint64_t available = size - offset - e.offset - bytes;
+                        if (stride && index > available / stride)
+                            continue;
+                        offset += index * stride;
+                        m.in[d.index & 15] = fetch(data + offset, e);
+                    }
         m.run();
         Out o;
         o.pos = m.opos;
@@ -884,7 +1114,9 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
     bool blend = pl.rs_set[27] && pl.rs[27];
     uint32_t src_blend = pl.rs_set[19] ? pl.rs[19] : 2, dst_blend = pl.rs_set[20] ? pl.rs[20] : 1;
     bool alpha_test = pl.rs_set[15] && pl.rs[15];
-    float alpha_ref = (pl.rs[24] & 0xff) / 255.0f;
+    Depth depth;
+    const bool depth_test = pl.rs[7] != 0 && depth.load(device->zbuffer_obj);
+    const uint32_t blend_constant = pl.rs[193];
     uint8_t *pixels = rt.data;
 
     uint32_t written = 0;
@@ -901,6 +1133,8 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
             iw[i] = 1.0f / w;
             sx[i] = vpx + (v[i]->pos[0] * iw[i] + 1.0f) * 0.5f * vpw;
             sy[i] = vpy + (1.0f - v[i]->pos[1] * iw[i]) * 0.5f * vph;
+            if (!std::isfinite(sx[i]) || !std::isfinite(sy[i]))
+                return;
         }
         float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
         if (std::fabs(area) < 1e-8f)
@@ -911,18 +1145,45 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
             if (pl.rs[22] == 3 && area < 0)
                 return;
         }
-        int x0 = std::max(0, (int)std::floor(std::min({sx[0], sx[1], sx[2]})));
-        int x1 = std::min((int)rt.width - 1, (int)std::ceil(std::max({sx[0], sx[1], sx[2]})));
-        int y0 = std::max(0, (int)std::floor(std::min({sy[0], sy[1], sy[2]})));
-        int y1 = std::min((int)rt.height - 1, (int)std::ceil(std::max({sy[0], sy[1], sy[2]})));
+        if (area < 0) {
+            std::swap(v[1], v[2]);
+            std::swap(sx[1], sx[2]);
+            std::swap(sy[1], sy[2]);
+            std::swap(iw[1], iw[2]);
+            area = -area;
+        }
+        auto top_left = [&](int a, int b) {
+            return sy[b] < sy[a] || (sy[b] == sy[a] && sx[b] > sx[a]);
+        };
+        auto covered = [](float edge, bool inclusive) {
+            return edge > 0 || (edge == 0 && inclusive);
+        };
+        float left = std::clamp(vpx, 0.0f, float(rt.width)),
+              top = std::clamp(vpy, 0.0f, float(rt.height));
+        float right = std::clamp(vpx + vpw, 0.0f, float(rt.width)),
+              bottom = std::clamp(vpy + vph, 0.0f, float(rt.height));
+        if (pl.rs[174]) {
+            left = std::max(left, float(pl.scissor[0]));
+            top = std::max(top, float(pl.scissor[1]));
+            right = std::min(right, float(pl.scissor[2]));
+            bottom = std::min(bottom, float(pl.scissor[3]));
+        }
+        if (left >= right || top >= bottom)
+            return;
+        int x0 = int(std::ceil(std::clamp(std::min({sx[0], sx[1], sx[2]}), left, right)));
+        int x1 = int(std::ceil(std::clamp(std::max({sx[0], sx[1], sx[2]}), left, right))) - 1;
+        int y0 = int(std::ceil(std::clamp(std::min({sy[0], sy[1], sy[2]}), top, bottom)));
+        int y1 = int(std::ceil(std::clamp(std::max({sy[0], sy[1], sy[2]}), top, bottom))) - 1;
         for (int y = y0; y <= y1; ++y) {
             for (int x = x0; x <= x1; ++x) {
-                float px = x + 0.5f, py = y + 0.5f;
-                float w0 = ((sx[1] - px) * (sy[2] - py) - (sx[2] - px) * (sy[1] - py)) / area;
-                float w1 = ((sx[2] - px) * (sy[0] - py) - (sx[0] - px) * (sy[2] - py)) / area;
-                float w2 = 1.0f - w0 - w1;
-                if (w0 < 0 || w1 < 0 || w2 < 0)
+                float px = float(x), py = float(y); // Direct3D 9 pixel centres are integers.
+                float e0 = ((sx[1] - px) * (sy[2] - py) - (sx[2] - px) * (sy[1] - py));
+                float e1 = ((sx[2] - px) * (sy[0] - py) - (sx[0] - px) * (sy[2] - py));
+                float e2 = ((sx[0] - px) * (sy[1] - py) - (sx[1] - px) * (sy[0] - py));
+                if (!covered(e0, top_left(1, 2)) || !covered(e1, top_left(2, 0)) ||
+                    !covered(e2, top_left(0, 1)))
                     continue;
+                const float w0 = e0 / area, w1 = e1 / area, w2 = e2 / area;
                 float q = w0 * iw[0] + w1 * iw[1] + w2 * iw[2];
                 if (q <= 0)
                     continue;
@@ -949,52 +1210,95 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
                 V4 col = ps.major >= 2 ? m.oc[0] : m.r[0];
                 for (int k = 0; k < 4; ++k)
                     col[k] = std::min(std::max(col[k], 0.0f), 1.0f);
-                if (alpha_test && col[3] < alpha_ref)
+                if (alpha_test &&
+                    !compare(pl.rs[25], uint32_t(col[3] * 255 + 0.5f), pl.rs[24] & 255))
                     continue;
+                const float z = w0 * v[0]->pos[2] * iw[0] + w1 * v[1]->pos[2] * iw[1] +
+                                w2 * v[2]->pos[2] * iw[2];
+                if (!std::isfinite(z) || z < 0 || z > 1)
+                    continue;
+                if (depth_test) {
+                    if (uint32_t(x) >= depth.surface.width || uint32_t(y) >= depth.surface.height)
+                        continue;
+                    uint8_t *p = depth.at(uint32_t(x), uint32_t(y));
+                    const double fragment = depth.fragment(
+                        pl.viewport_z[0] + z * (pl.viewport_z[1] - pl.viewport_z[0]));
+                    if (!compare(pl.rs[23], fragment, depth.value(p)))
+                        continue;
+                    if (pl.rs[14])
+                        depth.write(p, fragment);
+                }
                 if (!written++)
                     sample_colour = col;
                 uint8_t *o = pixels + (size_t)y * rt.pitch + (size_t)x * 4;
                 float dst[4] = {o[2] / 255.0f, o[1] / 255.0f, o[0] / 255.0f, o[3] / 255.0f};
                 float out[4];
-                for (int k = 0; k < 4; ++k)
-                    out[k] = blend ? col[k] * blend_factor(src_blend, col, dst, k) +
-                                         dst[k] * blend_factor(dst_blend, col, dst, k)
-                                   : col[k];
-                o[0] = (uint8_t)(std::min(std::max(out[2], 0.0f), 1.0f) * 255.0f + 0.5f);
-                o[1] = (uint8_t)(std::min(std::max(out[1], 0.0f), 1.0f) * 255.0f + 0.5f);
-                o[2] = (uint8_t)(std::min(std::max(out[0], 0.0f), 1.0f) * 255.0f + 0.5f);
-                o[3] = (uint8_t)(std::min(std::max(out[3], 0.0f), 1.0f) * 255.0f + 0.5f);
+                if (rt.format == 22)
+                    dst[3] = 1;
+                for (int k = 0; k < 4; ++k) {
+                    uint32_t src = src_blend, dest = dst_blend, op = pl.rs[171];
+                    if (k == 3 && pl.rs[206]) {
+                        src = pl.rs[207];
+                        dest = pl.rs[208];
+                        op = pl.rs[209];
+                    }
+                    if (src == 12) {
+                        src = 5;
+                        dest = 6;
+                    } else if (src == 13) {
+                        src = 6;
+                        dest = 5;
+                    }
+                    const float s = col[k] * blend_factor(src, col, dst, k, blend_constant);
+                    const float d = dst[k] * blend_factor(dest, col, dst, k, blend_constant);
+                    out[k] = !blend    ? col[k]
+                             : op == 2 ? s - d
+                             : op == 3 ? d - s
+                             : op == 4 ? std::min(col[k], dst[k])
+                             : op == 5 ? std::max(col[k], dst[k])
+                                       : s + d;
+                    if (pl.rs[168] & (1u << k)) {
+                        const int offset[] = {2, 1, 0, 3};
+                        o[offset[k]] = uint8_t(std::clamp(out[k], 0.0f, 1.0f) * 255 + 0.5f);
+                    }
+                }
             }
         }
     };
 
-    for (uint32_t p = 0; p < call.prim_count; ++p) {
-        uint32_t i0, i1, i2;
-        if (call.prim == 4) {
-            i0 = 3 * p;
-            i1 = 3 * p + 1;
-            i2 = 3 * p + 2;
-        } else if (call.prim == 5) {
-            i0 = p;
-            i1 = p + 1;
-            i2 = p + 2;
-            if (p & 1)
-                std::swap(i0, i1);
-        } else {
-            i0 = 0;
-            i1 = p + 1;
-            i2 = p + 2;
+    const uint32_t instances = (pl.stream[0].frequency & HOST_D9_STREAM_INDEXED)
+                                   ? pl.stream[0].frequency & HOST_D9_STREAM_DIVIDER
+                                   : 1;
+    for (instance = 0; instance < instances; ++instance) {
+        transformed.clear(); // Per-instance inputs change the same vertex's result.
+        for (uint32_t p = 0; p < call.prim_count; ++p) {
+            uint32_t i0, i1, i2;
+            if (call.prim == 4) {
+                i0 = 3 * p;
+                i1 = 3 * p + 1;
+                i2 = 3 * p + 2;
+            } else if (call.prim == 5) {
+                i0 = p;
+                i1 = p + 1;
+                i2 = p + 2;
+                if (p & 1)
+                    std::swap(i0, i1);
+            } else {
+                i0 = 0;
+                i1 = p + 1;
+                i2 = p + 2;
+            }
+            if (i2 >= nverts)
+                break;
+            const Out a = shade_vertex(vertex_index(i0));
+            if (!have_first) {
+                have_first = true;
+                first_w = a.pos[3];
+            }
+            const Out b = shade_vertex(vertex_index(i1));
+            const Out c = shade_vertex(vertex_index(i2));
+            draw_triangle(a, b, c);
         }
-        if (i2 >= nverts)
-            break;
-        const Out a = shade_vertex(vertex_index(i0));
-        if (!have_first) {
-            have_first = true;
-            first_w = a.pos[3];
-        }
-        const Out b = shade_vertex(vertex_index(i1));
-        const Out c = shade_vertex(vertex_index(i2));
-        draw_triangle(a, b, c);
     }
     static uint32_t reported = 0;
     if (++reported <= 16)

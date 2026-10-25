@@ -2,6 +2,7 @@
 // runtime/": import dispatch, unknown call targets, divide errors
 // and the handful of privileged or environment-sensing instructions.
 #include "imports.h"
+#include "memory.h"
 #include "profile.h"
 #include "mods_seam.h"
 #include "intrinsics.h"
@@ -13,6 +14,7 @@
 #include "thunks.h"
 #include "loader.h"
 #include "seh.h"
+#include "msvc_eh.h"
 #include "../platform/os.h"
 
 #include <setjmp.h>
@@ -34,6 +36,9 @@ struct SetjmpRecord {
     bool armed = false;
     uint32_t profile_depth = 0;
     uint32_t callback_depth = 0;
+    uint32_t seh_head = 0;
+    uint64_t arena_generation = 0;
+    X86 *cpu = nullptr;
 };
 // Keyed by the guest jmp_buf address. Heap allocated so a record outlives the
 // frame that created it.
@@ -422,6 +427,9 @@ jmp_buf *recomp_setjmp_prepare(X86 *c) {
         rec = new SetjmpRecord();
     rec->buf = buf;
     rec->saved = *c;
+    rec->cpu = c;
+    rec->arena_generation = mem_generation();
+    rec->seh_head = c->fs_base && gm_valid(c->fs_base, 12) ? rd32(c->fs_base) : 0;
     rec->profile_depth = recomp_profile_depth();
     rec->callback_depth = recomp_callback_depth();
     rec->armed = true;
@@ -457,7 +465,8 @@ void recomp_longjmp(X86 *c) {
     uint32_t buf = rd32(c->r[R_ESP] + 4);
     int value = (int)rd32(c->r[R_ESP] + 8);
     auto it = setjmps().find(buf);
-    if (it == setjmps().end() || !it->second->armed) {
+    if (it == setjmps().end() || !it->second->armed || it->second->cpu != c ||
+        it->second->arena_generation != mem_generation()) {
         LOGW("_longjmp(%08x, %d): no matching _setjmp, cannot unwind", buf, value);
         abort();
     }
@@ -471,9 +480,15 @@ void recomp_longjmp(X86 *c) {
     // are restored, because the ESP being unwound to is the saved one.
     mods_hooks_unwind_to_esp(rec->saved.r[R_ESP]);
     recomp_profile_truncate(rec->profile_depth);
+    recomp_msvc_unwind_to_esp(c, rec->saved.r[R_ESP]);
     recomp_seh_callback_leave(c, rec->callback_depth + 1);
     recomp_callback_truncate(rec->callback_depth);
     *c = rec->saved; // guest registers as they were at the _setjmp
+    if (rec->seh_head && c->fs_base && gm_valid(c->fs_base, 12)) {
+        wr32(c->fs_base, rec->seh_head);
+        recomp_seh_frame_leave(c);
+    }
+    c->r[R_EAX] = uint32_t(value); // controlling-expression setjmp callers read the full result
     g_setjmp_ctx = c;
     LOGV("_longjmp(%08x, %d): restoring ESP=%08x", buf, value, c->r[R_ESP]);
     longjmp(rec->env, value);

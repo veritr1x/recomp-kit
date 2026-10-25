@@ -73,6 +73,44 @@ def synthetic_image(code_at, base=0x00400000, size=0x2000):
     return img
 
 
+@pytest.mark.parametrize("code,expected", [
+    (b"\x0f\x28\x06\x0f\x29\x07\xc3", ["MOVAPS", "MOVAPS", "RET"]),
+    (b"\xd9\x36\xd9\x26\xc3", ["FNSTENV", "FLDENV", "RET"]),
+    (b"\xf2\x0f\x10\x06\xf2\x0f\xc2\xc1\x00\xc3", ["MOVSD", "CMPSD", "RET"]),
+])
+def test_recover_sse_and_environment_operands(code, expected):
+    entry = 0x401000
+    img = synthetic_image({entry:code})
+    insns = img.recover(entry, set())
+    assert [ins.mnem for ins in insns] == expected
+    assert len(insns[0].ops) > 0
+    if expected[0] == "MOVSD":
+        assert insns[0].ops == ["XMM0", "qword ptr [ESI]"]
+        assert insns[1].ops == ["XMM0", "XMM1", "0"]
+
+
+@pytest.mark.parametrize("pointer_kind", ["data", "pushed", "relocated"])
+@pytest.mark.parametrize("gap", [b"", b"\x0f\x0b\xf4"])
+def test_pointer_callback_keeps_branch_past_early_return(tmp_path,monkeypatch,pointer_kind,gap):
+    """A guessed callback's second return path belongs to the same body (#23)."""
+    import struct
+    entry, callback, helper, slot = 0x601000,0x601020,0x601100,0x601800
+    code = (b"\xe8"+struct.pack("<i",helper-callback-5)+b"\x84\xc0\x75"+
+            bytes([3+len(gap)])+b"\x31\xc0\xc3"+gap+b"\x6a\x01\x58\xc3")
+    entry_code = (b"\x68"+struct.pack("<I",callback)+b"\xc3" if pointer_kind == "pushed" else b"\xc3")
+    image = synthetic_image({entry:entry_code,callback-1:b"\x90"+code,helper:b"\xc3",
+                             slot:struct.pack("<I",callback)},base=0x600000)
+    if pointer_kind == "relocated":
+        image.relocated_pointers = lambda: {callback:slot}
+    text = translate_entry_fixture(tmp_path,monkeypatch,image,{entry:entry_code,helper:b"\xc3"})
+    assert "void fn_%08x(" % callback in text
+    tail = callback+12+len(gap)
+    assert "/* %08x PUSH" % tail in text
+    assert "goto L_%08x;" % tail in text
+    assert "UD2" not in text and "HLT" not in text
+    assert "recomp_unknown_call(c, 0x%xu)" % callback not in text
+
+
 def _walker_image(slots):
     """A __initterm-shaped walker, a caller naming a range, and that range."""
     import struct
@@ -105,6 +143,28 @@ def test_initterm_takes_a_table_of_function_pointers():
     """The walker is found by its shape, whatever registers it happens to use."""
     img, fns = _walker_image([0x00401000, 0, 0x00401005])
     ranges, entries = img.initterm_tables(fns)
+    assert len(ranges) == 1
+    assert entries == {0x00401000, 0x00401005}
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("name", ["_initterm", "_initterm_e"])
+def test_initterm_dll_iat_and_jump_thunk(direct, name):
+    import struct
+    img, fns = _walker_image([0x00401000, 0, 0x00401005])
+    iat, thunk, caller = 0x00402100, fns[0].addr, fns[1].addr
+    img.iat_names = {iat: name}
+    img.data = bytearray(img.data)
+    jump = b"\xff\x25" + struct.pack("<I", iat)
+    img.data[thunk-img.base:thunk-img.base+len(jump)] = jump
+    if direct:
+        call = b"\xff\x15" + struct.pack("<I", iat) + b"\xc3"
+        img.data[caller+10-img.base:caller+10-img.base+len(call)] = call
+    functions = []
+    for at in (thunk, caller):
+        insns = img.recover(at, set())
+        functions.append(T.Function(at, "fn_%08x" % at, insns[-1].addr+len(insns[-1].raw)-at, insns))
+    ranges, entries = img.initterm_tables(functions)
     assert len(ranges) == 1
     assert entries == {0x00401000, 0x00401005}
 
@@ -228,7 +288,7 @@ def test_output_records_the_loaded_image_base(tmp_path, monkeypatch, artifact, p
     monkeypatch.setattr(T, "FUNCS_TSV", str(table))
     monkeypatch.setattr(T, "BINARY", str(binary))
     monkeypatch.setattr(T, "CURATED", str(curated))
-    monkeypatch.setattr(T, "Image", lambda path: img)
+    monkeypatch.setattr(T, "Image", lambda path, **kwargs: img)
     monkeypatch.setattr(sys, "argv", ["translate.py", "--game", str(tmp_path),
                                      "--out", str(out), "--report", str(report), "--quiet"])
     assert T.main() == 0
@@ -321,7 +381,8 @@ def test_return_switch_requires_pushed_instruction_boundary(target, dispatch):
     assert ("switch (r_)" in text) == dispatch
     if dispatch:
         assert text.count("switch (r_)") == 2
-        assert text.count("case 0x60100bu: goto L_0060100b;") == 2
+        assert text.count("case 0x60100bu: goto L_0060100b;") == 1
+        assert text.count("case 0x60100bu: RECOMP_BACKEDGE(c); goto L_0060100b;") == 1
         assert "c->r[4] += 12u;" in text
         assert text.count("default: c->eip = r_; recomp_return(c); return;") == 2
     assert "void fn_00601005(X86 *c) { body_00601000(c, 0x601005u); }" in text
@@ -344,7 +405,8 @@ def test_tableless_jump_uses_all_local_instruction_labels(indirect):
     if indirect:
         assert "if (t_ >= 0x601000u && t_ < 0x601004u)" in text
         for addr in sorted(fn.addrs):
-            assert "case %s: goto L_%08x;" % (T.hexlit(addr), addr) in text
+            poll = "RECOMP_BACKEDGE(c); " if addr <= entry else ""
+            assert "case %s: %sgoto L_%08x;" % (T.hexlit(addr), poll, addr) in text
             assert "L_%08x: ;" % addr in text
         assert "default: break;" in text
         assert text.index("default: break;") < text.index("recomp_jump(c, t_)")
@@ -919,6 +981,137 @@ def translate_entry_fixture(tmp_path, monkeypatch, img, listings_at):
     return "\n".join(p.read_text() for p in out.glob("chunk_*.c"))
 
 
+@pytest.mark.parametrize("far", [False, True])
+def test_omitted_switch_case_is_local_and_can_fall_into_own_tail(tmp_path, monkeypatch, far):
+    import struct
+    entry, table = 0x601000, 0x601800
+    case = entry + (0x18000 if far else 0x40)
+    tail = case + 1
+    head = (b"\x83\xf8\x00\x0f\x87" + struct.pack("<i", tail-entry-9)
+            + b"\xff\x24\x85" + struct.pack("<I", table))
+    img = synthetic_image({entry:head, case:b"\x40\xc3", table:struct.pack("<I", case)},
+                          base=0x600000, size=0x20000)
+    img.code_pointers = lambda *a, **kw: (set(), set())
+    text = translate_entry_fixture(tmp_path, monkeypatch, img,
+                                   {entry:[(entry,head),(tail,b"\xc3")]})
+    assert "L_%08x:" % case in text
+    assert "goto L_%08x;" % case in text
+    assert "CALL_FN(%08x); return;" % case not in text
+
+
+def test_relocated_switch_method_owns_its_relocated_cases(tmp_path, monkeypatch):
+    import struct
+    anchor, method, case, table, slot = 0x601000,0x601020,0x601060,0x601080,0x601800
+    head = b"\x83\xf8\x00\x77\x0b\xff\x24\x85" + struct.pack("<I",table)
+    img = synthetic_image({anchor:b"\xc3",method:head,method+0x10:b"\xc3",
+                           case:b"\xb8\x2a\x00\x00\x00\xc3", table:struct.pack("<I",case),
+                           slot:struct.pack("<II",method,case)},base=0x600000)
+    img.relocated_pointers = lambda: {method:slot,case:slot+4}
+    text = translate_entry_fixture(tmp_path,monkeypatch,img,{anchor:b"\xc3"})
+    assert "void fn_%08x(" % method in text
+    assert "L_%08x:" % case in text
+    assert "goto L_%08x;" % case in text
+
+
+@pytest.mark.parametrize("tail_kind", ["entry", "interior", "unselected"])
+def test_relocated_switch_case_can_fall_into_listed_shared_tail(tmp_path, monkeypatch, tail_kind):
+    """A switch edge proves its case, including a fall-through into known code."""
+    import struct
+    anchor, method, case, tail, table, slot = (
+        0x601000, 0x601020, 0x601060, 0x601064, 0x601100, 0x601800)
+    head = b"\x83\xf8\x00\x77\x0b\xff\x24\x85" + struct.pack("<I", table)
+    blocks = {anchor: b"\xc3", method: head, method+0x10: b"\xc3",
+              case: b"\x85\xc0\x74\x01\xc3\xc3",
+              table: struct.pack("<I", case), slot: struct.pack("<I", method)}
+    image = synthetic_image(blocks, base=0x600000)
+    image.relocated_pointers = lambda: {method: slot}
+    listings = {anchor: blocks[anchor], tail: b"\xc3", tail+1: b"\xc3"}
+    if tail_kind == "interior":
+        jump = b"\xe9" + struct.pack("<i", tail-anchor-5)
+        image.data = image.data[:anchor-image.base] + jump + image.data[anchor-image.base+5:]
+        listings = {anchor: [(anchor, jump), (tail, b"\xc3")], tail+1: b"\xc3"}
+    if tail_kind == "unselected":
+        original = T.load_functions
+        monkeypatch.setattr(T, "load_functions", lambda *args: [row for row in original(*args)
+                                                                if row[0] != tail])
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, listings)
+    assert "void fn_%08x(" % method in text
+    assert "L_%08x:" % case in text
+    assert "goto L_%08x;" % case in text
+
+
+@pytest.mark.parametrize("relocated_default", [False, True])
+@pytest.mark.parametrize("table_default", [False, True])
+def test_switch_default_pointer_does_not_cut_case_fallthrough(tmp_path, monkeypatch, relocated_default, table_default):
+    """The method already reaches its default tail before decoding its cases."""
+    import struct
+    anchor, method, case, default, table, slot = (
+        0x601000, 0x601020, 0x60105c, 0x601060, 0x601100, 0x601800)
+    head = (b"\x83\xf8" + (b"\x01" if table_default else b"\x00") + b"\x77" + bytes([default-method-5]) +
+            b"\xff\x24\x85" + struct.pack("<I", table))
+    image = synthetic_image({anchor: b"\xc3", method: head,
+                             case: b"\x85\xc0\x74\x01\xc3\xc3",
+                             table: struct.pack("<II", case, default) if table_default else struct.pack("<I", case), slot: struct.pack("<II", method, default)},
+                            base=0x600000)
+    image.relocated_pointers = lambda: ({method: slot, default: slot+4} if relocated_default
+                                        else {method: slot})
+    text = translate_entry_fixture(tmp_path, monkeypatch, image, {anchor: b"\xc3"})
+    assert "void fn_%08x(" % method in text
+    assert "L_%08x:" % case in text
+    assert "L_%08x:" % default in text
+
+
+def test_unselected_listing_inside_first_opcode_does_not_bound_method(tmp_path,monkeypatch):
+    import struct
+    anchor,method,slot = 0x601000,0x601020,0x601800
+    code = b"\xb8\x2a\x00\x00\x00\xc3"
+    img = synthetic_image({anchor:b"\xc3",method:code,slot:struct.pack("<I",method)},base=0x600000)
+    img.relocated_pointers = lambda: {method:slot}
+    original = T.load_functions
+    monkeypatch.setattr(T,"load_functions",lambda *a: [row for row in original(*a) if row[0] != method+1])
+    text = translate_entry_fixture(tmp_path,monkeypatch,img,
+                                   {anchor:b"\xc3",method+1:b"\xc3"})
+    assert "void fn_%08x(" % method in text
+    assert "MOV EAX,0x2a" in text
+
+
+def test_discovery_trace_reports_selected_decisions(tmp_path,monkeypatch,capsys):
+    import struct
+    anchor,method,slot = 0x601000,0x601020,0x601800
+    img = synthetic_image({anchor:b"\xc3",method:b"\x40\xc3",
+                           slot:struct.pack("<I",method)},base=0x600000)
+    img.relocated_pointers = lambda: {method:slot}
+    monkeypatch.setenv("RECOMP_TRACE_DISCOVERY","00601020")
+    translate_entry_fixture(tmp_path,monkeypatch,img,{anchor:b"\xc3"})
+    output = capsys.readouterr().err
+    assert "discovery 00601020: consider" in output
+    assert "discovery 00601020: changed; owner=00601020" in output
+    assert "discovery 00601000:" not in output
+
+
+@pytest.mark.parametrize("kind", ["CALL", "JMP", "JZ"])
+@pytest.mark.parametrize("policy", ["fail", "trap"])
+def test_explicit_untranslated_range_branch_policy(monkeypatch,kind,policy):
+    from test_translate_insns import Opts
+    entry,target = 0x401000,0x401100
+    image = synthetic_image({entry:b"\x90\xc3",target:b"\xc3"})
+    monkeypatch.setattr(T,"UNTRANSLATED_RANGES",((target,target+16,policy),))
+    assert image.recover(target,set()) == []
+    fn = T.Function(entry,"f",16,T.parse_listing_text(
+        "00401000  %s 0x401100\n00401005  RET\n" % kind))
+    fn.measure(image)
+    tr = T.Translator(image,{entry,target},Opts())
+    tr.allow_unmodelled = "test must preserve explicit gate"
+    tr.prepare(fn)
+    if policy == "fail":
+        with pytest.raises(T.TranslateError,match="untranslated range"):
+            tr.translate(fn)
+    else:
+        text = "\n".join(tr.translate(fn))
+        assert "recomp_unknown_call(c, 0x401100u); return;" in text
+        assert "CALL_FN(00401100)" not in text
+
+
 def test_a_branch_reached_tail_may_fall_into_a_known_entry(tmp_path, monkeypatch):
     """An exception landing pad keeps the unlisted tail its own JMP names.
 
@@ -1448,6 +1641,7 @@ def test_auxiliary_module_emits_prefixed_tables_that_self_register(tmp_path, mon
     monkeypatch.setattr(T, "EXTRA_ENTRY_POINTS", frozenset())
     monkeypatch.setattr(T, "Image", lambda path: img)
     monkeypatch.setattr(T, "SYMBOL_PREFIX", "recomp_blit_")
+    monkeypatch.setattr(T, "Image", lambda path, **kwargs: img)
     monkeypatch.setattr(T, "AUX_MODULE", {"key": "blit", "name": "Blit_p6.dll", "base": 0x10000000, "size": 0x1000})
     monkeypatch.setattr(sys, "argv", ["translate.py", "--game", str(tmp_path),
                                      "--out", str(out), "--quiet"])

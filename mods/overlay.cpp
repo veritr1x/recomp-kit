@@ -127,7 +127,7 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
         }
         if (os_lstat(host.c_str(), &st) != 0)
             return false;
-        if (mutation && st.is_symlink)
+        if ((mutation && st.is_symlink) || !os_path_is_within(root.c_str(), host.c_str()))
             return false;
         if (i + 1 < comps.size() && (os_stat(host.c_str(), &st) != 0 || !st.is_dir))
             return false;

@@ -35,6 +35,32 @@ struct OsThread {
     pthread_t handle;
 };
 
+int os_realpath(const char *path, char *out, size_t cap) {
+    char *resolved = realpath(path, nullptr);
+    if (!resolved)
+        return -1;
+    const size_t bytes = strlen(resolved) + 1;
+    if (!out || bytes > cap) {
+        free(resolved);
+        return -1;
+    }
+    memcpy(out, resolved, bytes);
+    free(resolved);
+    return 0;
+}
+
+int os_path_is_absolute(const char *path) {
+    return path && path[0] == '/';
+}
+
+int os_path_is_within(const char *root, const char *path) {
+    char base[4096], target[4096];
+    if (os_realpath(root, base, sizeof base) != 0 || os_realpath(path, target, sizeof target) != 0)
+        return 0;
+    const size_t n = strlen(base);
+    return strncmp(base, target, n) == 0 && (n == 1 || target[n] == '/' || target[n] == '\0');
+}
+
 extern "C" {
 
 OsThread *os_thread_create(void *(*fn)(void *), void *arg, size_t stack_bytes) {
@@ -69,6 +95,11 @@ void os_thread_prefer_performance(void) {
 void os_thread_exit(void) {
     pthread_exit(nullptr);
 }
+void os_thread_prefer_user_initiated(void) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+}
 OsThreadId os_thread_self(void) {
     return (OsThreadId)(uintptr_t)pthread_self();
 }
@@ -82,6 +113,33 @@ void *os_vm_reserve(size_t bytes) {
 }
 void os_vm_release(void *p, size_t bytes) {
     munmap(p, bytes);
+}
+
+void *os_guest_arena_reserve(size_t bytes) {
+#if defined(__EMSCRIPTEN__)
+    return os_vm_reserve(bytes);
+#else
+    if (sizeof(size_t) < 8 || bytes == 0 || bytes > UINT64_C(0xffff0000))
+        return nullptr;
+    const size_t reserved = (size_t)UINT64_C(0x100010000);
+    void *p = mmap(nullptr, reserved, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED)
+        return nullptr;
+    if (mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) {
+        munmap(p, reserved);
+        return nullptr;
+    }
+    return p;
+#endif
+}
+
+void os_guest_arena_release(void *p, size_t bytes) {
+#if defined(__EMSCRIPTEN__)
+    os_vm_release(p, bytes);
+#else
+    (void)bytes;
+    munmap(p, (size_t)UINT64_C(0x100010000));
+#endif
 }
 
 void *os_dlopen(const char *path) {
@@ -374,6 +432,9 @@ int os_localtime(int64_t seconds, struct tm *out) {
 int os_gmtime(int64_t seconds, struct tm *out) {
     time_t t = (time_t)seconds;
     return gmtime_r(&t, out) ? 0 : -1;
+}
+int64_t os_mktime(struct tm *inout) {
+    return int64_t(mktime(inout));
 }
 
 uint64_t os_monotonic_ns(void) {

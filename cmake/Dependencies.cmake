@@ -1,5 +1,5 @@
-# Third-party code that is fetched rather than vendored. Pinned to a tag, never
-# a branch, so a configure today and a configure next year build the same bytes.
+# Third-party code fetched at immutable commits, with archive hashes verified
+# before extraction. Tags below are explanatory, never mutable build inputs.
 include(FetchContent)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -23,9 +23,10 @@ if(EMSCRIPTEN)
   set(SDL_PTHREADS ON CACHE BOOL "" FORCE) # the game runs on a thread of its own
 endif()
 FetchContent_Declare(SDL3
-  GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-  GIT_TAG release-3.4.16
-  GIT_SHALLOW TRUE)
+  # release-3.4.16
+  URL https://codeload.github.com/libsdl-org/SDL/tar.gz/fa2c02bb6e21974a89ea9824bc53c9932abe5f9c
+  URL_HASH SHA256=d246967187a4f37cc850608dbaf5cff9d1df4d731259903d25539755cdfcc657
+  DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
 FetchContent_MakeAvailable(SDL3)
 
 # glslang compiles the Direct3D 9 renderer's GLSL to SPIR-V at run time
@@ -42,9 +43,10 @@ if(NOT IOS AND NOT EMSCRIPTEN)
   set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
   set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(glslang
-    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-    GIT_TAG 16.6.0
-    GIT_SHALLOW TRUE)
+    # 16.6.0
+    URL https://codeload.github.com/KhronosGroup/glslang/tar.gz/e1b562a8bed273a02f30b59b66a5d499793cede5
+    URL_HASH SHA256=907174a24713c6202c146f164bf81783f1fbc79c8cb821a30f18f159eb980312
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
   FetchContent_MakeAvailable(glslang)
 endif()
 

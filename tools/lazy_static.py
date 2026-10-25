@@ -6,7 +6,7 @@
 A run reports the code its translation does not carry (runtime/discovery.h).
 Regenerating the whole translation to pick it up costs minutes; this compiles
 just those functions into one small library, which the host loads when
-RECOMP_EXTRA_CODE names it:
+RECOMP_EXTRA_CODE names it (the host must be built with -DRECOMP_DEV_LOADERS=ON):
 
     RECOMP_EXTRA_CODE=<game>/build/recomp/discovered.dylib <host>
 
@@ -88,7 +88,7 @@ def main(argv=None):
                ] + [str(s) for s in sources] + ["-o", str(out)]
     if subprocess.run(command, cwd=ROOT).returncode:
         return "the compile failed"
-    print("%s\n\nRun the game with it:\n    RECOMP_EXTRA_CODE=%s %s"
+    print("%s\n\nRun the game with a host built with -DRECOMP_DEV_LOADERS=ON:\n    RECOMP_EXTRA_CODE=%s %s"
           % (out, out, build_root / "recomp/pop_headless"))
     return 0
 

@@ -1097,6 +1097,92 @@ std::map<uint32_t, MmTimer> &timers() {
     return m;
 }
 uint32_t g_next_timer_id = 1;
+bool g_mm_thread_mode = RECOMP_MM_TIMER_THREAD;
+uint32_t g_mm_worker = 0, g_mm_entry = 0, g_mm_worker_generation = 0;
+std::vector<uint32_t> g_mm_retired;
+std::atomic<uint32_t> g_mm_generation{1}, g_mm_wake{0};
+std::atomic<bool> g_mm_stopped{false};
+
+uint32_t mm_clock() {
+    // Boot hosts can temporarily install a counting source while the process
+    // remains pinned. Timer deadlines always use the actual pin in that case.
+    return host_time_source_is_pinned() ? host_pinned_clock_value() : host_millis();
+}
+void mm_fire_due(X86 *c, bool worker, uint32_t generation);
+void mm_worker_entry(X86 *c) {
+    const uint32_t generation = arg(c, 0);
+    while (g_mm_generation.load(std::memory_order_acquire) == generation) {
+        mm_fire_due(c, true, generation);
+        if (timers().empty() || g_mm_generation.load(std::memory_order_acquire) != generation)
+            break;
+        const uint32_t now = mm_clock();
+        uint32_t wait = 0x7fffffffu;
+        for (const auto &entry : timers()) {
+            const int32_t remaining = int32_t(entry.second.next_due - now);
+            wait = std::min(wait, remaining > 0 ? uint32_t(remaining) : 0u);
+        }
+        // Advancing a pinned clock does not signal an OS event. Recheck it
+        // without turning a frozen pin into elapsed guest time.
+        if (host_time_source_is_pinned())
+            wait = std::min(wait, 16u);
+        const uint32_t wake = g_mm_wake.load(std::memory_order_acquire);
+        guest_wait_objects(&wake, 1, false, wait);
+    }
+    set_eax(c, 0);
+}
+
+bool mm_ensure_worker() {
+    if (g_mm_stopped.load(std::memory_order_acquire))
+        return false;
+    const uint32_t generation = g_mm_generation.load(std::memory_order_acquire);
+    if (g_mm_worker && guest_runtime_thread_alive(g_mm_worker)) {
+        if (g_mm_worker_generation == generation)
+            return true;
+        g_mm_retired.push_back(g_mm_worker);
+    } else if (g_mm_worker)
+        win32_close_handle(g_mm_worker);
+    for (auto it = g_mm_retired.begin(); it != g_mm_retired.end();) {
+        if (!guest_runtime_thread_alive(*it)) {
+            win32_close_handle(*it);
+            it = g_mm_retired.erase(it);
+        } else
+            ++it;
+    }
+    if (!g_mm_wake.load(std::memory_order_acquire))
+        g_mm_wake.store(win32_create_event(false, false), std::memory_order_release);
+    if (!g_mm_entry)
+        g_mm_entry =
+            imports_alloc_trampoline("runtime", "multimedia_timer_thread", mm_worker_entry, 1);
+    if (!g_mm_wake.load(std::memory_order_acquire) || !g_mm_entry)
+        return false;
+    g_mm_worker_generation = generation;
+    g_mm_worker = guest_runtime_thread_create(g_mm_entry, generation);
+    return g_mm_worker != 0;
+}
+
+} // namespace
+
+void host_stop_mm_timer_thread() {
+    g_mm_stopped.store(true, std::memory_order_release);
+    g_mm_generation.fetch_add(1, std::memory_order_acq_rel);
+    guest_event_signal_from_host(g_mm_wake.load(std::memory_order_acquire));
+}
+void host_reset_mm_timers() {
+    // win32_init discards all handles next; no old guest thread may survive it.
+    g_mm_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_mm_wake.store(0, std::memory_order_release);
+    g_mm_stopped.store(false, std::memory_order_release);
+    g_mm_worker = g_mm_entry = g_mm_worker_generation = 0;
+    g_mm_retired.clear();
+    timers().clear();
+    g_next_timer_id = 1;
+    g_mm_thread_mode = RECOMP_MM_TIMER_THREAD;
+}
+void host_mm_timer_thread_for_test(bool enabled) {
+    g_mm_thread_mode = enabled;
+}
+
+namespace {
 
 void m_timeGetTime(X86 *c) {
     host_note_cadence("timeGetTime");
@@ -1111,12 +1197,21 @@ void m_timeSetEvent(X86 *c) {
     t.user = user;
     t.period = delay ? delay : 1;
     t.periodic = (flags & 1) != 0; // TIME_PERIODIC
-    t.next_due = host_millis() + t.period;
+    t.next_due = mm_clock() + t.period;
     t.alive = true;
     uint32_t cb_mode = flags & 0x30;
     t.event_mode = cb_mode != 0; // TIME_CALLBACK_EVENT_SET/_PULSE
     t.event_pulse = cb_mode == 0x20;
     timers()[t.id] = t;
+    if (g_mm_thread_mode) {
+        g_mm_stopped.store(false, std::memory_order_release);
+        if (t.period > 0x7fffffffu || !mm_ensure_worker()) {
+            timers().erase(t.id);
+            set_eax(c, 0);
+            return;
+        }
+        win32_signal_event(g_mm_wake.load(std::memory_order_acquire), false);
+    }
     LOGV("timeSetEvent(%u ms, %s, %s=%08x) -> id %u", delay, t.periodic ? "periodic" : "one-shot",
          t.event_mode ? "event" : "callback", callback, t.id);
     set_eax(c, t.id);
@@ -1124,6 +1219,8 @@ void m_timeSetEvent(X86 *c) {
 
 void m_timeKillEvent(X86 *c) {
     timers().erase(arg(c, 0));
+    if (g_mm_thread_mode)
+        win32_signal_event(g_mm_wake.load(std::memory_order_acquire), false);
     set_eax(c, 0); // TIMERR_NOERROR
 }
 
@@ -1924,21 +2021,42 @@ void host_pump_timers(X86 *c) {
     for (int i = 0; i < g_frame_pump_count; ++i)
         g_frame_pumps[i](c);
 
+    if (g_mm_thread_mode) {
+        if (!timers().empty())
+            mm_ensure_worker();
+        return;
+    }
+    mm_fire_due(c, false, 0);
+}
+
+namespace {
+void mm_fire_due(X86 *c, bool worker, uint32_t generation) {
     if (timers().empty())
         return;
-    uint32_t now = host_millis();
-    std::vector<uint32_t> due;
-    for (auto &kv : timers())
-        if (kv.second.alive && (int32_t)(now - kv.second.next_due) >= 0)
-            due.push_back(kv.first);
-    for (uint32_t id : due) {
-        auto it = timers().find(id);
-        if (it == timers().end())
-            continue;
+    uint32_t now = mm_clock();
+    const uint32_t last_created = g_next_timer_id - 1;
+    uint32_t after = 0;
+    // Re-find by id after every callback: it may erase timers or recursively
+    // pump them. Keep no allocation or iterator alive across guest code that
+    // can ExitThread via longjmp. Newly created timers wait for the next pass.
+    for (;;) {
+        if (worker && g_mm_generation.load(std::memory_order_acquire) != generation)
+            return;
+        auto it = timers().upper_bound(after);
+        while (it != timers().end() && it->first <= last_created &&
+               (!it->second.alive || int32_t(now - it->second.next_due) < 0))
+            ++it;
+        if (it == timers().end() || it->first > last_created)
+            break;
         MmTimer t = it->second;
-        if (t.periodic)
-            it->second.next_due = now + t.period;
-        else
+        after = t.id;
+        if (t.periodic) {
+            // Keep the original phase, firing once after a stall and skipping
+            // missed intervals. The default message-loop mode stays unchanged.
+            it->second.next_due = worker
+                                      ? t.next_due + ((now - t.next_due) / t.period + 1) * t.period
+                                      : now + t.period;
+        } else
             timers().erase(it);
         if (!t.callback)
             continue;
@@ -1954,6 +2072,8 @@ void host_pump_timers(X86 *c) {
         }
     }
 }
+
+} // namespace
 
 // A stable name for the virtual Windows account, independent of host identity.
 // The size includes NUL on both success and the insufficient-buffer path.

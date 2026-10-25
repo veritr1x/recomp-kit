@@ -172,13 +172,18 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
     while (*p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *next = end ? end + 1 : p + len;
+        // Accept Windows line endings without making an embedded CR valid
+        // inside a number. Advance by the raw length even on a final CR.
+        if (len && p[len - 1] == '\r')
+            --len;
         ++line_number;
         char line[512];
         if (len >= sizeof line)
             return fail(line_number, "line is too long", nullptr);
         memcpy(line, p, len);
         line[len] = 0;
-        p = end ? end + 1 : p + len;
+        p = next;
 
         // Comments and blank lines.
         char *hash = strchr(line, '#');

@@ -1,6 +1,7 @@
 // node --test web/launcher/tests - the web launcher's import rules.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { queryEnvironment, executablePath } from "../../player/env.mjs";
 import { createHash } from "node:crypto";
 import {
   wildcardMatch, excluded, planImport, sha256Hex, Sha256, crc32, ZipReader, zipWrite,
@@ -8,6 +9,15 @@ import {
 } from "../core.js";
 
 const enc = new TextEncoder();
+
+test("player URLs cannot inject runtime environment switches", () => {
+  const query = "?RECOMP_PROFILE_DIR=/game&RECOMP_EXTRA_CODE=evil&RECOMP_VULKAN_LIBRARY=evil&RECOMP_LOG=2";
+  assert.deepEqual(Object.entries(queryEnvironment(query)), []);
+  assert.deepEqual(Object.entries(queryEnvironment(query, ["RECOMP_LOG"])), [["RECOMP_LOG", "2"]]);
+  assert.deepEqual(Object.entries(queryEnvironment("?RECOMP_LOG_SUFFIX=3", ["RECOMP_LOG"])), []);
+  assert.equal(executablePath({ executable: "GAME.EXE" }), "GAME.EXE");
+  assert.equal(executablePath({ exeDir: "Binaries/Win32", executable: "GAME.EXE" }), "Binaries/Win32/GAME.EXE");
+});
 const EXE = enc.encode("MZ fake game executable\n");
 const game = {
   id: "test", title: "Test Game", executable: "GAME.EXE",
@@ -56,6 +66,25 @@ const install = (prefix = "") => ({
   [prefix + "__redist/vc.exe"]: enc.encode("skip"),
   [prefix + "bink.dll"]: enc.encode("skip"),
   [prefix + "readme.txt"]: enc.encode("keep"),
+});
+
+test("nested executable keeps sibling data in the imported root", async () => {
+  const nested = { ...game, exeDir: "Binaries/Win32" };
+  for (const prefix of ["", "Install/"]) {
+    const src = memorySource({
+      [prefix + "BINARIES/win32/game.exe"]: EXE,
+      [prefix + "DATA/sprites.bin"]: enc.encode("asset"),
+      [prefix + "levels/one.lvl"]: enc.encode("level"),
+    });
+    const plan = planImport(nested, await src.list());
+    assert.equal(plan.base, prefix.replace(/\/$/, ""));
+    assert.equal(plan.exe, "BINARIES/win32/game.exe");
+    assert.deepEqual(plan.missing, []);
+    const store = new MemoryStore();
+    assert.equal((await importGame(nested, src, store)).result, "done");
+    assert.equal((await gameStatus(nested, store)).state, "ready");
+    assert.equal(await store.readText("DATA/sprites.bin"), "asset");
+  }
 });
 
 test("wildcards and exclusion", () => {

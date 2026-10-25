@@ -31,7 +31,13 @@ int mod_test_failures();
 #include <string>
 inline std::string mods_test_build_root() {
     const char *root = recomp_env("BUILD_ROOT");
-    return root && *root ? root : "build";
+    std::string path = root && *root ? root : "build";
+    if (!os_path_is_absolute(path.c_str())) {
+        char cwd[4096];
+        if (os_getcwd(cwd, sizeof cwd) == 0)
+            path = std::string(cwd) + "/" + path;
+    }
+    return path;
 }
 inline std::string mods_test_build_path(const char *rel) {
     return mods_test_build_root() + "/" + rel;

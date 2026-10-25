@@ -16,6 +16,15 @@ EXE = "GAME.EXE"
 
 
 class SetupTests(unittest.TestCase):
+    def test_executable_subdirectory_keeps_data_at_install_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Binaries").mkdir()
+            (root / "data").mkdir()
+            data = b"synthetic supported executable"
+            (root / "Binaries" / EXE).write_bytes(data)
+            self.assertEqual(setup.validate_game(root, EXE, hashlib.sha256(data).hexdigest(),
+                                                 ("data",), "Binaries"), root.resolve())
     def test_missing_executable_has_actionable_error(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "GAME.EXE was not found"):

@@ -58,7 +58,7 @@ translation, and your own copy of the game:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r kit/requirements-dev.txt
+.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r kit/requirements.lock
 .venv/bin/python tools/setup.py --install /path/to/the/installed/game --ghidra-home /path/to/ghidra
 .venv/bin/python tools/build.py --regenerate
 open build/<AppName>.app
@@ -86,6 +86,12 @@ of `@executable_path/../Frameworks`; each dylib is signed ad hoc before the
 app. Apple system libraries/frameworks are allowed; no Homebrew libraries
 are required. Bink cinematics decode through these libraries; Smacker
 still refuses to open a video.
+
+OpenAL playback and streaming use the shared host mixer, including clock-based
+progress on a silent host. Bink supports memory-resident input, registered SDK
+planes and rewind/forward seeking. Use `[bink] record = "sdk"` for the SDK
+record fields; the default remains `"legacy"`. See
+[audio compatibility](docs/audio-compat.md) for layouts and approximations.
 
 iOS cross-builds for arm64 and iOS 17.0 with the iPhoneOS SDK. Xcode embeds
 the three dylibs in `Frameworks/` and signs them on copy with the app's
@@ -250,6 +256,13 @@ and file-backed music, building the three shared media DLLs with llvm-mingw and
 copying them beside the executable. The build host needs a POSIX shell and GNU
 make; MSYS2 is only required when building on Windows itself. Translated app
 packages, including the DLLs and their notice, land in `build/windows/package/`.
+
+Metal prepares accepted D3D9 programs on two background workers. It records
+shader variants and pipeline descriptions in `<RECOMP_PROFILE_DIR>/d3d9-warm.txt`
+for subsequent sessions. `RECOMP_D3D9_WARM=0` disables preparation and hints;
+`RECOMP_D3D9_STATS=1` reports builds, takeovers and waits. With `RECOMP_PROFILE=1`,
+frames over 100 ms also report compile work, GPU waits, texture creation,
+uploads and draws. Background compile time can overlap a frame.
 
 ## Check a change
 
