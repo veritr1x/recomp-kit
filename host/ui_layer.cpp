@@ -223,7 +223,7 @@ void ui_layer_extract(HostFrameHandle f, int guest_w, int guest_h, const UiFrame
                       UiFrame *out) {
     if (!out)
         return;
-    UiFrame result{{}, guest_w, guest_h};
+    UiFrame result{{}, guest_w, guest_h, {}};
     if (previous && (previous->guest_w != guest_w || previous->guest_h != guest_h))
         previous = nullptr;
     if (guest_w <= 0 || guest_h <= 0) {
@@ -241,13 +241,61 @@ void ui_layer_extract(HostFrameHandle f, int guest_w, int guest_h, const UiFrame
     }
     const HostSurfaceId target = host_frame_render_surface(f);
     const HostSurfaceId cursor = host_cursor_surface();
-    std::vector<const HostBlitRecord *> records;
     const uint32_t count = host_frame_record_count(f);
+    // A software cursor erases itself by writing back the pixels it saved
+    // from the render target, by blit or a CPU lock. The host renders 3D on
+    // the GPU, so those pixels are stale guest memory, and replaying the write
+    // draws a box of old pixels where the cursor was. The compositor redraws
+    // the scene anyway. A write to the target is such a restore only when the
+    // cursor surface exists, a copy from the target saved that rectangle, and
+    // the cursor drew inside it in the frame of the save. Saves from earlier
+    // frames carry over in the previous UI, which the presenter resets with
+    // the session.
+    std::vector<UiCursorSave> saves;
+    if (target != HOST_SURFACE_NONE && cursor != HOST_SURFACE_NONE) {
+        std::vector<Rect> drawn;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto *r = host_frame_record(f, i);
+            if (r && r->dst == target && r->src.surface == cursor && r->w > 0 && r->h > 0)
+                drawn.push_back(rect(*r));
+        }
+        // Collect the saves first: a moving cursor's write lands on the
+        // rectangle it saves later in the same frame.
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto *r = host_frame_record(f, i);
+            if (!r || r->src.surface != target || r->dst == target || r->w <= 0 || r->h <= 0)
+                continue;
+            const Rect saved{r->src_x, r->src_y, int64_t(r->src_x) + r->w,
+                             int64_t(r->src_y) + r->h};
+            if (std::any_of(drawn.begin(), drawn.end(), [&](Rect d) {
+                    return d.x >= saved.x && d.y >= saved.y && d.right <= saved.right &&
+                           d.bottom <= saved.bottom;
+                }))
+                saves.push_back({target, r->src_x, r->src_y, r->w, r->h, 0});
+        }
+        if (previous)
+            for (auto s : previous->cursor_saves)
+                if (s.target == target && s.age < 4) {
+                    ++s.age;
+                    saves.push_back(s);
+                }
+    }
+    std::vector<const HostBlitRecord *> records;
     for (uint32_t i = 0; i < count; ++i) {
         const auto *r = host_frame_record(f, i);
-        if (r && target != HOST_SURFACE_NONE && r->dst == target && !r->is_upload && r->w > 0 &&
-            r->h > 0)
-            records.push_back(r);
+        if (!r || target == HOST_SURFACE_NONE || r->dst != target || r->is_upload || r->w <= 0 ||
+            r->h <= 0)
+            continue;
+        if (r->src.surface != cursor) {
+            auto restore = std::find_if(saves.begin(), saves.end(), [r](const UiCursorSave &s) {
+                return s.x == r->dst_x && s.y == r->dst_y && s.w == r->w && s.h == r->h;
+            });
+            if (restore != saves.end()) {
+                saves.erase(restore);
+                continue;
+            }
+        }
+        records.push_back(r);
     }
     std::stable_sort(records.begin(), records.end(),
                      [](const auto *a, const auto *b) { return a->seq < b->seq; });
@@ -359,5 +407,6 @@ void ui_layer_extract(HostFrameHandle f, int guest_w, int guest_h, const UiFrame
         seeds.push_back(initial_id(first));
     }
     identify(result.elements, seeds, previous);
+    result.cursor_saves = std::move(saves);
     *out = std::move(result);
 }

@@ -184,6 +184,102 @@ static void test_cursor_and_hud_flags() {
     CHECK(b.balanced());
 }
 
+static size_t ui_at(const UiFrame &out, int x, int y) {
+    return size_t(std::count_if(out.elements.begin(), out.elements.end(), [&](const UiElement &e) {
+        return !e.is_cursor && e.x == x && e.y == y;
+    }));
+}
+
+// The cursor's save-under sequence: write stale pixels onto its rectangle,
+// save that rectangle from the target, draw the cursor there.
+static void cursor_frame(test_frame_builder &b, int x, int y) {
+    b.blit(5, x, y, 16, 16);
+    auto &save = b.blit(b.render_surface, 0, 0, 16, 16);
+    save.dst = 7;
+    save.src_x = x;
+    save.src_y = y;
+    b.blit(9, x, y, 16, 16);
+}
+
+static void test_cursor_save_under_is_not_ui() {
+    test_frame_builder b;
+    b.cursor_surface = 9;
+    for (auto src : {1u, 5u, 9u})
+        solid(b, src);
+    cursor_frame(b, 30, 40);
+    b.blit(5, 200, 40, 16, 16); // unrelated UI
+    UiFrame out{};
+    ui_layer_extract(b.frame, 640, 480, nullptr, &out);
+    CHECK(out.elements.size() == 2);
+    CHECK(std::count_if(out.elements.begin(), out.elements.end(),
+                        [](const UiElement &e) { return e.is_cursor; }) == 1);
+    CHECK(ui_at(out, 200, 40) == 1 && ui_at(out, 30, 40) == 0);
+    CHECK(b.balanced());
+}
+
+// A copy from the target is a cursor save only when the cursor draws inside
+// the saved rectangle. Otherwise UI on that rectangle is kept.
+static void test_screen_copy_without_cursor_keeps_ui() {
+    for (bool cursor_elsewhere : {false, true}) {
+        test_frame_builder b;
+        if (cursor_elsewhere)
+            b.cursor_surface = 9;
+        for (auto src : {1u, 5u, 9u})
+            solid(b, src);
+        auto &copy = b.blit(1, 0, 0, 16, 16);
+        copy.dst = 7;
+        copy.src_x = 400;
+        copy.src_y = 300;
+        if (cursor_elsewhere)
+            b.blit(9, 100, 100, 16, 16);
+        b.blit(5, 400, 300, 16, 16);
+        UiFrame out{};
+        ui_layer_extract(b.frame, 640, 480, nullptr, &out);
+        CHECK(out.elements.size() == (cursor_elsewhere ? 2u : 1u));
+        CHECK(ui_at(out, 400, 300) == 1);
+        CHECK(out.cursor_saves.empty());
+        CHECK(b.balanced());
+    }
+}
+
+// Saves carry over in the previous UI for a few frames, for the same target.
+static void test_cursor_saves_follow_target_and_age() {
+    test_frame_builder b;
+    b.cursor_surface = 9;
+    for (auto src : {1u, 2u, 5u, 9u})
+        solid(b, src);
+    cursor_frame(b, 30, 40);
+    b.records.erase(b.records.begin()); // only the save and the draw
+    UiFrame out{};
+    ui_layer_extract(b.frame, 640, 480, nullptr, &out);
+    CHECK(out.cursor_saves.size() == 1);
+    UiFrame saved = out;
+
+    b.records.clear();
+    b.blit(5, 30, 40, 16, 16); // the write-back, next frame
+    ui_layer_extract(b.frame, 640, 480, &out, &out);
+    CHECK(out.elements.empty() && out.cursor_saves.empty());
+
+    b.render_surface = 2; // another target: its write is UI
+    b.records.clear();
+    b.blit(5, 30, 40, 16, 16);
+    ui_layer_extract(b.frame, 640, 480, &saved, &out);
+    CHECK(ui_at(out, 30, 40) == 1);
+
+    b.render_surface = 1; // the same target after the save has expired
+    b.records.clear();
+    out = saved;
+    for (int i = 0; i < 4; ++i)
+        ui_layer_extract(b.frame, 640, 480, &out, &out);
+    CHECK(out.cursor_saves.size() == 1);
+    ui_layer_extract(b.frame, 640, 480, &out, &out);
+    CHECK(out.cursor_saves.empty());
+    b.blit(5, 30, 40, 16, 16);
+    ui_layer_extract(b.frame, 640, 480, &out, &out);
+    CHECK(ui_at(out, 30, 40) == 1);
+    CHECK(b.balanced());
+}
+
 static void test_connectivity_uses_records() {
     test_frame_builder b;
     solid(b, 4);
@@ -438,6 +534,9 @@ int main() {
         {"identity match and split", test_identity_match_and_split},
         {"per-element keys, revisions and palettes", test_replay_per_element_with_key_and_palette},
         {"cursor and HUD flags", test_cursor_and_hud_flags},
+        {"cursor save-under is not UI", test_cursor_save_under_is_not_ui},
+        {"screen copy without cursor keeps UI", test_screen_copy_without_cursor_keeps_ui},
+        {"cursor saves follow target and age", test_cursor_saves_follow_target_and_age},
         {"record connectivity and holes", test_connectivity_uses_records},
         {"grouping sweep matches pairwise connectivity",
          test_grouping_sweep_matches_pairwise_connectivity},
