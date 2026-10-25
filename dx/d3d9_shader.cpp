@@ -257,6 +257,50 @@ Program load(const std::vector<uint8_t> &code) {
 
 } // namespace
 
+size_t instruction_words(uint32_t version, uint32_t token) {
+    const uint32_t op = token & 0xffffu;
+    if (op == OP_END || op == OP_PHASE)
+        return 1;
+    if (op == OP_COMMENT)
+        return 1 + ((token >> 16) & 0x7fffu);
+    const uint32_t major = (version >> 8) & 255, minor = version & 255;
+    const int count = operand_count(op, major, minor, (version >> 16) == 0xffff);
+    if (count < 0)
+        return 0;
+    const size_t words = major >= 2 ? ((token >> 24) & 15) : size_t(count);
+    return words < size_t(count) ? 0 : words + 1;
+}
+
+bool bytecode_extent(const uint8_t *code, size_t available, size_t *bytes, std::string *why) {
+    auto fail = [&](const char *message) {
+        if (why)
+            *why = message;
+        return false;
+    };
+    if (!code || !bytes || available < 8)
+        return fail("truncated shader header");
+    auto read = [&](size_t offset) {
+        return uint32_t(code[offset]) | (uint32_t(code[offset + 1]) << 8) |
+               (uint32_t(code[offset + 2]) << 16) | (uint32_t(code[offset + 3]) << 24);
+    };
+    const uint32_t version = read(0), major = (version >> 8) & 255;
+    if (((version >> 16) != 0xffff && (version >> 16) != 0xfffe) || !major || major > 3)
+        return fail("unsupported shader version");
+    const size_t words = available / 4;
+    for (size_t at = 1; at < words;) {
+        const uint32_t token = read(at * 4);
+        const size_t count = instruction_words(version, token);
+        if (!count || count > words - at)
+            return fail("unsupported or truncated shader instruction");
+        if ((token & 0xffffu) == OP_END) {
+            *bytes = (at + 1) * 4;
+            return true;
+        }
+        at += count;
+    }
+    return fail("shader has no end token");
+}
+
 uint64_t code_key(const uint8_t *code, size_t size) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < size; ++i) {

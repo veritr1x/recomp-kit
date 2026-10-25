@@ -1,5 +1,14 @@
 # Testing
 
+`d3d8_tests` exercises the Direct3D 8 guest vtables, stack cleanup, structure
+sizes, resource ownership, shader handles and actual CPU draw pixels.
+`d3d8_program_tests` checks FVF/declaration decoding, bounded shader parsing,
+constant binding and fixed-function combiner colours. Both carry the `nogame`
+label. `host_tests --d3d9-gpu` runs the same combiner cases on the active GPU
+backend (Metal on Apple platforms, Vulkan on Windows/Linux). These are
+offscreen correctness checks; they do not establish game compatibility or
+playable performance.
+
 Run checks appropriate to your change. Every suite's output belongs under ignored
 `build/`; requested tests must report failure rather than silently skip prerequisites.
 

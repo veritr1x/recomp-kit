@@ -60,6 +60,8 @@
 #include "../../dx/d3d9_msl.h"
 #include "../../dx/d3d9_shader.h"
 #include "../../dx/d3d9_pipeline.h"
+#include "../../dx/d3d8_program.h"
+#include "../../dx/tests/fixtures/d3d8_cases.h"
 
 #include <math.h>
 #ifndef M_PI
@@ -9654,6 +9656,73 @@ static void test_d3d9_ps11_texm3x2() {
     host_d9_texture_drop(T2);
 }
 
+// The very same generated programs and independently computed colours used
+// by the CPU suite must work through every real host shader backend.
+static void test_d3d8_fixed_gpu() {
+    constexpr uint32_t RT = 90100, TEX = 90101;
+    HostD9TextureDesc rt{RT, HOST_D9_TEX_2D, 8, 8, 1, 21, HOST_D9_USAGE_RENDERTARGET};
+    HostD9TextureDesc tex{TEX, HOST_D9_TEX_2D, 1, 1, 1, 21, 0};
+    host_d9_texture_define(&rt);
+    host_d9_texture_define(&tex);
+    const uint8_t bgra[] = {153, 102, 51, 128};
+    host_d9_texture_upload(TEX, 0, 0, bgra, 4);
+    d8::Layout layout;
+    std::string why;
+    CHECK(d8::fvf_layout(0x1c4, &layout, &why));
+    struct Vertex {
+        float x, y, z, w;
+        uint32_t diffuse, specular;
+        float u, v;
+    } vertices[] = {{0, 0, 0.5f, 1, 0xc0994d33u, 0x661a334du, 0, 0},
+                    {8, 0, 0.5f, 1, 0xc0994d33u, 0x661a334du, 0, 0},
+                    {0, 8, 0.5f, 1, 0xc0994d33u, 0x661a334du, 0, 0}};
+    D9Pipeline state;
+    state.sampler_tex[0] = TEX;
+    state.rs[22] = 1;
+    state.rs[60] = 0x99cc6633u;
+    state.tss[0][26] = 3;
+    HostD9Draw draw{};
+    draw.target.color[0] = {RT, 0, 0};
+    draw.viewport[2] = draw.viewport[3] = 8;
+    draw.depth_range[1] = 1;
+    draw.decl = layout.declaration.data();
+    draw.decl_size = uint32_t(layout.declaration.size());
+    draw.decl_id = 90100;
+    draw.stream[0].stride = sizeof(Vertex);
+    draw.inline_vertices = reinterpret_cast<const uint8_t *>(vertices);
+    draw.inline_bytes = sizeof vertices;
+    draw.primitive = 4;
+    draw.primitive_count = 1;
+    draw.sampler_texture[0] = TEX;
+    draw.sampler_state = &state.sampler_state[0][0];
+    draw.render_state = state.rs;
+    draw.render_state_set = reinterpret_cast<const uint8_t *>(state.rs_set);
+    for (const auto &test : d8_combiner_cases) {
+        state.tss[0][1] = test.op;
+        state.tss[0][2] = test.arg1;
+        d8::FixedPrograms code;
+        CHECK(d8::fixed_programs(layout, state, 8, 8, &code, &why));
+        draw.vs = code.vertex.data();
+        draw.vs_size = uint32_t(code.vertex.size());
+        draw.ps = code.pixel.data();
+        draw.ps_size = uint32_t(code.pixel.size());
+        draw.vconst = &code.vertex_constants[0][0];
+        draw.vconst_count = 6;
+        draw.pconst = &code.pixel_constants[0][0];
+        draw.pconst_count = 3;
+        host_d9_clear(&draw.target, draw.viewport, 0, nullptr, 1, 0, 1, 0);
+        host_d9_draw(&draw);
+        uint8_t p[4];
+        d9_pixel(RT, 1, 1, p);
+        CHECK(std::abs(int(p[2]) - test.r) <= 1);
+        CHECK(std::abs(int(p[1]) - test.g) <= 1);
+        CHECK(std::abs(int(p[0]) - test.b) <= 1);
+        CHECK_EQ(p[3], test.alpha);
+    }
+    host_d9_texture_drop(TEX);
+    host_d9_texture_drop(RT);
+}
+
 static void test_d3d9_gpu_renderer() {
     const uint32_t RT = 90001, DEPTH = 90002;
     HostD9TextureDesc rt{RT, HOST_D9_TEX_2D, 8, 8, 1, 21, HOST_D9_USAGE_RENDERTARGET};
@@ -9925,6 +9994,7 @@ int main(int argc, char **argv) {
         }
         test_d3d9_gpu_renderer();
         test_d3d9_ps11_texm3x2();
+        test_d3d8_fixed_gpu();
         printf("d3d9 GPU: %d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;
     }

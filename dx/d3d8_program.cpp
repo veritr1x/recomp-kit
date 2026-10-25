@@ -152,8 +152,48 @@ bool token_layout(const std::vector<uint32_t> &tokens, Layout *out,
     return fail(why, "vertex declaration has no end token");
 }
 
+namespace {
+bool prepare(const std::vector<uint8_t> &bytes, PreparedShader *out, std::string *why) {
+    size_t extent = 0;
+    if (!out || !d9sh::bytecode_extent(bytes.data(), bytes.size(), &extent, why) ||
+        extent != bytes.size())
+        return fail(why, "invalid shader extent");
+    const auto &program = d9sh::program_for(bytes);
+    if (!program.ok)
+        return fail(why, "unsupported shader instruction");
+    const uint32_t limit = program.pixel ? 8 : 96;
+    for (const auto &constant : program.defs)
+        if (constant.first >= limit)
+            return fail(why, "shader constant exceeds the version 8 register file");
+    if (!program.relative && program.max_const > limit)
+        return fail(why, "shader constant exceeds the version 8 register file");
+    for (const auto &instruction : program.code)
+        for (uint32_t i = 0; i < instruction.nsrc; ++i)
+            if (instruction.src[i].type == d9sh::R_CONST && instruction.src[i].index >= limit)
+                return fail(why, "shader constant exceeds the version 8 register file");
+    PreparedShader result;
+    result.constants = program.defs;
+    result.code.insert(result.code.end(), bytes.begin(), bytes.begin() + 4);
+    auto read = [&](size_t at) {
+        uint32_t value;
+        std::memcpy(&value, bytes.data() + at, 4);
+        return value;
+    };
+    const uint32_t version = read(0);
+    for (size_t at = 4; at < bytes.size();) {
+        const uint32_t token = read(at);
+        const size_t length = 4 * d9sh::instruction_words(version, token);
+        if ((token & 0xffffu) != d9sh::OP_DEF)
+            result.code.insert(result.code.end(), bytes.begin() + at, bytes.begin() + at + length);
+        at += length;
+    }
+    *out = std::move(result);
+    return true;
+}
+} // namespace
+
 bool vertex_shader(const Layout &layout, const std::vector<uint8_t> &original,
-                   const std::vector<uint32_t> &constant_defs, std::vector<uint8_t> *out,
+                   const std::vector<uint32_t> &constant_defs, PreparedShader *out,
                    std::string *why) {
     if (!out || original.size() < 8 || original.size() % 4 || original[0] != 1 ||
         original[1] != 1 || original[2] != 0xfe || original[3] != 0xff)
@@ -167,9 +207,13 @@ bool vertex_shader(const Layout &layout, const std::vector<uint8_t> &original,
     for (uint32_t token : constant_defs)
         word(result, token);
     result.insert(result.end(), original.begin() + 4, original.end());
-    if (!d9sh::program_for(result).ok)
-        return fail(why, "unsupported version 1.1 vertex shader instruction");
-    *out = std::move(result);
-    return true;
+    return prepare(result, out, why);
+}
+
+bool pixel_shader(const std::vector<uint8_t> &original, PreparedShader *out, std::string *why) {
+    if (original.size() < 8 || original[0] > 4 || original[1] != 1 || original[2] != 0xff ||
+        original[3] != 0xff)
+        return fail(why, "Direct3D 8 requires a version 1 pixel shader");
+    return prepare(original, out, why);
 }
 } // namespace d8

@@ -23,6 +23,8 @@
 #include "d3d9_pipeline.h"
 #include "d3d9_raster.h"
 #include "d3d9_shader.h"
+#include "d3d9_api.h"
+#include "d3d8_program.h"
 #include "host_d9.h"
 #include <unordered_map>
 #include <map>
@@ -70,6 +72,53 @@ static HostD9Target gpu_target(ComObj *dev);
 static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]);
 static void gpu_target_drawn(ComObj *dev, bool color, bool depth);
 static void gpu_sync(ComObj *o);
+static std::unordered_map<uint32_t, uint32_t> &resource_usage();
+
+// Every resource inherits its device's API version. The storage, revision and
+// GPU contracts are shared, but each out-pointer names the matching vtable.
+uint32_t d9_api_view(ComObj *o, ComIface iface) {
+    if (o && o->d3d_version == 8) {
+        switch (iface) {
+        case IF_D3D9:
+            iface = IF_D3D8;
+            break;
+        case IF_D3DDEVICE9:
+            iface = IF_D3DDEVICE8;
+            break;
+        case IF_D3DTEXTURE9:
+            iface = IF_D3DTEXTURE8;
+            break;
+        case IF_D3DCUBETEXTURE9:
+            iface = IF_D3DCUBETEXTURE8;
+            break;
+        case IF_D3DSURFACE9:
+            iface = IF_D3DSURFACE8;
+            break;
+        case IF_D3DVERTEXBUFFER9:
+            iface = IF_D3DVERTEXBUFFER8;
+            break;
+        case IF_D3DINDEXBUFFER9:
+            iface = IF_D3DINDEXBUFFER8;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return com_view(o, iface);
+}
+
+static bool d9_view_allowed(const ComObj *o, ComIface iface) {
+    const bool version8 = iface >= IF_D3D8 && iface <= IF_D3DINDEXBUFFER8;
+    if (version8 != (o->d3d_version == 8))
+        return false;
+    if (version8 && o->kind == K_D3D9TEXTURE) {
+        if (iface == IF_D3DTEXTURE8 && o->caps)
+            return false;
+        if (iface == IF_D3DCUBETEXTURE8 && !o->caps)
+            return false;
+    }
+    return true;
+}
 
 // One scratch block for structures a method fills in for the guest.
 static uint32_t g_scratch = 0, g_scratch_size = 0;
@@ -114,21 +163,25 @@ void D9_GetAdapterIdentifier(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    memset(gm_ptr(out), 0, 1100);
+    ComObj *factory = this_d3d9(c);
+    const bool version8 = factory && factory->d3d_version == 8;
+    memset(gm_ptr(out), 0, version8 ? 1068 : 1100);
     // Games of this era pick their feature set by vendor and device id, and
     // turn off whatever they do not recognise (Most Wanted offers shadows
     // only on NVIDIA and ATI). The renderer covers what a GeForce 7800 GTX
     // offered, hardware shadow maps included, so that is the card it names.
     gm_put_str(out, "nv4_disp.dll", 512);
     gm_put_str(out + 512, "NVIDIA GeForce 7800 GTX", 512);
-    gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
+    if (!version8)
+        gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
     // Driver[512], Description[512], DeviceName[32], then:
-    wr32(out + 1056, 0x000a249b); // DriverVersion 6.14.10.9371 (low, high)
-    wr32(out + 1060, 0x0006000e);
-    wr32(out + 1064, 0x10de); // VendorId
-    wr32(out + 1068, 0x0091); // DeviceId
-    wr32(out + 1076, 0xa1);   // Revision
-    wr32(out + 1096, 1);      // WHQLLevel: certified
+    const uint32_t at = out + (version8 ? 1024 : 1056);
+    wr32(at, 0x000a249b); // DriverVersion 6.14.10.9371 (low, high)
+    wr32(at + 4, 0x0006000e);
+    wr32(at + 8, 0x10de);  // VendorId
+    wr32(at + 12, 0x0091); // DeviceId
+    wr32(at + 20, 0xa1);   // Revision
+    wr32(at + 40, 1);      // WHQLLevel: certified
     com_ret(c, D3D_OK9);
 }
 
@@ -146,7 +199,13 @@ static void put_display_mode(uint32_t p) {
     wr32(p + 12, 22);
 }
 void D9_EnumAdapterModes(X86 *c) {
-    put_display_mode(arg(c, 4));
+    ComObj *factory = this_d3d9(c);
+    const bool version8 = factory && factory->d3d_version == 8;
+    if (version8 && arg(c, 2)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    put_display_mode(arg(c, version8 ? 3 : 4));
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterDisplayMode(X86 *c) {
@@ -171,7 +230,9 @@ static uint32_t multisample_count(uint32_t type, uint32_t quality) {
 // (this, Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType,
 // pQualityLevels)
 void D9_CheckDeviceMultiSampleType(X86 *c) {
-    uint32_t type = arg(c, 5), quality = arg(c, 6);
+    ComObj *factory = this_d3d9(c);
+    uint32_t type = arg(c, 5);
+    uint32_t quality = factory && factory->d3d_version == 8 ? 0 : arg(c, 6);
     uint32_t levels = type == 0 ? 1 : type == 1 ? 2 : (type == 2 || type == 4) ? 1 : 0;
     if (!levels) {
         com_ret(c, 0x8876086au); // D3DERR_NOTAVAILABLE
@@ -192,10 +253,10 @@ void D9_CheckDeviceFormatConversion(X86 *c) {
 // renderer implements: shader model 3.0, trilinear and 16x anisotropic
 // filtering, the usual blend, compare and stencil sets, non-power-of-two
 // textures, four render targets.
-static void put_caps9(uint32_t p) {
+static void put_caps9(uint32_t p, bool version8 = false) {
     if (!p)
         return;
-    memset(gm_ptr(p), 0, 304);
+    memset(gm_ptr(p), 0, version8 ? 212 : 304);
     auto f = [&](uint32_t off, float v) { wrf32(p + off, v); };
     wr32(p + 0, 1);            // DeviceType: D3DDEVTYPE_HAL
     wr32(p + 8, 0x00020000u);  // Caps: READ_SCANLINE
@@ -256,6 +317,28 @@ static void put_caps9(uint32_t p) {
     wr32(p + 200, 256);         // MaxVertexShaderConst
     wr32(p + 204, 0xffff0300u); // PixelShaderVersion ps_3_0
     f(208, 3.4e38f);            // PixelShaderMaxValue
+    if (version8) {
+        // Only capabilities implemented by the version 8 frontend are
+        // exposed. Lighting, generated coordinates, blending of matrices
+        // and user clip planes must not lure a game into an unsupported path.
+        wr32(p + 28, 0x00080000u); // HWRASTERIZATION; software vertex processing is available
+        wr32(p + 36, rd32(p + 36) & ~0x00010180u); // no fixed-function fog
+        wr32(p + 60, rd32(p + 60) & ~0x0004a000u); // no volume textures
+        wr32(p + 72, 0);                           // VolumeTextureFilterCaps
+        wr32(p + 80, 0);                           // VolumeTextureAddressCaps
+        wr32(p + 96, 0);                           // MaxVolumeExtent
+        wr32(p + 144, d8::texture_operation_caps());
+        wr32(p + 156, 0); // VertexProcessingCaps
+        wr32(p + 160, 0); // MaxActiveLights
+        wr32(p + 164, 0); // MaxUserClipPlanes
+        wr32(p + 168, 0); // MaxVertexBlendMatrices
+        wr32(p + 188, 8); // MaxStreams
+        wr32(p + 196, 0xfffe0101u);
+        wr32(p + 200, 96);
+        wr32(p + 204, 0xffff0101u);
+        f(208, 8.0f);
+        return;
+    }
     wr32(
         p + 212,
         0x00000051u); // DevCaps2: STREAMOFFSET, CAN_STRETCHRECT_FROM_TEXTURES, VERTEXELEMENTSCANSHARESTREAMOFFSET
@@ -279,7 +362,8 @@ static void put_caps9(uint32_t p) {
     wr32(p + 300, 32768);       // MaxPixelShader30InstructionSlots
 }
 void D9_GetDeviceCaps(X86 *c) {
-    put_caps9(arg(c, 3));
+    ComObj *factory = this_d3d9(c);
+    put_caps9(arg(c, 3), factory && factory->d3d_version == 8);
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterMonitor(X86 *c) {
@@ -300,16 +384,24 @@ void D9_CreateDevice(X86 *c) {
         return;
     }
     dev->dev_d3d = d3d->id;
+    dev->d3d_version = d3d->d3d_version;
+    const bool version8 = dev->d3d_version == 8;
     // D3DPRESENT_PARAMETERS: back buffer size and format first, the device
     // window at 28 and Windowed at 32.
     if (present) {
         dev->width = rd32(present + 0);
         dev->height = rd32(present + 4);
         dev->bpp = 32;
-        dev->hwnd = rd32(present + 28);
-        dev->samples = multisample_count(rd32(present + 16), rd32(present + 20));
+        dev->hwnd = rd32(present + (version8 ? 24 : 28));
+        dev->samples = multisample_count(rd32(present + 16), version8 ? 0 : rd32(present + 20));
+        if (version8) {
+            dev->d3d_format = rd32(present + 8) ? rd32(present + 8) : 22;
+            dev->d3d_depth_format = rd32(present + 36);
+            if (!dev->hwnd)
+                dev->hwnd = arg(c, 3);
+        }
     }
-    uint32_t view = com_view(dev, IF_D3DDEVICE9);
+    uint32_t view = d9_api_view(dev, IF_D3DDEVICE9);
     if (!view) {
         com_release(dev);
         com_ret(c, E_OUTOFMEMORY);
@@ -321,7 +413,7 @@ void D9_CreateDevice(X86 *c) {
         pl.color_target[0] = bb ? bb->id : 0;
         pl.scissor[2] = (int32_t)dev->width;
         pl.scissor[3] = (int32_t)dev->height;
-        if (present && rd32(present + 36)) {
+        if (present && rd32(present + (version8 ? 32 : 36))) {
             device_depthbuffer(dev);
             pl.rs[7] = 1; // ZENABLE defaults on with an automatic depth buffer
             pl.states_changed();
@@ -453,7 +545,12 @@ void Dev_Reset(X86 *c) {
     }
     dev->width = rd32(present + 0);
     dev->height = rd32(present + 4);
-    dev->samples = multisample_count(rd32(present + 16), rd32(present + 20));
+    const bool version8 = dev->d3d_version == 8;
+    dev->samples = multisample_count(rd32(present + 16), version8 ? 0 : rd32(present + 20));
+    if (version8) {
+        dev->d3d_format = rd32(present + 8) ? rd32(present + 8) : 22;
+        dev->d3d_depth_format = rd32(present + 36);
+    }
     device_forget_buffers(dev);
     ComObj *bb = device_backbuffer(dev);
     dev->render_target = bb ? bb->id : 0;
@@ -465,7 +562,7 @@ void Dev_Reset(X86 *c) {
     pl.scissor[0] = pl.scissor[1] = 0;
     pl.scissor[2] = (int32_t)dev->width;
     pl.scissor[3] = (int32_t)dev->height;
-    if (rd32(present + 36)) { // EnableAutoDepthStencil
+    if (rd32(present + (version8 ? 32 : 36))) { // EnableAutoDepthStencil
         device_depthbuffer(dev);
         pl.rs[7] = 1;
         pl.states_changed();
@@ -492,13 +589,14 @@ void Dev_GetDirect3D(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t view = com_view(d3d, IF_D3D9);
+    uint32_t view = d9_api_view(d3d, IF_D3D9);
     com_addref(d3d);
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
 }
 void Dev_GetDeviceCaps(X86 *c) {
-    put_caps9(arg(c, 1));
+    ComObj *dev = this_device9(c);
+    put_caps9(arg(c, 1), dev && dev->d3d_version == 8);
     com_ret(c, D3D_OK9);
 }
 void Dev_BeginScene(X86 *c) {
@@ -674,6 +772,8 @@ static void stage_unlock(ComObj *o) {
 }
 
 static void d3d9_resource_destroy(ComObj *o) {
+    if (o->d3d_version == 8)
+        d3d8_resource_destroy(o);
     if (o->pixels)
         heap_free(o->pixels);
     o->pixels = 0;
@@ -741,6 +841,7 @@ static ComObj *make_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t fmt) {
     if (!s)
         return nullptr;
     s->dev_d3d = dev ? dev->id : 0;
+    s->d3d_version = dev ? dev->d3d_version : 9;
     s->width = w ? w : 1;
     s->height = h ? h : 1;
     s->rmask = fmt; // the D3DFORMAT, which a Direct3D 9 surface has no other field for
@@ -756,6 +857,20 @@ static ComObj *make_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t fmt) {
         resource_alloc(s, s->pitch * s->height);
     }
     return s;
+}
+
+ComObj *d9_api_surface(ComObj *dev, uint32_t width, uint32_t height, uint32_t format,
+                       uint32_t sample_type, uint32_t usage, uint32_t pool) {
+    if (!dev || !width || !height)
+        return nullptr;
+    ComObj *surface = make_surface(dev, width, height, format);
+    if (surface) {
+        surface->samples = multisample_count(sample_type, 0);
+        surface->d3d_usage = usage;
+        surface->d3d_pool = pool;
+        resource_usage()[surface->id] = usage;
+    }
+    return surface;
 }
 
 // ---- What the CPU renderer needs to know about surfaces and textures --------
@@ -1018,8 +1133,12 @@ void Dev_CreateVertexBuffer(X86 *c) {
         return;
     }
     vb->dev_d3d = dev->id;
+    vb->d3d_version = dev->d3d_version;
+    vb->d3d_usage = arg(c, 2);
+    vb->d3d_pool = arg(c, 4);
+    vb->d3d_fvf = arg(c, 3);
     vb->buf_bytes = bytes;
-    uint32_t view_ = com_view(vb, IF_D3DVERTEXBUFFER9);
+    uint32_t view_ = d9_api_view(vb, IF_D3DVERTEXBUFFER9);
     if (!view_) {
         com_release(vb);
         com_ret(c, E_OUTOFMEMORY);
@@ -1045,9 +1164,12 @@ void Dev_CreateIndexBuffer(X86 *c) {
         return;
     }
     ib->dev_d3d = dev->id;
+    ib->d3d_version = dev->d3d_version;
+    ib->d3d_usage = arg(c, 2);
+    ib->d3d_pool = arg(c, 4);
     ib->buf_bytes = bytes;
     ib->rmask = arg(c, 3) == 102 ? 4 : 2; // D3DFMT_INDEX32 or D3DFMT_INDEX16
-    uint32_t view_ = com_view(ib, IF_D3DINDEXBUFFER9);
+    uint32_t view_ = d9_api_view(ib, IF_D3DINDEXBUFFER9);
     if (!view_) {
         com_release(ib);
         com_ret(c, E_OUTOFMEMORY);
@@ -1071,6 +1193,9 @@ void Dev_CreateTexture(X86 *c) {
         return;
     }
     tex->dev_d3d = dev->id;
+    tex->d3d_version = dev->d3d_version;
+    tex->d3d_usage = arg(c, 4);
+    tex->d3d_pool = arg(c, 6);
     tex->width = w;
     tex->height = h;
     tex->bpp = format_bytes(fmt) * 8;
@@ -1090,10 +1215,12 @@ void Dev_CreateTexture(X86 *c) {
         if (!s)
             break;
         s->front_obj = tex->id;
+        s->d3d_usage = tex->d3d_usage;
+        s->d3d_pool = tex->d3d_pool;
         tex->surfaces.push_back(s->id);
     }
     tex->back_obj = tex->surfaces.empty() ? 0 : tex->surfaces[0];
-    uint32_t view_ = com_view(tex, IF_D3DTEXTURE9);
+    uint32_t view_ = d9_api_view(tex, IF_D3DTEXTURE9);
     if (!view_) {
         com_release(tex);
         com_ret(c, E_OUTOFMEMORY);
@@ -1120,10 +1247,13 @@ void Dev_CreateCubeTexture(X86 *c) {
     tex->width = tex->height = edge;
     tex->bpp = format_bytes(fmt) * 8;
     tex->rmask = fmt;
-    tex->caps = 1;                              // a cube map
+    tex->caps = 1; // a cube map
+    tex->d3d_version = dev->d3d_version;
+    tex->d3d_usage = arg(c, 3);
+    tex->d3d_pool = arg(c, 5);
     tex->pal_flags = arg(c, 2) ? arg(c, 2) : 1; // levels, reusing a field cubes do not use
     resource_usage()[tex->id] = arg(c, 3) & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL);
-    uint32_t view = com_view(tex, IF_D3DCUBETEXTURE9);
+    uint32_t view = d9_api_view(tex, IF_D3DCUBETEXTURE9);
     if (!view) {
         com_release(tex);
         com_ret(c, E_OUTOFMEMORY);
@@ -1150,7 +1280,7 @@ static void create_surface_method(X86 *c, uint32_t out_index, uint32_t fmt_index
     if (out_index == 7)
         s->samples = multisample_count(arg(c, 4), arg(c, 5));
     resource_usage()[s->id] = usage;
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    uint32_t view_ = d9_api_view(s, IF_D3DSURFACE9);
     if (!view_) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -1181,12 +1311,15 @@ void Dev_CreateOffscreenPlainSurface(X86 *c) {
 static ComObj *device_backbuffer(ComObj *dev) {
     ComObj *s = com_get(dev->palette_obj);
     if (!s) {
-        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 22);
+        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480,
+                         dev->d3d_format);
         dev->palette_obj = s ? s->id : 0;
         if (s)
             s->samples = dev->samples;
         if (s)
             resource_usage()[s->id] = USAGE_RENDERTARGET;
+        if (s)
+            s->d3d_usage = USAGE_RENDERTARGET;
         if (s && !com_get(dev->render_target))
             dev->render_target = s->id;
     }
@@ -1268,12 +1401,15 @@ void Dev_StretchRect(X86 *c) {
 static ComObj *device_depthbuffer(ComObj *dev) {
     ComObj *s = com_get(dev->zbuffer_obj);
     if (!s) {
-        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 75);
+        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480,
+                         dev->d3d_depth_format);
         dev->zbuffer_obj = s ? s->id : 0;
         if (s)
             s->samples = dev->samples;
         if (s)
             resource_usage()[s->id] = USAGE_DEPTHSTENCIL;
+        if (s)
+            s->d3d_usage = USAGE_DEPTHSTENCIL;
     }
     return s;
 }
@@ -1292,14 +1428,14 @@ static void device_forget_buffers(ComObj *dev) {
 // (this, iSwapChain, iBackBuffer, Type, ppBackBuffer)
 void Dev_GetBackBuffer(X86 *c) {
     ComObj *dev = this_device9(c);
-    uint32_t out = arg(c, 4);
+    uint32_t out = arg(c, dev && dev->d3d_version == 8 ? 3 : 4);
     ComObj *s = dev ? device_backbuffer(dev) : nullptr;
     if (!s || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    uint32_t view_ = d9_api_view(s, IF_D3DSURFACE9);
     if (!view_) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -1318,7 +1454,7 @@ void Dev_GetDepthStencilSurface(X86 *c) {
         return;
     }
     com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    uint32_t view_ = d9_api_view(s, IF_D3DSURFACE9);
     if (!view_) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -1386,7 +1522,7 @@ void Dev_CreateVertexDeclaration(X86 *c) {
         if (stream == 0xff)
             break;
     }
-    uint32_t view_ = com_view(d, IF_D3DVERTEXDECL9);
+    uint32_t view_ = d9_api_view(d, IF_D3DVERTEXDECL9);
     if (!view_) {
         com_release(d);
         com_ret(c, E_OUTOFMEMORY);
@@ -1425,7 +1561,7 @@ void Dev_CreateQuery(X86 *c) {
     }
     q->dev_d3d = dev ? dev->id : 0;
     q->dev_type = type;
-    uint32_t view_ = com_view(q, IF_D3DQUERY9);
+    uint32_t view_ = d9_api_view(q, IF_D3DQUERY9);
     if (!view_) {
         com_release(q);
         com_ret(c, E_OUTOFMEMORY);
@@ -1436,31 +1572,34 @@ void Dev_CreateQuery(X86 *c) {
 }
 
 // (this, StreamNumber, pStreamData, OffsetInBytes, Stride)
-void Dev_SetStreamSource(X86 *c) {
-    ComObj *dev = this_device9(c);
-    ComObj *vb = com_this(arg(c, 2));
-    uint32_t stream = arg(c, 1);
+void d9_api_stream(ComObj *dev, uint32_t stream, ComObj *vb, uint32_t offset, uint32_t stride) {
     if (dev && stream < 8) {
         D9Pipeline::Stream &st = d9_pipeline(dev->id).stream[stream];
         st.vb = (vb && vb->kind == K_D3D9VB) ? vb->id : 0;
-        st.offset = arg(c, 3);
-        st.stride = arg(c, 4);
+        st.offset = offset;
+        st.stride = stride;
     }
     if (dev && stream == 0 && vb && vb->kind == K_D3D9VB) {
         dev->back_obj = vb->id;
-        dev->lock_off = arg(c, 3);
-        dev->rate = arg(c, 4); // the stride, reusing a spare field
+        dev->lock_off = offset;
+        dev->rate = stride; // the stride, reusing a spare field
     }
+}
+
+void Dev_SetStreamSource(X86 *c) {
+    d9_api_stream(this_device9(c), arg(c, 1), com_this(arg(c, 2)), arg(c, 3), arg(c, 4));
     com_ret(c, D3D_OK9);
 }
 
-void Dev_SetIndices(X86 *c) {
-    ComObj *dev = this_device9(c);
-    ComObj *ib = com_this(arg(c, 1));
+void d9_api_indices(ComObj *dev, ComObj *ib) {
     if (dev) {
         dev->front_obj = (ib && ib->kind == K_D3D9IB) ? ib->id : 0;
         d9_pipeline(dev->id).index_buffer = dev->front_obj;
     }
+}
+
+void Dev_SetIndices(X86 *c) {
+    d9_api_indices(this_device9(c), com_this(arg(c, 1)));
     com_ret(c, D3D_OK9);
 }
 
@@ -1652,8 +1791,7 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
 }
 
 // Hands one draw to the CPU renderer with what the device has bound.
-static void raster(X86 *c, const D9DrawCall &call) {
-    ComObj *dev = this_device9(c);
+static void raster(ComObj *dev, const D9DrawCall &call) {
     if (!dev)
         return;
     ComObj *target = com_get(dev->render_target);
@@ -1688,7 +1826,7 @@ void Dev_DrawPrimitive(X86 *c) {
         call.vertex_bytes = vb->blob.size() - dev->lock_off;
         call.stride = dev->rate;
         call.first = arg(c, 2);
-        raster(c, call);
+        raster(this_device9(c), call);
     }
     com_ret(c, D3D_OK9);
 }
@@ -1698,40 +1836,46 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     if (draw_worth_reporting())
         LOGW("d3d9: draw %u: %s, %u primitives, %u vertices from index %u, indexed", g_draws,
              prim_name(arg(c, 1)), arg(c, 6), arg(c, 4), arg(c, 5));
-    ComObj *dev = this_device9(c);
+    d9_api_indexed_draw(this_device9(c), arg(c, 1), (int32_t)arg(c, 2), arg(c, 5), arg(c, 6));
+    com_ret(c, D3D_OK9);
+}
+
+// BaseVertexIndex is explicit here: version 8 binds it with SetIndices,
+// whereas version 9 supplies it with each draw. Neither frontend rewrites
+// the guest's argument frame to call the other ABI.
+void d9_api_indexed_draw(ComObj *dev, uint32_t primitive, int32_t base_vertex, uint32_t first_index,
+                         uint32_t primitive_count) {
     if (dev && gpu_on()) {
         ComObj *ibo = com_get(d9_pipeline(dev->id).index_buffer);
         if (ibo) {
             gpu_sync_buffer(ibo);
             HostD9Draw d{};
-            d.primitive = arg(c, 1);
-            d.primitive_count = arg(c, 6);
-            d.start = arg(c, 5);
-            d.base_vertex = (int32_t)arg(c, 2);
+            d.primitive = primitive;
+            d.primitive_count = primitive_count;
+            d.start = first_index;
+            d.base_vertex = base_vertex;
             d.index_buffer = ibo->id;
             d.index_size = ibo->rmask ? ibo->rmask : 2;
             gpu_draw(dev, d);
         }
-        com_ret(c, D3D_OK9);
         return;
     }
     ComObj *vb = dev ? com_get(dev->back_obj) : nullptr;
     ComObj *ib = dev ? com_get(dev->front_obj) : nullptr;
     if (vb && resource_bytes(vb) && ib && resource_bytes(ib) && dev->lock_off < vb->blob.size()) {
         D9DrawCall call;
-        call.prim = arg(c, 1);
-        call.prim_count = arg(c, 6);
+        call.prim = primitive;
+        call.prim_count = primitive_count;
         call.vertex_data = resource_bytes(vb) + dev->lock_off;
         call.vertex_bytes = vb->blob.size() - dev->lock_off;
         call.stride = dev->rate;
         call.index_data = resource_bytes(ib);
         call.index_bytes = ib->blob.size();
         call.index_size = ib->rmask ? ib->rmask : 2;
-        call.base_vertex = (int32_t)arg(c, 2);
-        call.first = arg(c, 5);
-        raster(c, call);
+        call.base_vertex = base_vertex;
+        call.first = first_index;
+        raster(dev, call);
     }
-    com_ret(c, D3D_OK9);
 }
 
 // (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, Stride): the
@@ -1819,7 +1963,7 @@ void Dev_DrawPrimitiveUP(X86 *c) {
     call.prim_count = arg(c, 2);
     call.vertices = arg(c, 3);
     call.stride = arg(c, 4);
-    raster(c, call);
+    raster(this_device9(c), call);
     com_ret(c, D3D_OK9);
 }
 
@@ -1856,7 +2000,7 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
     call.stride = arg(c, 8);
     call.indices = arg(c, 5);
     call.index_size = arg(c, 6) == 102 ? 4 : 2;
-    raster(c, call);
+    raster(this_device9(c), call);
     com_ret(c, D3D_OK9);
 }
 
@@ -1899,7 +2043,7 @@ void Surf_GetContainer(X86 *c) {
     ComObj *parent = com_get(s->front_obj);
     if (parent) {
         com_addref(parent);
-        com_out_ptr(out, com_view(parent, parent->caps ? IF_D3DCUBETEXTURE9 : IF_D3DTEXTURE9));
+        com_out_ptr(out, d9_api_view(parent, parent->caps ? IF_D3DCUBETEXTURE9 : IF_D3DTEXTURE9));
         com_ret(c, D3D_OK9);
         return;
     }
@@ -1909,7 +2053,7 @@ void Surf_GetContainer(X86 *c) {
         return;
     }
     com_addref(dev);
-    com_out_ptr(out, com_view(dev, IF_D3DDEVICE9));
+    com_out_ptr(out, d9_api_view(dev, IF_D3DDEVICE9));
     com_ret(c, D3D_OK9);
 }
 
@@ -1922,7 +2066,7 @@ void Res_GetDevice(X86 *c) {
         return;
     }
     com_addref(dev);
-    com_out_ptr(out, com_view(dev, IF_D3DDEVICE9));
+    com_out_ptr(out, d9_api_view(dev, IF_D3DDEVICE9));
     com_ret(c, D3D_OK9);
 }
 
@@ -2014,6 +2158,8 @@ static ComObj *cube_face(ComObj *tex, uint32_t face, uint32_t level) {
         if (!s)
             return nullptr;
         s->front_obj = tex->id;
+        s->d3d_usage = tex->d3d_usage;
+        s->d3d_pool = tex->d3d_pool;
         tex->surfaces[slot] = s->id;
     }
     return s;
@@ -2030,12 +2176,13 @@ void Tex_GetCubeMapSurface(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t view = com_view(s, IF_D3DSURFACE9);
+    uint32_t view = d9_api_view(s, IF_D3DSURFACE9);
     if (!view) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    com_addref(tex);
+    if (tex->d3d_version != 8)
+        com_addref(tex);
     com_addref(s);
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
@@ -2095,9 +2242,10 @@ void Tex_GetSurfaceLevel(X86 *c) {
     // A level is a view into the texture and references it, the same way a
     // cube face does.
     s->front_obj = tex->id;
-    com_addref(tex);
+    if (tex->d3d_version != 8)
+        com_addref(tex);
     com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    uint32_t view_ = d9_api_view(s, IF_D3DSURFACE9);
     if (!view_) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -2542,10 +2690,37 @@ static const ComMethod g_device9[] = {
     {"CreateQuery", 3, Dev_CreateQuery},
 };
 
+// Version 8 explicitly selects only shared, implemented methods with the
+// same argument layout. Its different slots and unsupported methods remain
+// in the version 8 frontend; no vtable is reused by position.
+const ComMethod *d9_api_method(ComIface iface, const char *name) {
+    if (!name)
+        return nullptr;
+#define D9_METHODS(which, table)                                                                   \
+    case which:                                                                                    \
+        for (const auto &method : table)                                                           \
+            if (!strcmp(method.name, name))                                                        \
+                return &method;                                                                    \
+        break
+    switch (iface) {
+        D9_METHODS(IF_D3D9, g_d3d9);
+        D9_METHODS(IF_D3DDEVICE9, g_device9);
+        D9_METHODS(IF_D3DTEXTURE9, g_texture9);
+        D9_METHODS(IF_D3DCUBETEXTURE9, g_cubetexture9);
+        D9_METHODS(IF_D3DSURFACE9, g_surface9);
+        D9_METHODS(IF_D3DVERTEXBUFFER9, g_vb9);
+        D9_METHODS(IF_D3DINDEXBUFFER9, g_ib9);
+    default:
+        break;
+    }
+#undef D9_METHODS
+    return nullptr;
+}
+
 // The DLL's one export. Not a COM method: the guest calls it directly.
 void d3d9_Direct3DCreate9(X86 *c) {
     ComObj *o = com_new(K_D3D9);
-    uint32_t view = o ? com_view(o, IF_D3D9) : 0;
+    uint32_t view = o ? d9_api_view(o, IF_D3D9) : 0;
     if (!view) {
         if (o)
             com_release(o);
@@ -2571,6 +2746,8 @@ void d3d9_register() {
         return;
     done = true;
 
+    for (ComKind kind : {K_D3D9, K_D3D9DEVICE, K_D3D9TEXTURE, K_D3D9SURFACE, K_D3D9VB, K_D3D9IB})
+        com_set_view_filter(kind, d9_view_allowed);
     com_define(IF_D3D9, "d3d9.dll", "IDirect3D9", g_d3d9, std::size(g_d3d9));
     com_define(IF_D3DDEVICE9, "d3d9.dll", "IDirect3DDevice9", g_device9, std::size(g_device9));
     com_bind(IF_D3D9, K_D3D9);

@@ -4,6 +4,7 @@
 #include "d3d9_pipeline.h"
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -25,11 +26,18 @@ bool fvf_layout(uint32_t fvf, Layout *out, std::string *why);
 bool token_layout(const std::vector<uint32_t> &tokens, Layout *out,
                   std::vector<uint32_t> *constant_defs, std::string *why);
 
-// Add semantic declarations to a version 1.1 program whose register bindings
-// were supplied separately by Direct3D 8's vertex declaration.
+struct PreparedShader {
+    std::vector<uint8_t> code;
+    std::map<uint32_t, std::array<float, 4>> constants;
+};
+
+// Add semantic declarations to a version 1.1 program. Direct3D 8 applies DEF
+// constants when binding a shader, so they become initial register values,
+// rather than immutable Direct3D 9 shader-local definitions.
 bool vertex_shader(const Layout &layout, const std::vector<uint8_t> &original,
-                   const std::vector<uint32_t> &constant_defs, std::vector<uint8_t> *out,
+                   const std::vector<uint32_t> &constant_defs, PreparedShader *out,
                    std::string *why);
+bool pixel_shader(const std::vector<uint8_t> &original, PreparedShader *out, std::string *why);
 struct FixedPrograms {
     std::vector<uint8_t> vertex, pixel;
     float vertex_constants[6][4] = {};

@@ -18,7 +18,9 @@ std::deque<ComObj> &objects() {
 uint32_t g_vtable[IF_COUNT] = {0};
 uint64_t g_kind_mask[IF_COUNT] = {0}; // bit per ComKind
 void (*g_dtor[64])(ComObj *) = {nullptr};
+void (*g_ref_hook[64])(ComObj *, int32_t, int32_t) = {nullptr};
 ComQiHook g_qi_hook[64] = {nullptr};
+ComViewFilter g_view_filter[64] = {nullptr};
 const char *g_iface_name[IF_COUNT] = {nullptr};
 
 struct IidEntry {
@@ -121,6 +123,8 @@ ComObj *com_this_arg(X86 *c, ComIface want) {
 
 uint32_t com_view(ComObj *o, ComIface iface) {
     if (!o || iface == IF_NONE || iface >= IF_COUNT)
+        return 0;
+    if ((size_t)o->kind < 64 && g_view_filter[o->kind] && !g_view_filter[o->kind](o, iface))
         return 0;
     if (o->views[iface])
         return o->views[iface];
@@ -246,15 +250,25 @@ void com_set_destructor(ComKind kind, void (*fn)(ComObj *)) {
 }
 
 void com_addref(ComObj *o) {
-    if (o)
+    if (o) {
         ++o->refs;
+        if ((size_t)o->kind < 64 && g_ref_hook[o->kind])
+            g_ref_hook[o->kind](o, o->refs - 1, o->refs);
+    }
+}
+void com_set_ref_hook(ComKind kind, void (*fn)(ComObj *, int32_t, int32_t)) {
+    if ((size_t)kind < 64)
+        g_ref_hook[kind] = fn;
 }
 
 int32_t com_release(ComObj *o) {
     if (!o || !o->alive)
         return 0;
-    if (--o->refs > 0)
-        return o->refs;
+    if (--o->refs > 0) {
+        if ((size_t)o->kind < 64 && g_ref_hook[o->kind])
+            g_ref_hook[o->kind](o, o->refs + 1, o->refs);
+        return o->alive ? o->refs : 0;
+    }
     if (o->refs < 0) {
         LOGW("dx: over-release of object %u (kind %u)", o->id, (unsigned)o->kind);
         o->refs = 0;
@@ -656,6 +670,11 @@ void com_set_qi_hook(ComKind kind, ComQiHook hook) {
         g_qi_hook[kind] = hook;
 }
 
+void com_set_view_filter(ComKind kind, ComViewFilter filter) {
+    if ((size_t)kind < 64)
+        g_view_filter[kind] = filter;
+}
+
 // ---------------------------------------------------------------------------
 // IUnknown
 // ---------------------------------------------------------------------------
@@ -721,6 +740,11 @@ void com_QueryInterface(X86 *c) {
         ComObj *alt = g_qi_hook[o->kind](o, want);
         if (alt)
             target = alt;
+    }
+    if ((size_t)target->kind < 64 && g_view_filter[target->kind] &&
+        !g_view_filter[target->kind](target, want)) {
+        com_ret(c, E_NOINTERFACE);
+        return;
     }
     if ((uint32_t)target->kind < 64 &&
         !(g_kind_mask[want] & (uint64_t(1) << (uint32_t)target->kind))) {

@@ -141,6 +141,17 @@ enum ComIface : uint16_t {
     IF_DINPUTDEVICE8,
     // IDirectSound8: the DirectSound object through its version 8 vtable.
     IF_DSOUND8,
+    // Direct3D 8 views share the version 9 resource implementation, while
+    // retaining their own ABI and controlling identity.
+    IF_D3D8,
+    IF_D3DDEVICE8,
+    IF_D3DRESOURCE8,
+    IF_D3DBASETEXTURE8,
+    IF_D3DTEXTURE8,
+    IF_D3DCUBETEXTURE8,
+    IF_D3DSURFACE8,
+    IF_D3DVERTEXBUFFER8,
+    IF_D3DINDEXBUFFER8,
     IF_COUNT
 };
 
@@ -241,6 +252,12 @@ struct ComObj {
     // to return the same pointer for the lifetime of the object, so this is
     // fixed on first use and never revised when a lower-numbered view appears.
     uint32_t identity = 0;
+
+    // The shader-era Direct3D objects keep the API version on every child,
+    // so a resource's GetDevice/GetContainer returns the caller's ABI.
+    uint32_t d3d_version = 9;
+    uint32_t d3d_usage = 0, d3d_pool = 0, d3d_fvf = 0;
+    uint32_t d3d_format = 22, d3d_depth_format = 75;
 
     // --- K_DDRAW
     uint32_t hwnd = 0;
@@ -409,6 +426,9 @@ int32_t com_release(ComObj *o);
 void com_destroy(ComObj *o);
 // A module may hook its resource teardown here.
 void com_set_destructor(ComKind kind, void (*fn)(ComObj *));
+// Optional ownership notification after a live object's reference count
+// changes. The callback may release another object, including an owner.
+void com_set_ref_hook(ComKind kind, void (*fn)(ComObj *, int32_t, int32_t));
 
 // ---------------------------------------------------------------------------
 // Vtables
@@ -443,6 +463,11 @@ ComIface com_iface_for_iid(uint32_t guest_guid_addr);
 // false is the normal case.
 typedef ComObj *(*ComQiHook)(ComObj *self, ComIface want);
 void com_set_qi_hook(ComKind kind, ComQiHook hook);
+// A family can restrict its bound interfaces per object (for example, a
+// version 8 resource must never hand out a version 9 vtable). This applies
+// both to direct view creation and to QueryInterface, after redirection.
+using ComViewFilter = bool (*)(const ComObj *, ComIface);
+void com_set_view_filter(ComKind kind, ComViewFilter filter);
 
 // ---------------------------------------------------------------------------
 // COM classes: what ole32's CoCreateInstance can make. A module registers the

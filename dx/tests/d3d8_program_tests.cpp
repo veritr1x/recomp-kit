@@ -2,6 +2,7 @@
 #include "../d3d9_shader.h"
 #include "../d3d9_raster.h"
 #include "../com.h"
+#include "fixtures/d3d8_cases.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -66,13 +67,25 @@ void declarations() {
     for (uint32_t value : {0xfffe0101u, 1u, 0xc00f0000u, 0x90e40000u, 0xffffu})
         for (int k = 0; k < 4; ++k)
             original.push_back(uint8_t(value >> (8 * k)));
-    std::vector<uint8_t> converted;
+    d8::PreparedShader converted;
     CHECK(d8::vertex_shader(layout, original, {}, &converted, &why));
-    const auto &program = d9sh::program_for(converted);
+    const auto &program = d9sh::program_for(converted.code);
     CHECK(program.ok && program.inputs.size() == 3);
     CHECK(program.inputs[1].index == 5 && program.inputs[1].usage == 10);
     CHECK(program.code.size() == 1 && program.code[0].op == d9sh::OP_MOV);
     CHECK(original.size() == 20); // the caller's bytecode is immutable
+    CHECK(d8::vertex_shader(layout, original,
+                            {d9sh::OP_DEF, 0xa00f0002u, 0x3f800000u, 0xffffu, 0, 0}, &converted,
+                            &why));
+    CHECK(converted.constants.size() == 1 && converted.constants.at(2)[0] == 1.0f);
+    CHECK(d9sh::program_for(converted.code).defs.empty());
+    size_t extent = 99;
+    CHECK(d9sh::bytecode_extent(converted.code.data(), converted.code.size(), &extent, &why));
+    CHECK(extent == converted.code.size());
+    CHECK(!d9sh::bytecode_extent(original.data(), original.size() - 4, &extent, &why));
+    auto truncated = original;
+    truncated.resize(8);
+    CHECK(!d8::vertex_shader(layout, truncated, {}, &converted, &why));
     original[1] = 2;
     CHECK(!d8::vertex_shader(layout, original, {}, &converted, &why));
 }
@@ -111,20 +124,7 @@ void fixed_pixels() {
     draw.stride = sizeof(Vertex);
     draw.vertex_data = reinterpret_cast<const uint8_t *>(vertices);
     draw.vertex_bytes = sizeof vertices;
-    struct Case {
-        uint32_t op, arg1;
-        int r, g, b, alpha = 128;
-    };
-    const Case cases[] = {{1, 2, 153, 77, 51, 192}, {2, 2, 51, 102, 153},   {3, 2, 153, 77, 51},
-                          {4, 2, 31, 31, 31},       {5, 2, 61, 62, 61},     {6, 2, 122, 123, 122},
-                          {7, 2, 204, 179, 204},    {8, 2, 77, 52, 77},     {9, 2, 153, 103, 153},
-                          {10, 2, 0, 25, 102},      {11, 2, 173, 148, 173}, {12, 2, 76, 96, 128},
-                          {13, 2, 102, 90, 102},    {14, 2, 92, 92, 112},   {15, 2, 127, 140, 178},
-                          {16, 2, 76, 96, 128},     {17, 2, 51, 102, 153},  {18, 2, 128, 141, 179},
-                          {19, 2, 159, 159, 159},   {20, 2, 127, 140, 178}, {21, 2, 250, 174, 148},
-                          {24, 2, 0, 0, 0},         {25, 2, 235, 133, 82},  {26, 2, 71, 87, 71},
-                          {4, 0x12, 122, 46, 20},   {4, 0x22, 77, 39, 26},  {2, 3, 204, 102, 51}};
-    for (const Case &test : cases) {
+    for (const auto &test : d8_combiner_cases) {
         state.tss[0][1] = test.op;
         state.tss[0][2] = test.arg1;
         d8::FixedPrograms programs;
@@ -158,6 +158,30 @@ void fixed_pixels() {
     CHECK(d8::fixed_programs(layout, state, 16, 16, &after, &why));
     CHECK(before.vertex == after.vertex && before.pixel == after.pixel);
     CHECK(before.vertex_constants[4][0] == 2 * after.vertex_constants[4][0]);
+    auto check_stages = [&](int r, int g, int b, int alpha) {
+        d8::FixedPrograms programs;
+        CHECK(d8::fixed_programs(layout, state, 8, 8, &programs, &why));
+        state.vs.bytes = std::make_shared<const std::vector<uint8_t>>(programs.vertex);
+        state.ps.bytes = std::make_shared<const std::vector<uint8_t>>(programs.pixel);
+        std::memcpy(state.vconst, programs.vertex_constants, sizeof programs.vertex_constants);
+        std::memcpy(state.pconst, programs.pixel_constants, sizeof programs.pixel_constants);
+        d9_raster_draw(device, target, layout.declaration, draw);
+        const uint8_t *p = &target->blob[(1 * 8 + 1) * 4];
+        CHECK(std::abs(int(p[2]) - r) <= 1 && std::abs(int(p[1]) - g) <= 1 &&
+              std::abs(int(p[0]) - b) <= 1 && std::abs(int(p[3]) - alpha) <= 1);
+    };
+    state.sampler_tex[1] = texture->id;
+    state.tss[0][1] = 17; // PREMODULATE feeds the next stage's current colour
+    state.tss[1][1] = state.tss[1][4] = 3;
+    check_stages(10, 41, 92, 64);
+    state.tss[0][1] = 2;
+    state.tss[0][28] = 5; // write TEMP instead of CURRENT
+    state.tss[1][1] = state.tss[1][4] = 7;
+    state.tss[1][2] = state.tss[1][5] = 5;
+    check_stages(204, 179, 204, 255);
+    state.tss[0][1] = 1;
+    state.rs[29] = 1; // post-combiner specular preserves alpha
+    check_stages(179, 128, 128, 192);
 }
 } // namespace
 

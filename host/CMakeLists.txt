@@ -327,6 +327,7 @@ pop_host(host_tests UI_LAYER
           ${POP_ROOT}/dx/d3d11.cpp ${POP_ROOT}/dx/dxgi.cpp
           ${POP_ROOT}/dx/d3dcompiler.cpp ${POP_ROOT}/dx/d3dx10.cpp
           ${POP_ROOT}/dx/d3d9_shader.cpp ${POP_ROOT}/dx/d3d9_shadergen.cpp
+            ${POP_ROOT}/dx/d3d8_program.cpp ${POP_ROOT}/dx/d3d8_fixed.cpp
           ${POP_ROOT}/dx/host_d9_default.cpp
   LIBS recomp_platform recomp_runtime gpu_backend gpu_fake ${POP_D9_LIBS}
   FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})

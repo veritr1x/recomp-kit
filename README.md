@@ -233,6 +233,12 @@ supported in the browser.
 
 ## Other platforms and GPU APIs
 
+Direct3D 8 uses the same renderer through version 8 interfaces, FVF and
+vertex-declaration conversion, vs_1_1/ps_1_1 shaders and generated unlit
+fixed-function programs. Caps exclude unsupported lighting, fog, volume
+textures, bump mapping and clip planes; other unimplemented slots log and
+return failure.
+
 Direct3D 9 renders on Metal (macOS, iOS), Vulkan (Linux, Windows, and macOS
 through MoltenVK with `RECOMP_GPU_BACKEND=vulkan`) and WebGPU (the
 web), all from one shader generator. Windows builds cross-compile on macOS or

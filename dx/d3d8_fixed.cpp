@@ -186,6 +186,10 @@ bool fixed_programs(const Layout &layout, const D9Pipeline &state, uint32_t widt
                     FixedPrograms *out, std::string *why) {
     if (!out || layout.attributes.empty() || !width || !height)
         return fail(why, "missing layout or render target");
+    if (!layout.transformed && state.rs[137])
+        return fail(why, "fixed-function lighting is not supported");
+    if (state.rs[28])
+        return fail(why, "fixed-function fog is not supported");
     FixedPrograms result;
     auto &vs = result.vertex;
     auto &ps = result.pixel;
@@ -198,8 +202,6 @@ bool fixed_programs(const Layout &layout, const D9Pipeline &state, uint32_t widt
             colors[a.usage_index] = a.reg;
         if (a.usage == 5 && a.usage_index < 8)
             coordinates[a.usage_index] = a.reg;
-        if (a.usage == 3 && state.rs[137] && !layout.transformed)
-            return fail(why, "fixed-function lighting is not supported");
     }
     if (layout.transformed) {
         const float x = state.viewport_set ? float(state.viewport[0]) : 0;

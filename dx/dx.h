@@ -14,6 +14,7 @@
 #pragma once
 #include "../runtime/guest.h"
 #include <stdio.h>
+struct ComObj;
 
 // Registers every DirectDraw, Direct3D, DirectSound, DirectInput, QMixer and
 // weanetr shim and builds the COM vtables in guest memory. Idempotent.
@@ -28,6 +29,7 @@ void dx_reset();
 void ddraw_register();
 void d3d_register();
 void d3d9_register();
+void d3d8_register();
 void d3dx9_register();
 void dsound_register();
 void dshow_register();
@@ -59,6 +61,8 @@ void mf_reset();
 void ddraw_reset();
 void d3d_reset();
 void d3d9_reset();
+void d3d8_reset();
+void d3d8_resource_destroy(ComObj *object);
 void d3dx9_reset();
 void dsound_reset();
 void dshow_reset();

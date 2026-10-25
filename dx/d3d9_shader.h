@@ -145,6 +145,10 @@ struct Program {
 
 // A decoded program, cached by its bytes.
 const Program &program_for(const std::vector<uint8_t> &code);
+// Structural token sizes, including each opcode. A bounded extent scan
+// distinguishes END from the same bits in a constant or comment payload.
+size_t instruction_words(uint32_t version, uint32_t opcode);
+bool bytecode_extent(const uint8_t *code, size_t available, size_t *bytes, std::string *why);
 // The key that names a program's bytes (64-bit FNV-1a, never zero), and the
 // program cached under it: the per-draw path looks programs up by key.
 uint64_t code_key(const uint8_t *code, size_t size);
