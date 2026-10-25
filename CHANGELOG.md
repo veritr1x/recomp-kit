@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Software cursors that erase themselves with pixels saved from the render
+  target no longer leave a box of stale screen content beside the cursor.
+
 - Add a Direct3D 8 frontend with version 8 interfaces and structure layouts,
   FVF and vertex-declaration conversion, vs_1_1/ps_1_1 shader handles, and
   generated unlit fixed-function programs shared by the CPU and GPU renderers.

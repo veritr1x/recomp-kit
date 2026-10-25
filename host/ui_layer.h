@@ -13,9 +13,19 @@ struct UiElement {
     std::vector<uint8_t> mask; // One byte per pixel: 1 where this element drew.
 };
 
+// A rectangle a software cursor saved from the render target: a save from
+// the target whose rectangle holds a cursor draw in the same frame. age counts
+// the extractions since the save.
+struct UiCursorSave {
+    HostSurfaceId target;
+    int x, y, w, h;
+    uint32_t age;
+};
+
 struct UiFrame {
     std::vector<UiElement> elements;
     int guest_w, guest_h;
+    std::vector<UiCursorSave> cursor_saves{};
 };
 
 // The caller keeps f alive for the call. Output owns all its bytes and retains
