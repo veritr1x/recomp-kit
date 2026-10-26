@@ -89,6 +89,12 @@ const char *watch_writer() {
 }
 } // namespace
 
+#ifdef __wasm__
+extern "C" void recomp_tail(X86 *c, uint32_t fn) {
+    reinterpret_cast<void (*)(X86 *)>(static_cast<uintptr_t>(fn))(c);
+}
+#endif
+
 extern "C" void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, uint32_t after) {
     // Rate-limited: a routine that does this does it on every call, and the
     // first few name it as well as thousands would. EIP is where the callee

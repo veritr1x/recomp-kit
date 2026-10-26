@@ -146,7 +146,7 @@ def _jump_table_targets():
     `case` in an emitted switch is a jump-table target by construction."""
     out = set()
     for path in sorted(glob.glob(os.path.join(GEN, "chunk_*.c"))):
-        out |= set(re.findall(r"case 0x[0-9a-f]+u?: CALL_FN\(([0-9a-f]{8})\);",
+        out |= set(re.findall(r"case 0x[0-9a-f]+u?: TAIL_FN2?\(([0-9a-f]{8})\);",
                               read(path)))
     return out
 

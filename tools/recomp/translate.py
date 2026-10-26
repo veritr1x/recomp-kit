@@ -2664,6 +2664,7 @@ class Translator(object):
         if head:
             labels.add(fn.addr)
         prologue = 0                 # lines before the first instruction
+        fn.multi = bool(entries)     # body_ (two parameters): jumps use TAIL_FN2
         if entries:
             out.append("static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
             if fn.seh_escapes:
@@ -3506,7 +3507,7 @@ class Translator(object):
             return ["goto L_%08x;" % t]
         if t in self.func_addrs:
             self.stats["_tailcall"] += 1
-            return ["CALL_FN(%08x); return;" % t]
+            return ["%s(%08x); return;" % (tail_fn(fn), t)]
         self.stats["_tailcall_unknown"] += 1
         self.notes.append("%08x: jump to %08x outside any known function" % (ins.addr, t))
         return ["c->eip = %s; recomp_jump(c, %s); return;" % (hexlit(ins.addr), hexlit(t))]
@@ -3550,7 +3551,7 @@ class Translator(object):
             if t in fn.index:
                 L.append("case %s: goto L_%08x;" % (hexlit(t), t))
             else:
-                L.append("case %s: CALL_FN(%08x); return;" % (hexlit(t), t))
+                L.append("case %s: %s(%08x); return;" % (hexlit(t), tail_fn(fn), t))
         L.append("default: c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
         L.append("}")
         return L
@@ -3917,7 +3918,12 @@ class Translator(object):
 
 # --------------------------------------------------------------- driver ----
 
-WITHDRAWN_CALL_RE = re.compile(r"CALL_FN\(([0-9a-f]{8})\);( return;)?")
+def tail_fn(fn):
+    """The jump macro for code in fn: a forced tail call needs the caller's signature."""
+    return "TAIL_FN2" if getattr(fn, "multi", False) else "TAIL_FN"
+
+
+WITHDRAWN_CALL_RE = re.compile(r"(?:CALL|TAIL)_FN2?\(([0-9a-f]{8})\);( return;)?")
 WITHDRAWN_JUMP_RE = re.compile(r"(?:c->eip = 0x[0-9a-f]{1,8}u; )?recomp_jump\(c, 0x([0-9a-f]{1,8})u\); return;")
 
 
@@ -5712,7 +5718,34 @@ def main():
                  "    if (recomp_frame_watch && c->r[5] != ebp_)\\\n"
                  "        recomp_frame_changed(c, %sfunc_addrs[i_], ebp_, c->r[5]);\\\n"
                  "} while (0)\n"
-                 "#endif\n" % (P, P, P, P, P))
+                 "#endif\n"
+                 "/* A jump into another function (always followed by return) ends in a tail\n"
+                 " * call, so a loop that crosses functions does not grow the stack.  The web\n"
+                 " * merges a function's returns and then makes none (and its stack is small),\n"
+                 " * so there it is forced: musttail needs the caller's signature, so TAIL_FN2,\n"
+                 " * for body_ (two parameters), goes through recomp_tail.  noinline: inlining\n"
+                 " * a fn_ that only calls its body_ would leave that call a plain one. */\n"
+                 "#ifdef __wasm__\n"
+                 "#define TAIL_CALL_(a) [[clang::noinline]] __attribute__((musttail)) return FN(a)(c)\n"
+                 "#define TAIL_CALL2_(a) __attribute__((musttail)) return recomp_tail(c, (uint32_t)(uintptr_t)&FN(a))\n"
+                 "#else\n"
+                 "#define TAIL_CALL_(a) FN(a)(c)\n"
+                 "#define TAIL_CALL2_(a) FN(a)(c)\n"
+                 "#endif\n"
+                 "#ifdef RECOMP_NO_HOOKS\n"
+                 "#define TAIL_FN_(a, t) do { if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[FIDX(a)]); break; } t(a); } while (0)\n"
+                 "#else\n"
+                 "#define TAIL_FN_(a, t) do {\\\n"
+                 "    uint32_t i_ = FIDX(a);\\\n"
+                 "    if (__builtin_expect(recomp_frame_watch != 0u, 0)) { CALL_FN(a); break; }\\\n"
+                 "    if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[i_]); break; }\\\n"
+                 "    if (__builtin_expect(__atomic_load_n(&%shooked[i_],"
+                 " __ATOMIC_ACQUIRE) != 0u, 0)) { %shook_ptrs[i_](c, i_); break; }\\\n"
+                 "    t(a);\\\n"
+                 "} while (0)\n"
+                 "#endif\n"
+                 "#define TAIL_FN(a) TAIL_FN_(a, TAIL_CALL_)\n"
+                 "#define TAIL_FN2(a) TAIL_FN_(a, TAIL_CALL2_)\n" % (P, P, P, P, P, P, P, P, P))
         for i, a in enumerate(entry_names):
             fh.write("#define FIDX_%08x %du\n" % (a, i))
         # Both spellings are declared: fn_ADDR because the chunk defines it,

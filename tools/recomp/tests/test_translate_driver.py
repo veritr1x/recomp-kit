@@ -327,6 +327,26 @@ def test_return_switch_requires_pushed_instruction_boundary(target, dispatch):
     assert "void fn_00601005(X86 *c) { body_00601000(c, 0x601005u); }" in text
 
 
+@pytest.mark.parametrize("entries,macro", [([], "TAIL_FN"), ([0x00601005], "TAIL_FN2")])
+def test_a_jump_into_another_function_is_a_tail_call(entries, macro):
+    """A JMP to another function is a tail call, so a guest loop split across
+    two functions does not grow the host stack.  The web forces it with
+    musttail, which needs the caller's signature: a two-parameter body_ uses
+    TAIL_FN2."""
+    from test_translate_insns import Opts
+    entry, other = 0x00601000, 0x00601100
+    code = b"\xb8\x2a\x00\x00\x00\xe9\xf6\x00\x00\x00"   # MOV EAX,0x2a; JMP other
+    img = synthetic_image({entry: code, other: b"\xc3"}, base=0x00600000)
+    insns = T.parse_listing_text("00601000  MOV EAX,0x2a\n00601005  JMP 0x601100\n")
+    fn = T.Function(entry, "loop_half", len(code), insns)
+    fn.measure(img)
+    tr = T.Translator(img, {entry, other}, Opts())
+    tr.prepare(fn)
+    text = "\n".join(tr.translate(fn, entries))
+    assert "%s(00601100); return;" % macro in text
+    assert "CALL_FN(00601100)" not in text
+
+
 @pytest.mark.parametrize("indirect", [False, True])
 def test_tableless_jump_uses_all_local_instruction_labels(indirect):
     from test_translate_insns import Opts
@@ -818,7 +838,7 @@ def test_nested_except_join_keeps_outer_finally_in_establishing_body(tmp_path, m
     assert T.main() == 0
     text = '\n'.join(p.read_text() for p in out.glob('chunk_*.c'))
     for stub in (outer_stub, inner_stub):
-        assert "void fn_%08x(X86 *c) {\n    CALL_FN(%08x); return;" % (stub, dispatcher) in text
+        assert "void fn_%08x(X86 *c) {\n    TAIL_FN(%08x); return;" % (stub, dispatcher) in text
     # Normal execution must retain the frame until the epilogue restores ESP/EBP.
     assert 'void fn_%08x(X86 *c) { body_%08x(c, %s); }' % (cleanup, entry, T.hexlit(cleanup)) in text
     body = text.split('static void body_%08x(' % entry, 1)[1].split('void fn_%08x(' % entry, 1)[0]
@@ -1098,7 +1118,7 @@ def test_equal_rank_candidates_bound_speculative_sweeps(tmp_path, monkeypatch, t
     if terminated:
         body = text.split("void fn_%08x(X86 *c) {" % guess)[1].split("\n}", 1)[0]
         assert "XOR EAX,EAX" not in body
-        assert "CALL_FN(%08x)" % method in body
+        assert "TAIL_FN(%08x)" % method in body
 
 
 @pytest.mark.parametrize("fault", [None, "element_size", "refcount", "zero_length",

@@ -398,6 +398,9 @@ static inline void recomp_comis(X86 *c, double a, double b) {
 /* Indirect CALL: dispatch `target` to a translated function, an import shim,
  * or recomp_unknown_call.  Generated into build/recomp/gen/table.c. */
 void recomp_call(X86 *c, uint32_t target);
+/* Calls `fn`, a translated function's address; generated TAIL_FN2 tail calls it
+ * from a body_ on the web (musttail needs a two-parameter callee there). */
+void recomp_tail(X86 *c, uint32_t fn);
 /* Entry/callback driver for images that switch cooperative guest stacks. */
 void recomp_run(X86 *c, uint32_t target);
 extern const int recomp_resumable_stacks;

@@ -116,9 +116,9 @@
       "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
       "cacheVariables": {
         "RECOMP_VIDEO": "OFF",
-        "CMAKE_C_FLAGS": "-pthread",
-        "CMAKE_CXX_FLAGS": "-pthread",
-        "CMAKE_EXE_LINKER_FLAGS": "-pthread"
+        "CMAKE_C_FLAGS": "-pthread -mtail-call",
+        "CMAKE_CXX_FLAGS": "-pthread -mtail-call",
+        "CMAKE_EXE_LINKER_FLAGS": "-pthread -mtail-call"
       }
     },
     {
