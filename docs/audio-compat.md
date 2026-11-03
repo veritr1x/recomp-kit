@@ -1,4 +1,4 @@
-# OpenAL and Bink compatibility
+# OpenAL, Bink and vorbisfile compatibility
 
 `OpenAL32.dll` is served by the runtime's DirectX layer. One playback device,
 `Generic Software`, supports contexts, a listener, shared device buffers,
@@ -55,8 +55,39 @@ Summary and realtime outputs cover their full 124/56-byte SDK records;
 unmeasured native timing counters stay zero. Without FFmpeg, the existing
 finished-record fallback remains available. Smacker is still unavailable.
 
-Issue #32 also requests Epic's modified vorbisfile 1.2 ABI. Its report gives
-the object size and argument counts, but not the five argument types/order
-for `ov_read`. The public [Xiph signature](https://xiph.org/vorbis/doc/vorbisfile/ov_read.html)
-takes seven arguments. The modified DLL/header or contributor implementation
-is needed to verify that boundary; this change does not claim to serve it.
+## vorbisfile
+
+Unreal Engine 3 games ship Epic's build of libvorbisfile 1.2.0. With FFmpeg
+enabled, `vorbisfile.dll` serves its seven decoding entry points, all cdecl:
+`ov_open_callbacks`, `ov_read`, `ov_info`, `ov_pcm_total`, `ov_time_total`,
+`ov_pcm_seek_page` and `ov_clear`. Two differ from the public 1.2.0 API, as
+measured from a shipped DLL and its callers:
+
+- `ov_open_callbacks(datasource, vf, initial, ibytes, callbacks, sizeof_vf)`
+  takes a ninth stack argument after the four by-value callbacks. It must be
+  `0x2d8`, `sizeof(OggVorbis_File)`, or the call returns -139.
+- `ov_read(vf, buffer, length, sgned, bitstream)` takes five arguments, not the
+  [seven of Xiph's signature](https://xiph.org/vorbis/doc/vorbisfile/ov_read.html).
+  Output is always 16-bit little-endian, scaled by 32768, truncated and
+  clamped; `sgned == 0` offsets each sample by 0x8000. Only whole frames are
+  returned; a length under one frame is `OV_EINVAL`.
+
+The guest owns the 0x2d8-byte `OggVorbis_File` and its callers only pass its
+address back, so decoder state stays on the host, keyed by that address. The
+record is zeroed and receives libvorbisfile's fields: datasource +0, seekable
++4, link count +0x34, `vorbis_info` pointer +0x48, ready state +0x58 and the
+four callbacks at +0x2c8. The 32-byte `vorbis_info` (version, channels, rate,
+three bitrates, window, codec_setup) is guest heap, one per open file.
+
+The datasource is read only through the guest's callbacks, on the guest
+thread that made the call. A stream is seekable when seek and tell exist and
+`seek(0, SEEK_CUR)` succeeds, libvorbisfile's own test. Its length is the
+last page's granule position; `ov_read` returns exactly that many frames,
+cutting decoder output past it and padding a shortfall with silence, because
+UE3 sizes its buffer from `ov_pcm_total` and reads until it is full.
+Unseekable streams report no length and decode whatever FFmpeg produces.
+`ov_pcm_seek_page` reopens the stream and decodes forward to the exact
+frame, at a cost proportional to the position. Chained (multi-link) files are
+not modelled: one link and bitstream 0 are reported. Without FFmpeg the
+imports stay unresolved. The encoder DLLs (`vorbisenc.dll`, `vorbis.dll`,
+`ogg.dll`) are not served.

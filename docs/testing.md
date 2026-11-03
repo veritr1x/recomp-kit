@@ -9,7 +9,13 @@ reproduced this when app resources contained core manifests but no dynamic DLL.
 `openal_tests` captures mixer calls and advances the guest clock to check
 source progress, processed queues, shared-context buffer lifetimes, stable
 pitch/pan, all six distance models, format/rate refusal, null upload bounds,
-multichannel folding and device cleanup. Bink tests in `dx_tests` cover the
+multichannel folding and device cleanup. `vorbisfile_tests` decodes a
+synthetic Ogg tone through guest callbacks with the modified UE3 ABI: the
+size argument, five-argument `ov_read`, record fields, granule-exact length,
+channel order, signed/unsigned output, seeking, initial bytes, unseekable
+streams and error codes. `RECOMP_TEST_OGG=host-path[,offset,length]`
+additionally decodes a private Ogg stream, optionally stored raw inside a
+larger package, and checks its length against the last granule. Bink tests in `dx_tests` cover the
 legacy/SDK records, registered Y/cR/cB planes, seek back to frame one and
 full summary/realtime guards with `RECOMP_TEST_BINK_CONTAINER=host-path,offset`.
 Use a colored fixture to establish sensitivity to swapped chroma planes.

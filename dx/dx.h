@@ -49,6 +49,15 @@ void galaxy_stub_register();
 void bink_register();
 void openal_register();
 void openal_reset();
+// Ogg Vorbis (vorbisfile.dll, cdecl): the seven decoding entry points of the
+// libvorbisfile 1.2.0 build that Unreal Engine 3 games ship, served by the
+// kit's FFmpeg. Without FFmpeg nothing registers.
+void vorbisfile_register();
+// Drops the open files; mem_init already discarded the guest records.
+void vorbisfile_reset();
+// Test only: how many decoded streams had to be padded or cut to the length
+// their granule positions give (0 while FFmpeg agrees with them).
+uint64_t vorbisfile_fixups_for_test();
 void weanetr_register();
 // Media Foundation: the session, the topology it is given and the file it
 // plays. Registered last of the media shims because nothing else defers to it.
