@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Software cursors that erase themselves with pixels saved from the render
+  target no longer leave a box of stale screen content beside the cursor.
+  Match cursor-sized saves and their restore sources so ordinary screen
+  captures, unrelated UI and fills stay visible.
+
 - Serve vorbisfile.dll's seven decoding imports through FFmpeg with the
   modified libvorbisfile 1.2.0 ABI that Unreal Engine 3 games ship: the
   `sizeof(OggVorbis_File)` argument (0x2d8, else -139) and five-argument,
