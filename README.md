@@ -90,7 +90,9 @@ still refuses to open a video.
 OpenAL playback and streaming use the shared host mixer, including clock-based
 progress on a silent host. Bink supports memory-resident input, registered SDK
 planes and rewind/forward seeking. Use `[bink] record = "sdk"` for the SDK
-record fields; the default remains `"legacy"`. See
+record fields; the default remains `"legacy"`. `vorbisfile.dll` decodes Ogg
+Vorbis through the same libraries with the modified libvorbisfile 1.2.0 ABI
+that Unreal Engine 3 games ship. See
 [audio compatibility](docs/audio-compat.md) for layouts and approximations.
 
 iOS cross-builds for arm64 and iOS 17.0 with the iPhoneOS SDK. Xcode embeds
