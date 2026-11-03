@@ -193,7 +193,8 @@ static size_t ui_at(const UiFrame &out, int x, int y) {
 // The cursor's save-under sequence: write stale pixels onto its rectangle,
 // save that rectangle from the target, draw the cursor there.
 static void cursor_frame(test_frame_builder &b, int x, int y) {
-    b.blit(5, x, y, 16, 16);
+    b.blit(HOST_SRC_CPU, x, y, 16, 16);
+    b.cpu(std::vector<uint8_t>(16 * 16, 1), 8, 16);
     auto &save = b.blit(b.render_surface, 0, 0, 16, 16);
     save.dst = 7;
     save.src_x = x;
@@ -217,7 +218,7 @@ static void test_cursor_save_under_is_not_ui() {
     CHECK(b.balanced());
 }
 
-// A copy from the target is a cursor save only when the cursor draws inside
+// A copy from the target is a cursor save only when the cursor draws on
 // the saved rectangle. Otherwise UI on that rectangle is kept.
 static void test_screen_copy_without_cursor_keeps_ui() {
     for (bool cursor_elsewhere : {false, true}) {
@@ -256,7 +257,8 @@ static void test_cursor_saves_follow_target_and_age() {
     UiFrame saved = out;
 
     b.records.clear();
-    b.blit(5, 30, 40, 16, 16); // the write-back, next frame
+    b.blit(HOST_SRC_CPU, 30, 40, 16, 16); // the write-back, next frame
+    b.cpu(std::vector<uint8_t>(16 * 16, 1), 8, 16);
     ui_layer_extract(b.frame, 640, 480, &out, &out);
     CHECK(out.elements.empty() && out.cursor_saves.empty());
 
@@ -278,6 +280,94 @@ static void test_cursor_saves_follow_target_and_age() {
     ui_layer_extract(b.frame, 640, 480, &out, &out);
     CHECK(ui_at(out, 30, 40) == 1);
     CHECK(b.balanced());
+}
+
+// An ordinary screen capture can contain a cursor without being its save-under.
+// Neither surface blits nor CPU writes of that larger rectangle may disappear.
+static void test_screen_capture_with_cursor_keeps_ui() {
+    for (bool cpu_write : {false, true}) {
+        test_frame_builder b;
+        b.cursor_surface = 9;
+        for (auto src : {1u, 5u})
+            b.revision({src, 1}, 640, 480, 8, std::vector<uint8_t>(640 * 480, 1));
+        solid(b, 9);
+        auto &copy = b.blit(1, 0, 0, 640, 480);
+        copy.dst = 7;
+        b.blit(cpu_write ? HOST_SRC_CPU : 5, 0, 0, 640, 480);
+        if (cpu_write)
+            b.cpu(std::vector<uint8_t>(640 * 480, 1), 8, 640);
+        b.blit(9, 100, 100, 16, 16);
+        UiFrame out{};
+        ui_layer_extract(b.frame, 640, 480, nullptr, &out);
+        CHECK(ui_at(out, 0, 0) == 1);
+        CHECK(out.cursor_saves.empty());
+        CHECK(b.balanced());
+    }
+}
+
+// A restore blit must read the surface and offset actually written by the save.
+// Other UI and fills on the same rectangle must not consume that save.
+static void test_cursor_restore_matches_saved_source() {
+    test_frame_builder b;
+    b.cursor_surface = 9;
+    for (auto src : {1u, 5u, 7u, 9u})
+        solid(b, src);
+    b.revision({7, 1}, 32, 32, 8, std::vector<uint8_t>(32 * 32, 1));
+    auto &copy = b.blit(1, 0, 0, 16, 16);
+    copy.dst = 7;
+    copy.dst_x = 3;
+    copy.dst_y = 4;
+    copy.src_x = 30;
+    copy.src_y = 40;
+    b.blit(9, 30, 40, 16, 16);
+    UiFrame saved{};
+    ui_layer_extract(b.frame, 640, 480, nullptr, &saved);
+    CHECK(saved.cursor_saves.size() == 1);
+    for (auto src : {HOST_SURFACE_NONE, 5u, 7u}) {
+        b.records.clear();
+        auto &write = b.blit(src, 30, 40, 16, 16);
+        write.src_x = src == 7 ? 1 : 0;
+        UiFrame out{};
+        ui_layer_extract(b.frame, 640, 480, &saved, &out);
+        CHECK(ui_at(out, 30, 40) == 1);
+        CHECK(out.cursor_saves.size() == 1);
+        CHECK(b.balanced());
+    }
+    b.records.clear();
+    b.blit(5, 30, 40, 16, 16); // unrelated UI before the real restore
+    auto &restore = b.blit(7, 30, 40, 16, 16);
+    restore.src_x = 3;
+    restore.src_y = 4;
+    UiFrame out{};
+    ui_layer_extract(b.frame, 640, 480, &saved, &out);
+    CHECK(out.elements.size() == 1 && out.elements[0].src == 5);
+    CHECK(out.cursor_saves.empty());
+    CHECK(b.balanced());
+}
+
+// A cursor drawn before a copy does not establish a later save-under. A CPU
+// write after a same-frame save likewise does not erase a previous cursor.
+static void test_cursor_save_requires_matching_sequence() {
+    for (bool cursor_first : {false, true}) {
+        test_frame_builder b;
+        b.cursor_surface = 9;
+        solid(b, 9);
+        if (cursor_first)
+            b.blit(9, 30, 40, 16, 16);
+        auto &copy = b.blit(1, 0, 0, 16, 16);
+        copy.dst = 7;
+        copy.src_x = 30;
+        copy.src_y = 40;
+        b.blit(HOST_SRC_CPU, 30, 40, 16, 16);
+        b.cpu(std::vector<uint8_t>(16 * 16, 1), 8, 16);
+        if (!cursor_first)
+            b.blit(9, 30, 40, 16, 16);
+        UiFrame out{};
+        ui_layer_extract(b.frame, 640, 480, nullptr, &out);
+        CHECK(ui_at(out, 30, 40) == 1);
+        CHECK(out.cursor_saves.size() == (cursor_first ? 0u : 1u));
+        CHECK(b.balanced());
+    }
 }
 
 static void test_connectivity_uses_records() {
@@ -537,6 +627,9 @@ int main() {
         {"cursor save-under is not UI", test_cursor_save_under_is_not_ui},
         {"screen copy without cursor keeps UI", test_screen_copy_without_cursor_keeps_ui},
         {"cursor saves follow target and age", test_cursor_saves_follow_target_and_age},
+        {"screen capture with cursor keeps UI", test_screen_capture_with_cursor_keeps_ui},
+        {"cursor restore matches saved source", test_cursor_restore_matches_saved_source},
+        {"cursor save requires matching sequence", test_cursor_save_requires_matching_sequence},
         {"record connectivity and holes", test_connectivity_uses_records},
         {"grouping sweep matches pairwise connectivity",
          test_grouping_sweep_matches_pairwise_connectivity},

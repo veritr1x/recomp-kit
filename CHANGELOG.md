@@ -4,6 +4,8 @@
 
 - Software cursors that erase themselves with pixels saved from the render
   target no longer leave a box of stale screen content beside the cursor.
+  Match cursor-sized saves and their restore sources so ordinary screen
+  captures, unrelated UI and fills stay visible.
 
 - Embed the game's core mods in Windows/Linux smoke and headless hosts, as
   the desktop app does, so shared app resources cannot leave diagnostics
