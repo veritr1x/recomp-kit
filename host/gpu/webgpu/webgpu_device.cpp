@@ -862,6 +862,10 @@ void WebGpuDevice::dispatch_groups(CommandBuffer cb, int groups_x, int groups_y,
 
 void WebGpuDevice::blit(CommandBuffer cb, Texture src, Region src_region, Texture dst, int dst_x,
                         int dst_y) {
+    // Clipped cursor saves can be empty. WebGPU still validates empty depth
+    // copies as whole-subresource operations, invalidating the entire batch.
+    if (src_region.w <= 0 || src_region.h <= 0)
+        return;
     if (off_main())
         return on_main_void([&] { blit(cb, src, src_region, dst, dst_x, dst_y); });
     Cmd *c = cmd(cb);
@@ -881,6 +885,8 @@ void WebGpuDevice::blit(CommandBuffer cb, Texture src, Region src_region, Textur
 
 void WebGpuDevice::copy_buffer_to_texture(CommandBuffer cb, Buffer src, uint64_t offset, int pitch,
                                           Texture dst, Region dst_region) {
+    if (dst_region.w <= 0 || dst_region.h <= 0)
+        return;
     if (off_main())
         return on_main_void(
             [&] { copy_buffer_to_texture(cb, src, offset, pitch, dst, dst_region); });
@@ -903,6 +909,8 @@ void WebGpuDevice::copy_buffer_to_texture(CommandBuffer cb, Buffer src, uint64_t
 
 void WebGpuDevice::copy_texture_to_buffer(CommandBuffer cb, Texture src, Region src_region,
                                           Buffer dst, uint64_t offset, int pitch) {
+    if (src_region.w <= 0 || src_region.h <= 0)
+        return;
     if (off_main())
         return on_main_void(
             [&] { copy_texture_to_buffer(cb, src, src_region, dst, offset, pitch); });

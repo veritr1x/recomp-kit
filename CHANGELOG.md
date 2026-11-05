@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix the fixed-function WebGPU shader using a reserved WGSL identifier,
+  which prevented Direct3D 2/3 games from drawing. Ignore empty texture
+  transfers so clipped cursor saves do not invalidate a command batch.
+
 - Allow `--stream ID=INSTALL` to stage a full private installation when the
   analysis input contains only executable images. Retain pinned hashes and
   prepared auxiliary overrides without modifying the configured input tree.
