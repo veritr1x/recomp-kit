@@ -18,6 +18,18 @@
   Skip WebGPU drawable acquisition while the canvas backing store is zero
   sized, so collapsed views can resume without invalid-texture submissions.
 
+- Software cursors that erase themselves with pixels saved from the render
+  target no longer leave a box of stale screen content beside the cursor.
+  Match cursor-sized saves and their restore sources so ordinary screen
+  captures, unrelated UI and fills stay visible.
+
+- Serve vorbisfile.dll's seven decoding imports through FFmpeg with the
+  modified libvorbisfile 1.2.0 ABI that Unreal Engine 3 games ship: the
+  `sizeof(OggVorbis_File)` argument (0x2d8, else -139) and five-argument,
+  always 16-bit `ov_read`. Read through the guest's callbacks on the calling
+  thread, fill libvorbisfile's record fields, return exactly the granule
+  length and seek by exact decode. Chained streams report one link. Fixes #32.
+
 - Embed the game's core mods in Windows/Linux smoke and headless hosts, as
   the desktop app does, so shared app resources cannot leave diagnostics
   loading manifests without their plugin implementations.

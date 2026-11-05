@@ -13,9 +13,20 @@ struct UiElement {
     std::vector<uint8_t> mask; // One byte per pixel: 1 where this element drew.
 };
 
+// A save of exactly the rectangle drawn by the software cursor. Keep the
+// destination surface/offset to distinguish its restore from unrelated UI.
+// age counts extractions; save_seq is zero for a save from an earlier frame.
+struct UiCursorSave {
+    HostSurfaceId target, storage;
+    int x, y, w, h;
+    int storage_x, storage_y;
+    uint32_t age, save_seq;
+};
+
 struct UiFrame {
     std::vector<UiElement> elements;
     int guest_w, guest_h;
+    std::vector<UiCursorSave> cursor_saves{};
 };
 
 // The caller keeps f alive for the call. Output owns all its bytes and retains
