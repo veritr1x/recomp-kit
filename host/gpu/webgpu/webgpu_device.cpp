@@ -3,6 +3,7 @@
 #include "shaders_wgsl.h"
 
 #include <emscripten/emscripten.h>
+#include <emscripten/html5.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 
@@ -1013,6 +1014,7 @@ Swapchain WebGpuDevice::create_swapchain(void *native_surface, int width, int he
     WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
     sd.nextInChain = &canvas.chain;
     Chain c;
+    c.canvas_selector = selector;
     c.surface = wgpuInstanceCreateSurface(instance_, &sd);
     if (!c.surface)
         return {};
@@ -1062,6 +1064,14 @@ Texture WebGpuDevice::acquire(Swapchain s) {
     if (it == chains_.end())
         return {};
     Chain &c = it->second;
+    // SDL can collapse the canvas backing store independently of resize().
+    // Do not acquire an invalid drawable while a hidden view has zero size.
+    int canvas_w = 0, canvas_h = 0;
+    if (c.width <= 0 || c.height <= 0 ||
+        emscripten_get_canvas_element_size(c.canvas_selector.c_str(), &canvas_w, &canvas_h) !=
+            EMSCRIPTEN_RESULT_SUCCESS ||
+        canvas_w <= 0 || canvas_h <= 0)
+        return {};
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
     wgpuSurfaceGetCurrentTexture(c.surface, &st);
     if (!st.texture || (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&

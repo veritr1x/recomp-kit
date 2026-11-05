@@ -147,6 +147,7 @@ class WebGpuDevice final : public Device {
     };
     struct Chain {
         WGPUSurface surface = nullptr;
+        std::string canvas_selector;
         WGPUTextureFormat format = WGPUTextureFormat_BGRA8Unorm;
         int width = 0, height = 0;
         uint64_t current = 0; // the acquired texture's handle

@@ -216,14 +216,20 @@ replaces the old `[touch] keypad`, which is still accepted (`"auto"` →
 
 ## Run in a browser
 
-Requires the Emscripten SDK (`source emsdk_env.sh`) and a macOS or Linux
-build already regenerated, or `--stub`.
+Requires the Emscripten SDK (tested with 6.0.11) and a prepared game
+installation and Ghidra listings. Translation and the web build can run on
+Windows, macOS or Linux; `--stub` builds without game inputs.
 
 ```sh
-.venv/bin/python tools/build.py --target web
+.venv/bin/python tools/build.py --target web --regenerate
 .venv/bin/python kit/tools/web_launcher.py --game-dir "$PWD" --out build/web-site \
     --web-build <game id>=build/web/recomp --serve 8000
 ```
+
+Activate the SDK first with `source /path/to/emsdk/emsdk_env.sh`, or
+`& C:\path\to\emsdk\emsdk_env.ps1` in PowerShell. Windows uses
+`.venv/Scripts/python.exe`. Later builds can omit `--regenerate` when the
+translation and translator have not changed.
 
 `--target web` builds the `web` preset (WebGPU, pthreads, WasmFS) and writes
 `build/web-site`: the launcher page with the game's build in `<game id>/`.
@@ -233,9 +239,11 @@ does that for local testing. The launcher imports the player's copy of the
 game into the browser's private storage, and Play opens the game page, which
 asks for a WebGPU device (tested in Chrome on macOS).
 The game runs on a worker; the browser's main thread owns SDL, WebGPU and the
-presenter. `RECOMP_*` switches go in the page's query string
-(`<game id>/?RECOMP_D3D9_STATS=1`). Reading a render target back is not
-supported in the browser.
+presenter. Release builds also optimize at Wasm link time and strip debug
+information. Eight workers are prewarmed with a 512 MiB initial shared heap;
+the heap and worker pool can grow as the game needs them. Reading a render
+target back is not supported in the browser. URL environment overrides are
+disabled unless explicitly allowed in `web/player/env.mjs`.
 
 ## Other platforms and GPU APIs
 

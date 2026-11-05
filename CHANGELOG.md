@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Optimize Release WebAssembly at link time and strip debug information.
+  Prewarm eight workers with a 512 MiB initial heap to reduce startup cost.
+  Skip WebGPU drawable acquisition while the canvas backing store is zero
+  sized, so collapsed views can resume without invalid-texture submissions.
+
 - Embed the game's core mods in Windows/Linux smoke and headless hosts, as
   the desktop app does, so shared app resources cannot leave diagnostics
   loading manifests without their plugin implementations.
