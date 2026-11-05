@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Implement WebGPU texture and buffer readback for guest-worker callers,
+  parking only the worker while browser mapping completes. Preserve padded
+  rows, refresh buffer snapshots, propagate queue failures and wake callers
+  on mapping failure. Copy texture-transfer arguments into their main-thread
+  proxy jobs so rectangle values survive the handoff. Add real-browser GPU
+  checks for color/depth copies, completion ordering and device loss.
+
 - Supply alpha on the fixed-function WebGPU coverage output so alpha-blended
   pipelines validate while retaining the R8 coverage mask. Fixes the black
   3D level-selection screen reached by Populous in the browser.

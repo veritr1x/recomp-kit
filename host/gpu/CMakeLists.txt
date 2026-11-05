@@ -31,6 +31,13 @@ if(EMSCRIPTEN)
   target_link_options(gpu_backend PUBLIC --use-port=emdawnwebgpu)
   target_link_libraries(gpu_backend PUBLIC recomp_platform)
   pop_optimize(gpu_backend 1)
+  # Real browser/device checks run on a worker, matching guest readback calls.
+  add_executable(gpu_webgpu_readback_tests tests/webgpu_readback_tests.cpp)
+  target_link_libraries(gpu_webgpu_readback_tests PRIVATE gpu_backend)
+  target_link_options(gpu_webgpu_readback_tests PRIVATE -O2 -g0 -pthread
+    -sPTHREAD_POOL_SIZE=2 -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web,worker
+    -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sEXPORTED_RUNTIME_METHODS=callMain)
+  pop_optimize(gpu_webgpu_readback_tests 1)
   return()
 endif()
 

@@ -157,6 +157,66 @@ bool off_main() {
     return !emscripten_is_main_runtime_thread();
 }
 
+// Park only the caller's worker. The main-thread task returns immediately;
+// its eventual callback finishes the proxy after copying CPU-visible bytes.
+// A system proxy task must not wait for the browser's event loop itself.
+template <class F> bool await_main(F &&start) {
+    struct Job {
+        F *start;
+        static void run(em_proxying_ctx *context, void *arg) {
+            (*static_cast<Job *>(arg)->start)(context);
+        }
+    } job{&start};
+    return emscripten_proxy_sync_with_ctx(emscripten_proxy_get_system_queue(),
+                                          emscripten_main_runtime_thread_id(), &Job::run, &job);
+}
+
+WGPUBuffer staging_buffer(WGPUDevice device, uint64_t bytes) {
+    WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+    desc.size = bytes;
+    desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+    return wgpuDeviceCreateBuffer(device, &desc);
+}
+
+// Mapping callbacks arrive holding emdawnwebgpu's event lock. Defer the range
+// access/unmap to avoid taking that lock recursively. `copy` sees mapped bytes
+// only during its call; `finish` runs after unmap, including on map failure.
+void map_staging(WGPUBuffer buffer, uint64_t bytes, std::function<void(const uint8_t *)> copy,
+                 std::function<void(bool)> finish) {
+    struct Job {
+        WGPUBuffer buffer;
+        uint64_t bytes;
+        std::function<void(const uint8_t *)> copy;
+        std::function<void(bool)> finish;
+    };
+    auto *job = new Job{buffer, bytes, std::move(copy), std::move(finish)};
+    WGPUBufferMapCallbackInfo info = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    info.mode = WGPUCallbackMode_AllowSpontaneous;
+    info.userdata1 = job;
+    info.callback = [](WGPUMapAsyncStatus status, WGPUStringView message, void *u1, void *) {
+        if (status != WGPUMapAsyncStatus_Success)
+            fprintf(stderr, "gpu/webgpu: readback map failed (%d): %.*s\n", int(status),
+                    int(message.length == WGPU_STRLEN && message.data ? strlen(message.data)
+                                                                      : message.length),
+                    message.data ? message.data : "");
+        WebGpuDevice::later([status, u1] {
+            std::unique_ptr<Job> j(static_cast<Job *>(u1));
+            bool ok = false;
+            if (status == WGPUMapAsyncStatus_Success) {
+                auto *data = static_cast<const uint8_t *>(
+                    wgpuBufferGetConstMappedRange(j->buffer, 0, size_t(j->bytes)));
+                if (data) {
+                    j->copy(data);
+                    ok = true;
+                }
+                wgpuBufferUnmap(j->buffer);
+            }
+            j->finish(ok);
+        });
+    };
+    wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, size_t(bytes), info);
+}
+
 } // namespace
 
 std::unique_ptr<WebGpuDevice> WebGpuDevice::create() {
@@ -308,8 +368,58 @@ bool WebGpuDevice::upload(Texture tex, Region region, const void *bytes, int pit
     return true;
 }
 
-bool WebGpuDevice::readback(Texture, Region, void *, int) {
-    return false; // the browser maps buffers only asynchronously
+bool WebGpuDevice::readback(Texture texture, Region region, void *bytes, int pitch) {
+    if (!off_main() || !bytes || region.x < 0 || region.y < 0 || region.w <= 0 || region.h <= 0)
+        return false;
+    bool result = false;
+    const bool completed = await_main([&](em_proxying_ctx *context) {
+        auto it = textures_.find(texture.id);
+        if (it == textures_.end()) {
+            emscripten_proxy_finish(context);
+            return;
+        }
+        const Tex &t = it->second;
+        const uint64_t row = uint64_t(region.w) * bytes_per_pixel(t.desc.format);
+        const uint64_t stride = round_up(row, 256), size = stride * region.h;
+        if (region.x > t.desc.width - region.w || region.y > t.desc.height - region.h ||
+            pitch < 0 || uint64_t(pitch) < row || size > limits_.maxBufferSize) {
+            emscripten_proxy_finish(context);
+            return;
+        }
+        WGPUBuffer staging = staging_buffer(device_, size);
+        if (!staging) {
+            emscripten_proxy_finish(context);
+            return;
+        }
+        WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device_, nullptr);
+        WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        from.texture = t.texture;
+        from.origin = {uint32_t(region.x), uint32_t(region.y), 0};
+        if (t.desc.format == Format::Depth32F)
+            from.aspect = WGPUTextureAspect_DepthOnly;
+        WGPUTexelCopyBufferInfo to = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+        to.buffer = staging;
+        to.layout.bytesPerRow = uint32_t(stride);
+        WGPUExtent3D extent = {uint32_t(region.w), uint32_t(region.h), 1};
+        wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &to, &extent);
+        WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
+        wgpuCommandEncoderRelease(encoder);
+        wgpuQueueSubmit(queue_, 1, &command);
+        wgpuCommandBufferRelease(command);
+        map_staging(
+            staging, size,
+            [=](const uint8_t *data) {
+                for (int y = 0; y < region.h; ++y)
+                    memcpy(static_cast<uint8_t *>(bytes) + size_t(y) * pitch,
+                           data + size_t(y) * stride, size_t(row));
+            },
+            [&, context, staging](bool ok) {
+                wgpuBufferRelease(staging);
+                result = ok;
+                emscripten_proxy_finish(context);
+            });
+    });
+    return completed && result;
 }
 
 void WebGpuDevice::destroy(Texture tex) {
@@ -372,8 +482,40 @@ void WebGpuDevice::update(Buffer b, uint64_t offset, const void *bytes, uint64_t
     wgpuQueueWriteBuffer(queue_, it->second.buffer, offset, bytes, size_t(count));
 }
 
-const void *WebGpuDevice::map_read(Buffer) {
-    return nullptr;
+const void *WebGpuDevice::map_read(Buffer buffer) {
+    if (!off_main())
+        return nullptr;
+    const void *result = nullptr;
+    const bool completed = await_main([&](em_proxying_ctx *context) {
+        auto it = buffers_.find(buffer.id);
+        if (it == buffers_.end()) {
+            emscripten_proxy_finish(context);
+            return;
+        }
+        Buf &b = it->second;
+        if (!b.staging)
+            b.staging = staging_buffer(device_, b.bytes);
+        if (!b.staging) {
+            emscripten_proxy_finish(context);
+            return;
+        }
+        b.readback.resize(size_t(b.bytes));
+        WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device_, nullptr);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, b.buffer, 0, b.staging, 0, b.bytes);
+        WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
+        wgpuCommandEncoderRelease(encoder);
+        wgpuQueueSubmit(queue_, 1, &command);
+        wgpuCommandBufferRelease(command);
+        map_staging(
+            b.staging, b.bytes,
+            [&b](const uint8_t *data) { memcpy(b.readback.data(), data, size_t(b.bytes)); },
+            [&, context](bool ok) {
+                if (ok)
+                    result = b.readback.data();
+                emscripten_proxy_finish(context);
+            });
+    });
+    return completed ? result : nullptr;
 }
 
 uint64_t WebGpuDevice::buffer_bytes(Buffer b) {
@@ -390,6 +532,8 @@ void WebGpuDevice::destroy(Buffer b) {
     if (it == buffers_.end())
         return;
     wgpuBufferRelease(it->second.buffer);
+    if (it->second.staging)
+        wgpuBufferRelease(it->second.staging);
     buffers_.erase(it);
 }
 
@@ -867,7 +1011,7 @@ void WebGpuDevice::blit(CommandBuffer cb, Texture src, Region src_region, Textur
     if (src_region.w <= 0 || src_region.h <= 0)
         return;
     if (off_main())
-        return on_main_void([&] { blit(cb, src, src_region, dst, dst_x, dst_y); });
+        return on_main_void([=, this] { blit(cb, src, src_region, dst, dst_x, dst_y); });
     Cmd *c = cmd(cb);
     auto s = textures_.find(src.id), d = textures_.find(dst.id);
     if (!c || s == textures_.end() || d == textures_.end())
@@ -889,7 +1033,7 @@ void WebGpuDevice::copy_buffer_to_texture(CommandBuffer cb, Buffer src, uint64_t
         return;
     if (off_main())
         return on_main_void(
-            [&] { copy_buffer_to_texture(cb, src, offset, pitch, dst, dst_region); });
+            [=, this] { copy_buffer_to_texture(cb, src, offset, pitch, dst, dst_region); });
     Cmd *c = cmd(cb);
     auto b = buffers_.find(src.id);
     auto d = textures_.find(dst.id);
@@ -913,7 +1057,7 @@ void WebGpuDevice::copy_texture_to_buffer(CommandBuffer cb, Texture src, Region 
         return;
     if (off_main())
         return on_main_void(
-            [&] { copy_texture_to_buffer(cb, src, src_region, dst, offset, pitch); });
+            [=, this] { copy_texture_to_buffer(cb, src, src_region, dst, offset, pitch); });
     Cmd *c = cmd(cb);
     auto s = textures_.find(src.id);
     auto b = buffers_.find(dst.id);
@@ -946,12 +1090,18 @@ void WebGpuDevice::on_complete(CommandBuffer cb, std::function<void(CommandStatu
 }
 
 void WebGpuDevice::after_submitted(std::function<void()> fn) {
-    auto *box = new std::function<void()>(std::move(fn));
+    when_submitted([fn = std::move(fn)](CommandStatus) { fn(); });
+}
+void WebGpuDevice::when_submitted(std::function<void(CommandStatus)> fn) {
+    auto *box = new std::function<void(CommandStatus)>(std::move(fn));
     WGPUQueueWorkDoneCallbackInfo info = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     info.mode = WGPUCallbackMode_AllowSpontaneous;
-    info.callback = [](WGPUQueueWorkDoneStatus, WGPUStringView, void *u1, void *) {
-        auto *f = static_cast<std::function<void()> *>(u1);
-        later(std::move(*f));
+    info.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *u1, void *) {
+        auto *f = static_cast<std::function<void(CommandStatus)> *>(u1);
+        later([fn = std::move(*f), status] {
+            fn(status == WGPUQueueWorkDoneStatus_Success ? CommandStatus::Completed
+                                                         : CommandStatus::Error);
+        });
         delete f;
     };
     info.userdata1 = box;
@@ -989,18 +1139,36 @@ void WebGpuDevice::commit(CommandBuffer cb) {
     const double submitted = now_seconds();
     const uint64_t id = cb.id;
     auto callbacks = std::move(c->callbacks);
-    after_submitted([this, id, submitted, callbacks = std::move(callbacks)]() {
-        status_[id] = CommandStatus::Completed;
+    when_submitted([this, id, submitted, callbacks = std::move(callbacks)](CommandStatus status) {
+        status_[id] = status;
         const double ms = (now_seconds() - submitted) * 1000.0;
         for (auto &fn : callbacks)
-            fn(CommandStatus::Completed, ms);
+            fn(status, ms);
+        auto waiting = waiters_.extract(id);
+        if (!waiting.empty())
+            for (auto &finish : waiting.mapped())
+                finish();
         if (status_.size() > 4096)
-            status_.clear();
+            for (auto it = status_.begin(); it != status_.end();) {
+                if (it->second != CommandStatus::Pending && it->first < id)
+                    it = status_.erase(it);
+                else
+                    ++it;
+            }
     });
 }
 
-void WebGpuDevice::wait(CommandBuffer) {
-    // The browser finishes the work once control returns to it.
+void WebGpuDevice::wait(CommandBuffer cb) {
+    // The presenter never waits on the main thread. Guest callers can wait
+    // without freezing input or starving the mapping/completion callbacks.
+    if (!off_main())
+        return;
+    await_main([&](em_proxying_ctx *context) {
+        if (status(cb) != CommandStatus::Pending || recording_.count(cb.id))
+            emscripten_proxy_finish(context);
+        else
+            waiters_[cb.id].push_back([context] { emscripten_proxy_finish(context); });
+    });
 }
 
 CommandStatus WebGpuDevice::status(CommandBuffer cb) {

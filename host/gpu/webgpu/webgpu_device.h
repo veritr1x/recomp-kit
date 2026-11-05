@@ -4,9 +4,9 @@
 // Everything runs on the browser's main thread, the only thread that owns the
 // WebGPU objects; the web host pumps the presenter and the Direct3D 9 queue
 // from there. The browser completes work on its own schedule, so the calls
-// that would block elsewhere do not: wait() returns at once, readback() and
-// map_read() report nothing, and on_complete() callbacks run from the event
-// loop once the queue says the work is done.
+// that need CPU results park the calling worker through a proxy context while
+// the main thread returns to the browser. Readback is never synchronous on
+// the main thread. Completion callbacks run outside the binding's event lock.
 //
 // The device is the page's: it requests the adapter and device (with the
 // features the renderers use) and hands it over as
@@ -114,7 +114,9 @@ class WebGpuDevice final : public Device {
     };
     struct Buf {
         WGPUBuffer buffer = nullptr;
+        WGPUBuffer staging = nullptr;
         uint64_t bytes = 0;
+        std::vector<uint8_t> readback;
     };
     struct Binding {
         WGPUBuffer buffer = nullptr;
@@ -161,6 +163,7 @@ class WebGpuDevice final : public Device {
     void bind(Cmd &c, bool compute);
     Binding stage_bytes(const void *bytes, uint64_t count);
     WGPUBindGroupLayout make_layout(bool compute);
+    void when_submitted(std::function<void(CommandStatus)> fn);
 
     WGPUInstance instance_ = nullptr;
     WGPUDevice device_ = nullptr;
@@ -184,6 +187,7 @@ class WebGpuDevice final : public Device {
     std::unordered_map<uint64_t, Buf> buffers_;
     std::unordered_map<uint64_t, std::unique_ptr<Cmd>> recording_;
     std::unordered_map<uint64_t, CommandStatus> status_;
+    std::unordered_map<uint64_t, std::vector<std::function<void()>>> waiters_;
     std::unordered_map<uint64_t, Family> families_;
     std::unordered_map<uint64_t, uint64_t> family_by_key_;
     std::unordered_map<std::string, WGPUShaderModule> modules_;
