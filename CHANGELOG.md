@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add opt-in `web_launcher.py --stream <id>` staging and HTTP range serving.
+  The web player can mount hosted assets read-only while folder/ZIP imports
+  and OPFS saves remain available. Link a corrected WasmFS fetch backend
+  with whole-file read integrity checks and a bounded 64 MiB download cache;
+  no installed SDK patch is needed.
+
 - Preserve host-supplied keyboard characters through `TranslateMessage`
   instead of appending another character. Fixes doubled alias/name input
   while retaining case, punctuation and normal editing-key translation.

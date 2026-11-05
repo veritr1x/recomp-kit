@@ -270,6 +270,7 @@ if(TARGET recomp_gen)
     # The web: core mods compiled in, the host's resources packaged at
     # /app/resources (runtime/layout.cpp), threads for the game.
     pop_builtin_mods(recomp_app)
+    target_sources(recomp_app PRIVATE ${HOST}/web_stream.cpp)
     set(web_resources ${POP_OUT}/web-resources)
     file(REMOVE_RECURSE ${web_resources})
     file(MAKE_DIRECTORY ${web_resources})
@@ -288,6 +289,8 @@ if(TARGET recomp_gen)
     configure_file(${POP_ROOT}/web/player/player.js ${POP_OUT}/player.js @ONLY)
     configure_file(${POP_ROOT}/web/player/style.css ${POP_OUT}/style.css COPYONLY)
     configure_file(${POP_ROOT}/web/player/env.mjs ${POP_OUT}/env.mjs COPYONLY)
+    configure_file(${POP_ROOT}/web/player/source.mjs ${POP_OUT}/source.mjs COPYONLY)
+    configure_file(${POP_ROOT}/web/player/FETCH-NOTICE.txt ${POP_OUT}/FETCH-NOTICE.txt COPYONLY)
     target_link_options(recomp_app PRIVATE
       # Emscripten's Wasm/JS optimization happens at link time too; the
       # per-target compile flags do not enable it or strip guest DWARF.
@@ -300,7 +303,9 @@ if(TARGET recomp_gen)
       -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=16777216
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0
       -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS
+      --js-library ${POP_ROOT}/web/player/fetch-backend.js
       --preload-file ${web_resources}@/app/resources)
+    set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/player/fetch-backend.js)
   elseif(APPLE)
     pop_mac_bundle(recomp_app)
   else()

@@ -245,6 +245,33 @@ the heap and worker pool can grow as the game needs them. Reading a render
 target back is not supported in the browser. URL environment overrides are
 disabled unless explicitly allowed in `web/player/env.mjs`.
 
+### Optional streamed installation
+
+```sh
+.venv/bin/python kit/tools/web_launcher.py --game-dir "$PWD" --out build/web-site \
+    --web-build <game id>=build/web/recomp --stream <game id> --serve 8000
+```
+
+`--stream` explicitly copies the configured private installation into
+`<out>/<game id>/data/` and publishes `manifest.txt`. It verifies the executable
+and prepared auxiliary module hashes, honors bundle exclusions and refreshes
+previously staged files. No game files are published without this option.
+The launcher offers **Stream game** alongside folder/ZIP import; **Play**
+uses an imported copy. Direct player URLs prefer imported data when present,
+otherwise use the configured stream. Saves share the same OPFS profile in
+both modes. A site without streaming metadata keeps the import-only flow.
+
+The worker mounts streamed files read-only using WasmFS fetch, with 4 MiB
+chunks and a 64 MiB memory cache. Sizes come from the manifest, so directory
+indexing does not download the entire installation. The app links its own
+corrected fetch backend; the installed Emscripten SDK is unchanged. Whole-file
+reads retain correct offsets across chunk boundaries, and truncated or invalid
+range responses fail. Servers must support HEAD and byte ranges for files
+larger than 64 MiB, preserve Content-Length/Content-Range and use the same
+origin and isolation headers as the player. `--serve` provides these locally.
+The cache is per session; streaming does not create an offline OPFS install.
+See [the backend notice](web/player/FETCH-NOTICE.txt).
+
 ## Other platforms and GPU APIs
 
 Direct3D 8 uses the same renderer through version 8 interfaces, FVF and

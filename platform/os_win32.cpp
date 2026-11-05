@@ -285,6 +285,15 @@ int os_lstat(const char *path, OsStat *out) {
 int os_mkdir(const char *path) {
     return CreateDirectoryW(widen(path).c_str(), nullptr) ? 0 : -1;
 }
+int os_set_readonly(const char *path, int readonly) {
+    const std::wstring name = widen(path);
+    DWORD attributes = GetFileAttributesW(name.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return -1;
+    attributes =
+        readonly ? attributes | FILE_ATTRIBUTE_READONLY : attributes & ~FILE_ATTRIBUTE_READONLY;
+    return SetFileAttributesW(name.c_str(), attributes) ? 0 : -1;
+}
 int os_rename(const char *from, const char *to) {
     return MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
 }

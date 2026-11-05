@@ -62,9 +62,11 @@ typedef struct OsStat {
     int64_t atime, mtime, ctime; // seconds since the epoch
     int is_dir, is_regular, is_symlink, is_readonly;
 } OsStat;
-int os_stat(const char *path, OsStat *out);      // follows symlinks; 0 or -1
-int os_lstat(const char *path, OsStat *out);     // does not follow
-int os_mkdir(const char *path);                  // 0, or -1 (an existing directory is -1, as mkdir)
+int os_stat(const char *path, OsStat *out);  // follows symlinks; 0 or -1
+int os_lstat(const char *path, OsStat *out); // does not follow
+int os_mkdir(const char *path);              // 0, or -1 (an existing directory is -1, as mkdir)
+int os_set_readonly(const char *path,
+                    int readonly);               // POSIX write bits / Windows readonly attribute
 int os_rename(const char *from, const char *to); // replaces an existing destination file
 int os_unlink(const char *path);
 int os_rmdir(const char *path);       // the directory must be empty

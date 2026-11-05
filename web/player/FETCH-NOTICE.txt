@@ -1,0 +1,29 @@
+The web fetch backend is derived from Emscripten 6.0.11's
+src/lib/libwasmfs_fetch.js (commit a0014542110d6078c3a1a7941fa1ddb3a2281f16).
+https://github.com/emscripten-core/emscripten/tree/a0014542110d6078c3a1a7941fa1ddb3a2281f16
+
+Copyright 2022 The Emscripten Authors
+Copyright (c) 2010-2014 Emscripten authors, see AUTHORS file upstream.
+
+Changes: whole-file reads keep file offsets across chunk boundaries;
+range/length checks reject incomplete responses; manifest metadata avoids
+fetching every file during indexing; a shared 64 MiB LRU bounds downloaded
+bytes. Prepared game data remains read-only; saves use the separate OPFS mount.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

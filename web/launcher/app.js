@@ -30,8 +30,9 @@ let busy = false;
 function setBusy(value) {
   busy = value;
   for (const c of cards.values())
-    for (const b of c.el.querySelectorAll(".import-folder, .import-zip, .import-saves, .delete, .play"))
+    for (const b of c.el.querySelectorAll(".import-folder, .import-zip, .import-saves, .delete, .play, .stream"))
       b.disabled = value || (b.classList.contains("play") && c.state !== "ready") ||
+                   (b.classList.contains("stream") && !c.streamAvailable) ||
                    (b.classList.contains("delete") && c.state === "notFound");
 }
 
@@ -52,11 +53,13 @@ async function refresh(card) {
   const { status, estimate, persisted } = await call("status", { game: card.game });
   card.state = status.state;
   const [label, tone] = STATES[status.state];
-  card.stateEl.textContent = label;
-  card.stateEl.className = "state " + tone;
+  card.stateEl.textContent = status.state === "notFound" && card.streamAvailable ? "Streaming available" : label;
+  card.stateEl.className = "state " + (card.streamAvailable && status.state === "notFound" ? "ready" : tone);
   let detail = "";
   if (status.state === "ready") detail = `${status.files} files, ${humanBytes(status.bytes)} in this browser.`;
-  else if (status.state === "notFound") detail = `Import the folder ${card.game.title} is installed in (it holds ${card.game.executable}), or a ZIP of it.`;
+  else if (status.state === "notFound") detail = card.streamAvailable
+    ? "Stream the hosted game now, or import your copy to play from this browser's storage."
+    : `Import the folder ${card.game.title} is installed in (it holds ${card.game.executable}), or a ZIP of it.`;
   else if (status.missing && status.missing.length) detail = `Missing folders: ${status.missing.join(", ")}. Import again.`;
   else detail = `The imported ${card.game.executable} is not the supported version. Import again from the supported release.`;
   card.detailEl.textContent = detail;
@@ -155,18 +158,21 @@ function pickFiles(input) {
 
 function addCard(game) {
   const el = document.getElementById("game-card").content.firstElementChild.cloneNode(true);
-  const card = { game, el, state: "notFound", stateEl: el.querySelector(".state"),
+  const card = { game, el, state: "notFound", streamAvailable: false, stateEl: el.querySelector(".state"),
                  detailEl: el.querySelector(".detail"), message: el.querySelector(".message") };
   el.querySelector("h2").textContent = game.title;
   const store = el.querySelector(".store");
   if (game.store) store.href = game.store;
 
-  el.querySelector(".play").onclick = async () => {
+  const play = async (source) => {
     const url = new URL(`${game.id}/`, location.href);
     const found = await fetch(new URL("index.html", url), { method: "HEAD" }).then((r) => r.ok).catch(() => false);
+    url.searchParams.set("source", source);
     if (found) location.href = url.href;
     else show(card, `The web version of ${game.title} is not available here yet. The imported game is kept for it.`);
   };
+  el.querySelector(".play").onclick = () => play("import");
+  el.querySelector(".stream").onclick = () => play("stream");
   el.querySelector(".import-folder").onclick = async () => {
     if (window.showDirectoryPicker) {
       let handle;
@@ -253,6 +259,15 @@ document.getElementById("persist").onclick = async () => {
 
 const games = await fetch("games.json").then((r) => r.json());
 for (const game of games) addCard(game);
+for (const card of cards.values()) {
+  if (!card.game.streamManifest) continue;
+  const url = new URL(card.game.streamManifest, new URL("games.json", location.href));
+  card.streamAvailable = url.origin === location.origin &&
+    await fetch(url, { method: "HEAD" }).then(r => r.ok).catch(() => false);
+  card.el.querySelector(".stream").hidden = !card.streamAvailable;
+}
+if (games.some(game => game.streamManifest))
+  document.querySelector(".lead").textContent = "Stream a hosted game, or import your own copy once to keep it in this browser. Saves stay in this browser in either mode.";
 await Promise.all([...cards.values()].map(refresh));
 
 // For automated checks: import files the page already has.

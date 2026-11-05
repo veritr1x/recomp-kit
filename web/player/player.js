@@ -1,4 +1,5 @@
 import { queryEnvironment, executablePath } from "./env.mjs";
+import { selectSource } from "./source.mjs";
 "use strict";
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("canvas");
@@ -14,6 +15,13 @@ function status(text, back) {
 }
 const log = [];
 window.recompLog = log; // for tests
+function record(text, warning) {
+  log.push(text);
+  if (log.length > 2000) log.shift();
+  if (text.startsWith("[stream] failed:"))
+    status("The hosted game files could not be loaded. Return to the launcher and retry or import your copy.", true);
+  (warning ? console.warn : console.log)(text);
+}
 
 async function gameId() {
   const parts = location.pathname.split("/").filter(Boolean);
@@ -25,12 +33,15 @@ async function start() {
   if (!crossOriginIsolated) throw new Error("This page must be served cross-origin isolated (COOP/COEP headers).");
   if (!navigator.gpu) throw new Error("This browser has no WebGPU.");
   const id = await gameId();
-  const games = await fetch("../games.json").then((r) => r.json());
+  const gamesUrl = new URL("../games.json", location.href).href;
+  const games = await fetch(gamesUrl).then((r) => r.json());
   const game = games.find((g) => g.id === id);
   if (!game) throw new Error(`No game "${id}" in the launcher's games.json.`);
   document.title = game.title;
 
-  // The game must have been imported by the launcher first.
+  // Imported data remains preferred by default. Explicit streaming never
+  // modifies that installation, and both modes share the same OPFS profile.
+  let imported = false;
   let dir = await navigator.storage.getDirectory();
   try {
     for (const p of [id, "game"]) dir = await dir.getDirectoryHandle(p);
@@ -38,9 +49,10 @@ async function start() {
     const file = components.pop();
     for (const part of components) dir = await dir.getDirectoryHandle(part);
     await dir.getFileHandle(file);
-  } catch {
-    throw new Error(`${game.title} has not been imported yet.`);
-  }
+    imported = (await (await dirForStamp(id)).text()).trim() === game.sha256;
+  } catch {}
+  const source = await selectSource(game, gamesUrl, location.search, imported);
+  window.recompSource = source.kind;
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("WebGPU gave no adapter.");
@@ -59,13 +71,12 @@ async function start() {
   device.lost.then((info) => status(`The graphics device was lost: ${info.message}`, true));
   device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
 
-  const exe = `/opfs/${id}/game/${executablePath(game)}`;
   const Module = {
     canvas,
     preinitializedWebGPUDevice: device,
     noInitialRun: true,
-    print: (t) => { log.push(t); console.log(t); },
-    printErr: (t) => { log.push(t); console.warn(t); },
+    print: (t) => record(t, false),
+    printErr: (t) => record(t, true),
     setStatus: (t) => status(t ? t : ""),
     onAbort: (what) => status(`The game stopped: ${what}`, true),
     preRun: [() => {
@@ -76,7 +87,7 @@ async function start() {
     onRuntimeInitialized() {
       status("");
       canvas.focus();
-      Module.callMain([`--exe=${exe}`]);
+      Module.callMain(source.args);
     },
   };
   window.Module = Module;
@@ -84,6 +95,12 @@ async function start() {
   script.src = "@APP@.js";
   script.onerror = () => status("The game's web build is missing.", true);
   document.body.append(script);
+}
+
+async function dirForStamp(id) {
+  const root = await navigator.storage.getDirectory();
+  const game = await (await root.getDirectoryHandle(id)).getDirectoryHandle("game");
+  return (await game.getFileHandle(".stamp")).getFile();
 }
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());

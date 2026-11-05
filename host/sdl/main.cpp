@@ -52,6 +52,7 @@
 #include <SDL3/SDL_main.h> // on iOS this supplies the UIKit entry point and renames main
 #ifdef __EMSCRIPTEN__
 #include "../gpu/d3d9_backend.h"
+#include "../web_stream.h"
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
 #include <thread>
@@ -1614,6 +1615,7 @@ void post_drawable_size() {
 namespace {
 
 std::string g_web_exe;
+std::string g_web_stream_base;
 std::atomic<bool> g_web_guest_done{false};
 int g_web_dw = 0, g_web_dh = 0;
 
@@ -1659,6 +1661,14 @@ void web_guest() {
     backend_t opfs = wasmfs_create_opfs_backend();
     if (!opfs || wasmfs_create_directory("/opfs", 0777, opfs) != 0)
         fprintf(stderr, RECOMP_APP_NAME ": the browser's private file system is unavailable\n");
+    if (!g_web_stream_base.empty()) {
+        std::string error;
+        if (!web_stream_mount(g_web_stream_base, &error)) {
+            fprintf(stderr, "[stream] failed: %s\n", error.c_str());
+            g_web_guest_done.store(true);
+            return;
+        }
+    }
     std::string dir = g_web_exe.substr(0, g_web_exe.find_last_of('/'));
     if (!dir.empty() && os_chdir(dir.c_str()) != 0)
         fprintf(stderr, "[host] could not enter %s\n", dir.c_str());
@@ -1689,6 +1699,8 @@ int web_main(int argc, char **argv) {
             g_web_exe = argv[i] + 6;
         else if (strcmp(argv[i], "--exe") == 0 && i + 1 < argc)
             g_web_exe = argv[++i];
+        else if (strcmp(argv[i], "--stream-base") == 0 && i + 1 < argc)
+            g_web_stream_base = argv[++i];
     }
     if (g_web_exe.empty()) {
         fprintf(stderr, RECOMP_APP_NAME ": the page gave no --exe\n");

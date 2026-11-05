@@ -44,16 +44,16 @@ class WebLauncherTests(unittest.TestCase):
             build.mkdir()
             with self.assertRaises(ValueError):
                 web_launcher.copy_web_build("stub", build, tmp / "site")
-            for name in ("index.html", "player.js", "env.mjs", "style.css", "App.js", "App.wasm", "App.data", "libgen.a"):
+            for name in ("index.html", "player.js", "env.mjs", "source.mjs", "FETCH-NOTICE.txt", "style.css", "App.js", "App.wasm", "App.data", "libgen.a"):
                 (build / name).write_text(name)
             web_launcher.copy_web_build("stub", build, tmp / "site")
             copied = sorted(f.name for f in (tmp / "site/stub").iterdir())
-            self.assertEqual(copied, ["App.data", "App.js", "App.wasm", "env.mjs", "index.html", "player.js", "style.css"])
+            self.assertEqual(copied, ["App.data", "App.js", "App.wasm", "FETCH-NOTICE.txt", "env.mjs", "index.html", "player.js", "source.mjs", "style.css"])
     def test_core_suite(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not installed")
-        run = subprocess.run([node, "--test", str(ROOT / "web/launcher/tests/core.test.mjs")],
+        run = subprocess.run([node, "--test", *map(str, sorted((ROOT / "web/launcher/tests").glob("*.test.mjs")))],
                              capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 

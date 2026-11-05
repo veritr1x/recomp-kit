@@ -193,6 +193,12 @@ int os_lstat(const char *path, OsStat *out) {
 int os_mkdir(const char *path) {
     return mkdir(path, 0755);
 }
+int os_set_readonly(const char *path, int readonly) {
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return -1;
+    return chmod(path, readonly ? st.st_mode & ~0222 : st.st_mode | 0200);
+}
 int os_rename(const char *from, const char *to) {
     return rename(from, to);
 }

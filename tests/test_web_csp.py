@@ -39,5 +39,5 @@ def test_pages_enforce_strict_csp():
 
 def test_player_assets_are_staged_by_cmake():
     cmake = (ROOT / "host/CMakeLists.txt").read_text(encoding="utf-8")
-    for asset in ("index.html","player.js","style.css","env.mjs"):
+    for asset in ("index.html","player.js","style.css","env.mjs","source.mjs","FETCH-NOTICE.txt"):
         assert f"web/player/{asset}" in cmake

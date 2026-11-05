@@ -123,6 +123,10 @@ void test_paths_and_descriptors() {
     CHECK(os_fd_close(dup) == 0);
     CHECK(os_fd_close(fd) == 0);
     CHECK(os_stat((sub + "/a.txt").c_str(), &st) == 0 && st.size == 2);
+    CHECK(os_set_readonly((sub + "/a.txt").c_str(), 1) == 0);
+    CHECK(os_stat((sub + "/a.txt").c_str(), &st) == 0 && st.is_readonly);
+    CHECK(os_set_readonly((sub + "/a.txt").c_str(), 0) == 0);
+    CHECK(os_stat((sub + "/a.txt").c_str(), &st) == 0 && !st.is_readonly);
     CHECK(os_fd_open((sub + "/a.txt").c_str(), OS_O_WRONLY | OS_O_CREAT | OS_O_EXCL) == -1);
 
     std::string tmpl = sub + "/b.XXXXXX";

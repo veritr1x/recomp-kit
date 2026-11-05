@@ -27,6 +27,7 @@ PORTABLE_TESTS = [
     "tests/test_gen_stub_translation.py", "tests/test_stage_game_files.py",
     "tests/test_extract_icon.py", "tests/test_web_launcher.py",
     "tests/test_web_csp.py", "tools/tests/test_finish_bundle.py",
+    "tests/test_web_streaming.py",
     "tools/tests/test_package_desktop.py", "tools/tests/test_build.py",
     "tools/tests/test_discovery_tools.py",
     "tools/recomp/tests/test_mode_probe.py", "tools/recomp/tests/test_texture_pack.py",

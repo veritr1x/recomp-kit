@@ -70,3 +70,8 @@ SNEG-DEV/siege-of-avalon's src/win32/graphics/D3DRenderer.pas (LGPL-2.1), and
 dx/d3dcompiler.cpp recognises those programs by digests of their source. No
 part of that source is included; the software adapter implements the
 described arithmetic independently.
+
+web/player/fetch-backend.js derives from Emscripten 6.0.11's WasmFS fetch
+backend, Copyright 2022 The Emscripten Authors, under the MIT license. It
+corrects whole-file/chunk reads and adds bounded caching and response checks.
+The full notice is web/player/FETCH-NOTICE.txt and ships beside the web engine.
