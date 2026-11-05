@@ -2352,6 +2352,40 @@ static void test_frame_command_pool() {
     }
 }
 
+// Window renderers consume offscreen blits without a DirectDraw Flip. Their
+// coverage arenas and source revisions must retire at each complete image.
+static void test_window_present_retires_blits() {
+    rec_reset();
+    uint32_t dst = make_offscreen_for_test(320, 240, 8);
+    uint32_t src = make_offscreen_for_test(320, 240, 8);
+    uint64_t warmed = 0;
+    for (int frame = 0; frame < 100; ++frame) {
+        auto recorded = host_frame_current();
+        blt_for_test(dst, src, 0, 0, 320, 240, 0);
+        CHECK_EQ(host_frame_record_count(recorded), 1u);
+        fill_for_test(src, uint32_t(frame + 1));
+        CHECK(host_retained_bytes_for_test() > 0);
+        ddraw_window_presented();
+        CHECK(host_frame_current().id != recorded.id);
+        CHECK_EQ(host_frame_record_count(recorded), 0u);
+        CHECK_EQ(host_retained_bytes_for_test(), 0u);
+        if (frame == 0)
+            warmed = ddraw_frame_chunk_allocations_for_test();
+        else
+            CHECK_EQ(ddraw_frame_chunk_allocations_for_test(), warmed);
+    }
+    // A window refresh cannot discard a Direct3D frame still being built.
+    auto pending = host_frame_current();
+    ddraw_note_draw();
+    auto *payload = (uint8_t *)ddraw_frame_alloc(100000, 16);
+    memset(payload, 37, 100000);
+    ddraw_window_presented();
+    CHECK_EQ(host_frame_current().id, pending.id);
+    CHECK(host_frame_had_draws(pending));
+    CHECK_EQ(payload[99999], 37);
+    host_frame_release(pending);
+}
+
 static void test_frame_release_frees_leases() {
     rec_reset();
     uint32_t rt = make_render_target_for_test(640, 480, 8);
@@ -12904,6 +12938,7 @@ int main() {
         {"frame sealing", test_seal_events},
         {"unchanged texture uploads", test_unchanged_texture_uploads},
         {"frame command pool", test_frame_command_pool},
+        {"window present retires blits", test_window_present_retires_blits},
         {"release frees leases", test_frame_release_frees_leases},
         {"presenter seal and retire", test_presenter_seal_hook_and_retirement_queue},
         {"screen class", test_screen_class},

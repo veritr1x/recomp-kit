@@ -1,5 +1,10 @@
 # Testing
 
+`dx_tests` checks that complete window presents retire offscreen DirectDraw
+blit records, release copied source revisions and reuse coverage arenas over
+100 frames. A pending Direct3D draw keeps its recorder and owned snapshot.
+`host_tests` also checks that the window presenter invokes this boundary.
+
 `test_web_streaming.py` checks private asset staging, pinned hashes, bundle
 exclusions, prepared auxiliary modules and source preservation, then exercises
 the actual local HTTP server's HEAD, ranges, empty files and error responses.

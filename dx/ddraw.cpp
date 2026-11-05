@@ -2147,6 +2147,22 @@ void ddraw_external_present_end(void) {
     seal_frame("external present");
 }
 
+// D3D11/GDI window presents use a separate presenter sequence. Offscreen
+// DirectDraw blits have already reached that complete image, so nobody will
+// replay their records. Without this boundary they accumulate in one arena
+// indefinitely. A frame containing Direct3D draws still needs normal sealing
+// and GPU retirement; a window refresh must not invalidate its snapshots.
+void ddraw_window_presented(void) {
+    auto it = frames().find(g_frame_id);
+    if (it != frames().end() && it->second.had_draws)
+        return;
+    host_frame_release({g_frame_id});
+    ++g_frame_id;
+    g_seq = 0;
+    g_after_first_draw = g_after_first_hud = false;
+    g_present_since_seal = g_drew_since_seal = false;
+}
+
 // A CPU write, seen at Unlock. The decoder's frames arrive this way, and a
 // write to the primary while a movie is playing is what makes the frame FMV.
 // Called only when the write actually changed pixels: FMV is a property of

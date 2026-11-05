@@ -30,6 +30,9 @@ void ddraw_set_present_callbacks(void (*first_write)(void), void (*seal)(void));
 // guest-owned stores only on the next writer (or after presenter shutdown).
 void ddraw_present_release(struct HostFrameHandle f);
 void ddraw_drain_present_releases(void);
+// A complete window snapshot already contains the current offscreen blits.
+// Retire their recorder on the guest baton; pending Direct3D draws keep theirs.
+void ddraw_window_presented(void);
 
 // A Direct3D draw was submitted. Everything blitted after this is "after the
 // first draw", which is what tells a HUD blit from scenery.

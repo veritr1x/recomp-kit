@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Retire consumed DirectDraw blit records when D3D11/GDI publishes a complete
+  window image. Keep pending Direct3D draw snapshots alive. Prevents offscreen
+  coverage records accumulating until the browser reaches its 4 GB memory limit.
+
 - Restore WebGPU Depth32Float checkpoints and CPU uploads through a depth-only
   render pass instead of the forbidden buffer-to-depth copy. Preserve source
   row pitch and destination rectangles without changing caller render state.

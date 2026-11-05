@@ -1886,6 +1886,7 @@ extern "C" void host_present_seal_window() {
     auto s = active.load();
     if (!s)
         return;
+    ddraw_window_presented();
     // A separate sequence avoids collisions with DirectDraw's frame leases.
     static uint64_t next = uint64_t(1) << 63;
     attach_settings_page(s);

@@ -5108,6 +5108,10 @@ extern "C" int host_frame_had_draws(HostFrameHandle) {
 extern "C" void ddraw_set_present_callbacks(void (*)(), void (*)()) {}
 extern "C" void ddraw_present_release(HostFrameHandle) {}
 extern "C" void ddraw_drain_present_releases() {}
+static unsigned window_recorder_boundaries = 0;
+extern "C" void ddraw_window_presented() {
+    ++window_recorder_boundaries;
+}
 
 // DISP-T8: deterministic display-link/offscreen substitute. These assertions
 // run without a Metal device; the production GPU path is covered separately.
@@ -9163,6 +9167,7 @@ static void test_display_settings_bridge() {
     host_present_test_begin();
     g_page_draws = true;
     const uint8_t window_rgba[4] = {1, 2, 3, 255};
+    const unsigned recorder_before = window_recorder_boundaries;
     host_present_stage_rgba(window_rgba, 1, 1);
     host_present_seal_window();
     CHECK_EQ(host_present_settings_pages(), 1u);
@@ -9170,6 +9175,7 @@ static void test_display_settings_bridge() {
     host_present_stage_rgba(window_rgba, 1, 1);
     host_present_seal_window();
     CHECK_EQ(host_present_settings_pages(), 1u); // a hidden page rides on nothing
+    CHECK_EQ(window_recorder_boundaries, recorder_before + 2);
     host_present_stop();
     host_page_set_enabled(false);
     in.classic = true;
