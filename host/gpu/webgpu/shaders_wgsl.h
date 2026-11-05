@@ -126,7 +126,9 @@ struct V2F {
     return o;
 }
 fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.0), vec3f(1.0)); }
-struct PSOut { @location(0) color: vec4f, @location(1) coverage: f32 };
+// The R8 coverage target stores only red, but a shared alpha blend factor
+// still requires an explicit alpha component in its fragment output.
+struct PSOut { @location(0) color: vec4f, @location(1) coverage: vec4f };
 @fragment fn fs_main(i: V2F) -> PSOut {
     var c = i.color;
     var t = textureSample(tex, tex_s, i.uv);
@@ -185,7 +187,7 @@ struct PSOut { @location(0) color: vec4f, @location(1) coverage: f32 };
     }
     var o: PSOut;
     o.color = c;
-    o.coverage = 1.0;
+    o.coverage = vec4f(1.0);
     return o;
 }
 )WGSL";

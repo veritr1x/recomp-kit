@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Supply alpha on the fixed-function WebGPU coverage output so alpha-blended
+  pipelines validate while retaining the R8 coverage mask. Fixes the black
+  3D level-selection screen reached by Populous in the browser.
+
 - Fix the fixed-function WebGPU shader using a reserved WGSL identifier,
   which prevented Direct3D 2/3 games from drawing. Ignore empty texture
   transfers so clipped cursor saves do not invalidate a command batch.
