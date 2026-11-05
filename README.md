@@ -260,6 +260,10 @@ and prepared auxiliary module hashes, honors bundle exclusions and refreshes
 previously staged files. Omitting this option disables streaming metadata and
 copies no installation files. Previously staged data remains on disk; use a
 separate output directory when preparing an import-only distribution.
+If analysis uses a minimal executable copy, select the complete installation
+with `--stream "<game id>=/path/to/installed game"`. Its executable must still
+match the profile's pinned hash; prepared auxiliary module overrides remain
+in effect. No configured input paths or installed files are changed.
 The launcher offers **Stream game** alongside folder/ZIP import; **Play**
 uses an imported copy. Direct player URLs prefer imported data when present,
 otherwise use the configured stream. Saves share the same OPFS profile in

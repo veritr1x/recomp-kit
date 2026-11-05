@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Allow `--stream ID=INSTALL` to stage a full private installation when the
+  analysis input contains only executable images. Retain pinned hashes and
+  prepared auxiliary overrides without modifying the configured input tree.
+
 - Add opt-in `web_launcher.py --stream <id>` staging and HTTP range serving.
   The web player can mount hosted assets read-only while folder/ZIP imports
   and OPFS saves remain available. Link a corrected WasmFS fetch backend

@@ -68,6 +68,28 @@ def test_wrong_hash_or_unmanaged_output_is_preserved(install, tmp_path):
     assert not (tmp_path / "new").exists()
 
 
+def test_explicit_full_install_keeps_hashes_auxiliary_overrides_and_config(install, tmp_path, monkeypatch):
+    prepared = tmp_path / "prepared.dll"
+    prepared.write_bytes(b"prepared module")
+    install["aux_modules"] = [{"name": "Module.dll", "path": prepared,
+                               "sha256": stream_assets.digest(prepared)}]
+    full = install["developer_game_dir_path"]
+    cfg = dict(install, developer_game_dir_path=tmp_path / "analysis-only",
+               developer_exe_path=tmp_path / "analysis-only/Game.exe")
+    monkeypatch.setattr(web_launcher.game_config, "load", lambda _: cfg)
+    game = {"id": "sample", "title": "Sample", "exeDir": "Binaries/Win32", "executable": "Game.exe"}
+    web_launcher.stage_streams([tmp_path], [game], ["sample=" + str(full)], tmp_path / "site")
+    assert (tmp_path / "site/sample/data/Module.dll").read_bytes() == prepared.read_bytes()
+    assert game["streamManifest"] == "./sample/data/manifest.txt"
+    assert cfg["developer_game_dir_path"] == tmp_path / "analysis-only"
+    cfg["game"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="pinned executable"):
+        web_launcher.stage_streams([tmp_path], [game], ["sample=" + str(full)], tmp_path / "wrong")
+    for selection in (["sample="], ["sample", "sample"], ["unknown=" + str(full)]):
+        with pytest.raises(ValueError):
+            web_launcher.stage_streams([tmp_path], [game], selection, tmp_path / "invalid")
+
+
 def test_staging_cannot_write_into_or_over_its_input(install):
     root = install["developer_game_dir_path"]
     for dest in (root, root / "generated", root.parent):

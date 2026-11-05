@@ -61,12 +61,26 @@ def build(game_dirs, out):
 
 def stage_streams(game_dirs, games, ids, out):
     """Only explicit --stream selections publish private game data."""
+    selections = {}
+    for spec in ids:
+        game_id, sep, install = spec.partition("=")
+        if game_id in selections or (sep and not install):
+            raise ValueError("--stream wants one ID or ID=INSTALL per game")
+        selections[game_id] = Path(install).expanduser().resolve() if sep else None
     known = {g["id"] for g in games}
-    if set(ids) - known:
+    if set(selections) - known:
         raise ValueError("--stream wants a known game id: %s" % ", ".join(sorted(known)))
     for game_dir, game in zip(game_dirs, games):
-        if game["id"] in ids:
-            files = stream_assets.stage(game_config.load(game_dir), Path(out) / game["id"] / "data")
+        if game["id"] in selections:
+            cfg = game_config.load(game_dir)
+            install = selections[game["id"]]
+            if install is not None:
+                # Analysis can use a minimal private executable copy. Hosting
+                # needs the full installation; preserve the profile's prepared
+                # auxiliary module overrides and all pinned image checks.
+                cfg = dict(cfg, developer_game_dir_path=install,
+                           developer_exe_path=install / game["exeDir"] / game["executable"])
+            files = stream_assets.stage(cfg, Path(out) / game["id"] / "data")
             game["streamManifest"] = "./%s/data/manifest.txt" % game["id"]
             print("staged %s for streaming: %d files, %d bytes" %
                   (game["title"], len(files), sum(files.values())), flush=True)
@@ -171,8 +185,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--web-build", action="append", default=[], metavar="ID=DIR")
     parser.add_argument("--serve", type=int, nargs="?", const=8000, metavar="PORT")
-    parser.add_argument("--stream", action="append", default=[], metavar="ID",
-                        help="stage this game's private installation for on-demand HTTP reads")
+    parser.add_argument("--stream", action="append", default=[], metavar="ID[=INSTALL]",
+                        help="stage a private installation (optionally select a full install directory)")
     args = parser.parse_args()
     games = build(args.game_dir, args.out)
     try:
