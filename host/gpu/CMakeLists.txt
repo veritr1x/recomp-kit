@@ -38,6 +38,9 @@ if(EMSCRIPTEN)
     -sPTHREAD_POOL_SIZE=2 -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web,worker
     -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sEXPORTED_RUNTIME_METHODS=callMain)
   pop_optimize(gpu_webgpu_readback_tests 1)
+  foreach(asset webgpu-readback-tests.html webgpu-readback-tests.js)
+    configure_file(${POP_ROOT}/web/tests/${asset} ${POP_OUT}/${asset} COPYONLY)
+  endforeach()
   return()
 endif()
 

@@ -174,6 +174,28 @@ Direct3D 8 combiner cases also run in the Metal and Vulkan CI jobs.
 Run checks appropriate to your change. Every suite's output belongs under ignored
 `build/`; requested tests must report failure rather than silently skip prerequisites.
 
+### Browser GPU readback
+
+With the hashed Python environment and Emscripten 6.0.11 activated, build the
+game-free WebGPU fixture through the kit API, from the kit root:
+
+```sh
+.venv/bin/python -c "import sys; from pathlib import Path; sys.path.insert(0,'tools'); import build; out=Path.cwd()/'build/web-readback'; build.configure('web-stub',build.game_defines(Path.cwd()/'games/stub',out),build_dir=out/'cmake'); build.build('web-stub',['gpu_webgpu_readback_tests'],4,build_dir=out/'cmake')"
+.venv/bin/python -c "import sys; sys.path.insert(0,'tools'); import web_launcher; web_launcher.serve('build/web-readback/web-stub/recomp',2029)"
+```
+
+On Windows use `.venv/Scripts/python.exe`. Open
+`http://127.0.0.1:2029/webgpu-readback-tests.html` in a WebGPU browser.
+The page reports checks/failures and exposes `gpuReadbackChecks` and
+`gpuReadbackFailures` for automation. It tests odd/padded rows, subregions,
+RGBA/BGRA/R8 data, depth checkpoints, fresh buffer snapshots, all three
+texture-copy paths, self-copies, completion ordering and invalid handles.
+The final deliberate device destruction must return a failed map rather
+than hang or expose old bytes; its map-failure diagnostic is expected.
+Other WebGPU errors or a timeout fail the check. This does not establish
+gameplay or performance. The main thread never blocks on readback: callers
+requiring CPU bytes must run on a worker, as the web guest does.
+
 | Command | What it checks | Needs game files? |
 | --- | --- | --- |
 | `tools/test.py` | Setup failures, synthetic texture processing and display-mode tooling | No |

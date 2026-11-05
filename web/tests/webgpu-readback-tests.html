@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU readback contracts</title>
+</head>
+<body>
+<h1>WebGPU readback contracts</h1>
+<p id="status" role="status">Preparing WebGPU…</p>
+<p>This game-free test deliberately destroys its graphics device at the end
+to check that failed mapping wakes the worker.</p>
+<script src="webgpu-readback-tests.js"></script>
+</body>
+</html>

@@ -379,8 +379,13 @@ bool WebGpuDevice::readback(Texture texture, Region region, void *bytes, int pit
             return;
         }
         const Tex &t = it->second;
-        const uint64_t row = uint64_t(region.w) * bytes_per_pixel(t.desc.format);
-        const uint64_t stride = round_up(row, 256), size = stride * region.h;
+        const uint64_t bpp = bytes_per_pixel(t.desc.format);
+        const uint64_t row = uint64_t(region.w) * bpp;
+        // Depth copies must cover the whole subresource in WebGPU. Read it
+        // once and crop on the CPU when the caller requests a depth rectangle.
+        const bool depth = t.desc.format == Format::Depth32F;
+        const Region copy = depth ? Region{0, 0, t.desc.width, t.desc.height} : region;
+        const uint64_t stride = round_up(uint64_t(copy.w) * bpp, 256), size = stride * copy.h;
         if (region.x > t.desc.width - region.w || region.y > t.desc.height - region.h ||
             pitch < 0 || uint64_t(pitch) < row || size > limits_.maxBufferSize) {
             emscripten_proxy_finish(context);
@@ -394,13 +399,13 @@ bool WebGpuDevice::readback(Texture texture, Region region, void *bytes, int pit
         WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device_, nullptr);
         WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         from.texture = t.texture;
-        from.origin = {uint32_t(region.x), uint32_t(region.y), 0};
-        if (t.desc.format == Format::Depth32F)
+        from.origin = {uint32_t(copy.x), uint32_t(copy.y), 0};
+        if (depth)
             from.aspect = WGPUTextureAspect_DepthOnly;
         WGPUTexelCopyBufferInfo to = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
         to.buffer = staging;
         to.layout.bytesPerRow = uint32_t(stride);
-        WGPUExtent3D extent = {uint32_t(region.w), uint32_t(region.h), 1};
+        WGPUExtent3D extent = {uint32_t(copy.w), uint32_t(copy.h), 1};
         wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &to, &extent);
         WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
         wgpuCommandEncoderRelease(encoder);
@@ -411,7 +416,9 @@ bool WebGpuDevice::readback(Texture texture, Region region, void *bytes, int pit
             [=](const uint8_t *data) {
                 for (int y = 0; y < region.h; ++y)
                     memcpy(static_cast<uint8_t *>(bytes) + size_t(y) * pitch,
-                           data + size_t(y) * stride, size_t(row));
+                           data + size_t(y + (depth ? region.y : 0)) * stride +
+                               (depth ? uint64_t(region.x) * bpp : 0),
+                           size_t(row));
             },
             [&, context, staging](bool ok) {
                 wgpuBufferRelease(staging);
@@ -1011,10 +1018,14 @@ void WebGpuDevice::blit(CommandBuffer cb, Texture src, Region src_region, Textur
     if (src_region.w <= 0 || src_region.h <= 0)
         return;
     if (off_main())
+        // Own the transfer record rather than referring to ABI argument
+        // storage that may be reused during the tail-called proxy handoff.
         return on_main_void([=, this] { blit(cb, src, src_region, dst, dst_x, dst_y); });
     Cmd *c = cmd(cb);
     auto s = textures_.find(src.id), d = textures_.find(dst.id);
     if (!c || s == textures_.end() || d == textures_.end())
+        return;
+    if (s->second.texture == d->second.texture && src_region.x == dst_x && src_region.y == dst_y)
         return;
     end_passes(*c);
     WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -1024,7 +1035,21 @@ void WebGpuDevice::blit(CommandBuffer cb, Texture src, Region src_region, Textur
     to.texture = d->second.texture;
     to.origin = {uint32_t(dst_x), uint32_t(dst_y), 0};
     WGPUExtent3D size = {uint32_t(src_region.w), uint32_t(src_region.h), 1};
-    wgpuCommandEncoderCopyTextureToTexture(c->encoder, &from, &to, &size);
+    if (from.texture == to.texture) {
+        // WebGPU forbids copies within one texture subresource, even for
+        // disjoint rectangles. A temporary also preserves overlapping pixels.
+        WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        desc.size = size;
+        desc.format = wgpu_format(s->second.desc.format);
+        desc.usage = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+        WGPUTexture scratch = wgpuDeviceCreateTexture(device_, &desc);
+        WGPUTexelCopyTextureInfo temporary = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        temporary.texture = scratch;
+        wgpuCommandEncoderCopyTextureToTexture(c->encoder, &from, &temporary, &size);
+        wgpuCommandEncoderCopyTextureToTexture(c->encoder, &temporary, &to, &size);
+        wgpuTextureRelease(scratch);
+    } else
+        wgpuCommandEncoderCopyTextureToTexture(c->encoder, &from, &to, &size);
 }
 
 void WebGpuDevice::copy_buffer_to_texture(CommandBuffer cb, Buffer src, uint64_t offset, int pitch,

@@ -8,6 +8,10 @@
   on mapping failure. Copy texture-transfer arguments into their main-thread
   proxy jobs so rectangle values survive the handoff. Add real-browser GPU
   checks for color/depth copies, completion ordering and device loss.
+- Treat identical WebGPU texture self-copies as no-ops and stage overlapping
+  copies through a temporary texture, preserving pixels without invalidating
+  the command buffer. Crop depth readback rectangles from a whole-subresource
+  copy to satisfy WebGPU's depth-copy requirements.
 
 - Supply alpha on the fixed-function WebGPU coverage output so alpha-blended
   pipelines validate while retaining the R8 coverage mask. Fixes the black

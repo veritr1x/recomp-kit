@@ -19,8 +19,8 @@ class Page(HTMLParser):
 
 
 def test_pages_enforce_strict_csp():
-    for name in ("launcher","player"):
-        path = ROOT / "web" / name / "index.html"
+    for path in (ROOT / "web/launcher/index.html", ROOT / "web/player/index.html",
+                 ROOT / "web/tests/webgpu-readback-tests.html"):
         page = Page()
         html = path.read_text(encoding="utf-8")
         page.feed(html)

@@ -135,6 +135,10 @@ void depth_checkpoint() {
     CHECK(d.readback(depth, {0, 0, 8, 4}, values, 8 * 4));
     for (float value : values)
         CHECK(value == 0.25f);
+    float subregion[4] = {};
+    CHECK(d.readback(depth, {3, 1, 2, 2}, subregion, 2 * 4));
+    for (float value : subregion)
+        CHECK(value == 0.25f);
     d.destroy(buffer);
     d.destroy(depth);
 }
@@ -165,6 +169,13 @@ void uploaded_copy_and_blit() {
             }
     d.destroy(b);
     d.destroy(src);
+    cb = d.begin();
+    d.blit(cb, dst, {0, 0, 6, 4}, dst, 0, 0); // identical copy is a no-op
+    d.blit(cb, dst, {2, 1, 3, 2}, dst, 1, 0); // overlapping self-copy
+    d.commit(cb);
+    CHECK(d.readback(dst, {0, 0, 6, 4}, output, 6 * 4));
+    for (int y = 0; y < 2; ++y)
+        CHECK(memcmp(output + (y * 6 + 1) * 4, rows.data() + y * 256, 3 * 4) == 0);
     d.destroy(dst);
 }
 
