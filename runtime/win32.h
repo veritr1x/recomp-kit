@@ -359,7 +359,9 @@ void host_post_client_mouse_message(uint32_t hwnd, uint32_t msg, uint32_t mk, in
 // Post a keyboard message to the window that has the focus, which is where
 // Windows sends one. Not the same as host_main_window: in a VCL application
 // that is the invisible application window.
-void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam);
+// A host-supplied character is queued with the key and is not translated a
+// second time by the guest's TranslateMessage call.
+void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam, uint32_t character = 0);
 uint32_t host_main_window(); // first created top-level HWND, or 0
 // Visible top-level form to close, following visible owners past modal dialogs.
 uint32_t host_close_target();

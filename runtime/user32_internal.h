@@ -57,7 +57,8 @@ struct Window {
 
 struct Msg {
     uint32_t hwnd, message, wparam, lparam, time, ptx, pty;
-    uint32_t thread = 0; // explicit target for windowless messages
+    uint32_t thread = 0;           // explicit target for windowless messages
+    bool character_posted = false; // host already supplied this key's text
 };
 
 std::map<std::string, WndClass> &classes();

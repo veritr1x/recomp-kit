@@ -993,6 +993,17 @@ void u_TranslateMessage(X86 *c) {
     }
     uint32_t msg = rd32(p + 4), vk = rd32(p + 8), lparam = rd32(p + 12);
     if (msg == 0x0100 || msg == 0x0104) { // WM_KEYDOWN / WM_SYSKEYDOWN
+        // The host can supply layout-aware text with a physical key. Preserve
+        // that character (including case) instead of appending a second one.
+        // Match the complete retrieved MSG so guest-posted/modified keys still
+        // take the ordinary translation path, and copied MSG values work too.
+        const Msg &last = last_message();
+        if (last.character_posted && last.hwnd == rd32(p) && last.message == msg &&
+            last.wparam == vk && last.lparam == lparam && last.time == rd32(p + 16) &&
+            last.ptx == rd32(p + 20) && last.pty == rd32(p + 24)) {
+            set_eax(c, 1);
+            return;
+        }
         uint32_t ch = 0;
         if (vk >= 0x30 && vk <= 0x5a)
             ch = vk; // digits and letters

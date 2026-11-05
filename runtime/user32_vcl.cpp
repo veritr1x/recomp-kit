@@ -1502,14 +1502,19 @@ void user32::forget_window_services(uint32_t hwnd) {
 // is the invisible application window, which does nothing with a keystroke.
 // Falls back to the active window and then to the main one, so a guest that
 // never called SetFocus is no worse off than before.
-void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam, uint32_t character) {
     uint32_t hwnd = user32::focus;
     if (!hwnd || !user32::find_window(hwnd))
         hwnd = user32::active;
     if (!hwnd || !user32::find_window(hwnd))
         hwnd = host_main_window();
-    if (hwnd)
+    if (hwnd) {
         host_post_message(hwnd, msg, wparam, lparam);
+        if (character && msg == 0x0100) {
+            user32::queue().back().character_posted = true;
+            host_post_message(hwnd, 0x0102, character, lparam);
+        }
+    }
 }
 
 void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y) {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve host-supplied keyboard characters through `TranslateMessage`
+  instead of appending another character. Fixes doubled alias/name input
+  while retaining case, punctuation and normal editing-key translation.
+  Add a focused game-independent keyboard regression.
+
 - Optimize Release WebAssembly at link time and strip debug information.
   Prewarm eight workers with a 512 MiB initial heap to reduce startup cost.
   Skip WebGPU drawable acquisition while the canvas backing store is zero

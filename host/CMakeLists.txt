@@ -351,6 +351,8 @@ pop_host(host_tests UI_LAYER
 pop_link_sdl(host_tests)
 pop_test_binary(host_tests)
 add_test(NAME host_tests COMMAND host_tests WORKING_DIRECTORY ${POP_ROOT})
+add_test(NAME host_keyboard_tests COMMAND host_tests --keyboard-only WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(host_keyboard_tests PROPERTIES LABELS nogame TIMEOUT 30)
 set_tests_properties(host_tests PROPERTIES LABELS gpu)
   add_test(NAME d3d9_gpu_tests COMMAND host_tests --d3d9-gpu WORKING_DIRECTORY ${POP_ROOT})
   set_tests_properties(d3d9_gpu_tests PROPERTIES LABELS gpu TIMEOUT 120)

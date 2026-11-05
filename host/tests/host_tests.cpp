@@ -7127,8 +7127,14 @@ static void test_input_gate() {
         CHECK(gate_buffered_events(&ctx, kb) == 1); // 2. buffered event
     CHECK(async_down() != 0);                       // 3. GetAsyncKeyState
     uint32_t wp = 0;
-    CHECK(gate_next_message(&ctx, &wp) == 0x0100); // 4. WM_KEYDOWN
-    CHECK(wp == m.vk);
+    uint32_t keymsg = gate_scratch(0x200);
+    CHECK(gate_call_import(&ctx, "USER32.dll", "PeekMessageA", {keymsg, 0, 0, 0, 1}) == 1);
+    CHECK(rd32(keymsg + 4) == 0x0100 && rd32(keymsg + 8) == m.vk); // 4. WM_KEYDOWN
+    // Real game loops translate the returned key before dispatch. The host
+    // already supplied its layout-aware 'G'; translating must not append 'g'.
+    uint32_t copied = gate_scratch(0x240);
+    memcpy(gm_ptr(copied), gm_ptr(keymsg), 28);
+    CHECK(gate_call_import(&ctx, "USER32.dll", "TranslateMessage", {copied}) == 1);
     CHECK(gate_next_message(&ctx, &wp) == 0x0102); //    and its WM_CHAR
     CHECK(wp == 'G');
     CHECK(gate_next_message(&ctx, nullptr) == 0);
@@ -7139,6 +7145,27 @@ static void test_input_gate() {
     CHECK(dik_down() == 0);
     CHECK(gate_next_message(&ctx, nullptr) == 0x0101); // WM_KEYUP
     CHECK(!host_guest_key_down(m.vk));
+
+    // Layout punctuation survives translation too. Editing keys without a
+    // supplied character still use USER32's normal control-character path.
+    for (uint32_t character : {'g', '?'}) {
+        CHECK(!host_key_event(kMacG, true, character));
+        CHECK(gate_call_import(&ctx, "USER32.dll", "PeekMessageA", {keymsg, 0, 0, 0, 1}) == 1);
+        CHECK(gate_call_import(&ctx, "USER32.dll", "TranslateMessage", {keymsg}) == 1);
+        CHECK(gate_next_message(&ctx, &wp) == 0x0102 && wp == character);
+        CHECK(gate_next_message(&ctx, nullptr) == 0);
+        host_key_event(kMacG, false, 0);
+        CHECK(gate_next_message(&ctx, nullptr) == 0x0101);
+    }
+    CHECK(async_down() != 0); // consume the additional presses' asynchronous edge
+    CHECK(async_down() == 0);
+    host_key_event(0x33 /* Backspace */, true, 0);
+    CHECK(gate_call_import(&ctx, "USER32.dll", "PeekMessageA", {keymsg, 0, 0, 0, 1}) == 1);
+    CHECK(gate_call_import(&ctx, "USER32.dll", "TranslateMessage", {keymsg}) == 1);
+    CHECK(gate_next_message(&ctx, &wp) == 0x0102 && wp == '\b');
+    CHECK(gate_next_message(&ctx, nullptr) == 0);
+    host_key_event(0x33, false, 0);
+    CHECK(gate_next_message(&ctx, nullptr) == 0x0101);
 
     // ---- consumed: the press, its repeat and its release reach nothing -----
     gate_reset_all(&ctx);
@@ -10141,6 +10168,14 @@ static void test_d3d9_gpu_renderer() {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--keyboard-only")) {
+        mem_init();
+        test_input_gate();
+        test_input_gate_modifiers();
+        printf("keyboard: %d checks, %d failures\n", g_checks, g_failures);
+        mem_shutdown();
+        return g_failures ? 1 : 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--dumpat-only")) {
         test_dumpat_present_and_seal();
         printf("dumpat integration: %d checks, %d failures\n", g_checks, g_failures);

@@ -1,5 +1,11 @@
 # Testing
 
+`host_keyboard_tests` (`host_tests --keyboard-only`) checks the real input
+gate and USER32 message path without a game or GPU. Host-supplied text is
+delivered once when the guest calls `TranslateMessage`, including a copied
+MSG, capitalization and punctuation; Backspace still translates normally.
+The same run covers consumed keys and modifier transitions.
+
 Windows/Linux diagnostic hosts embed the same game core mods as the app.
 When validating a real port, check that its required core mod is reported as
 loaded; a completed input script can otherwise hide a rejected plugin and

@@ -72,14 +72,14 @@ void post_key(HostKeyMapping m, bool down, bool sys, bool context, uint32_t char
     bool was_down = g_guest_key[m.vk];
     g_guest_key[m.vk] = down;
     uint32_t lparam = host_key_lparam(m, down, context, down ? was_down : true);
-    post(down ? (sys ? WM_SYSKEYDOWN_ : WM_KEYDOWN_) : (sys ? WM_SYSKEYUP_ : WM_KEYUP_), m.vk,
-         lparam);
     // Printable characters, and the four control characters Win32 also
     // delivers as WM_CHAR.
-    if (down && !sys && character &&
-        ((character >= 0x20 && character < 0x7f) || character == 0x0d || character == 0x1b ||
-         character == 0x09 || character == 0x08))
-        post(WM_CHAR_, character, lparam);
+    const bool text = down && !sys && character &&
+                      ((character >= 0x20 && character < 0x7f) || character == 0x0d ||
+                       character == 0x1b || character == 0x09 || character == 0x08);
+    host_post_key_message(down ? (sys ? WM_SYSKEYDOWN_ : WM_KEYDOWN_)
+                               : (sys ? WM_SYSKEYUP_ : WM_KEYUP_),
+                          m.vk, lparam, text ? character : 0);
 }
 
 // The modifier bit a scan code contributes: either side counts, which is what
