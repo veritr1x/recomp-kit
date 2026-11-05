@@ -139,6 +139,22 @@ void depth_checkpoint() {
     CHECK(d.readback(depth, {3, 1, 2, 2}, subregion, 2 * 4));
     for (float value : subregion)
         CHECK(value == 0.25f);
+    cb = d.begin();
+    pass.depth.clear = 0.75;
+    d.begin_render_pass(cb, pass);
+    d.end_render_pass(cb);
+    d.copy_buffer_to_texture(cb, buffer, 0, 256, depth, {0, 0, 8, 4});
+    d.commit(cb);
+    CHECK(d.readback(depth, {0, 0, 8, 4}, values, 8 * 4));
+    for (float value : values)
+        CHECK(value == 0.25f);
+    const float patch[] = {0.1f, 0.2f, 0.3f, 0.4f};
+    CHECK(d.upload(depth, {3, 1, 2, 2}, patch, 2 * 4));
+    CHECK(d.readback(depth, {0, 0, 8, 4}, values, 8 * 4));
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 8; ++x)
+            CHECK(values[y * 8 + x] ==
+                  (x >= 3 && x < 5 && y >= 1 && y < 3 ? patch[(y - 1) * 2 + x - 3] : 0.25f));
     d.destroy(buffer);
     d.destroy(depth);
 }

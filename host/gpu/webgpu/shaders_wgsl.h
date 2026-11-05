@@ -87,6 +87,21 @@ fn byte_at(off: u32) -> u32 { return (words[off >> 2u] >> ((off & 3u) * 8u)) & 2
 }
 )WGSL";
 
+// WebGPU cannot copy a buffer into Depth32Float. Restore checkpoint words
+// with a depth-only render pass; fragment coordinates retain rectangle origin.
+inline constexpr const char *kDepthUpload = R"WGSL(
+@group(0) @binding(4) var<storage, read> depths: array<f32>;
+@group(0) @binding(5) var<storage, read> p: vec4u;
+@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
+    let corner = vec2f(f32(vid & 1u), f32(vid >> 1u));
+    return vec4f(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0, 1);
+}
+@fragment fn fs_main(@builtin(position) frag: vec4f) -> @builtin(frag_depth) f32 {
+    let xy = vec2u(frag.xy) - p.zw;
+    return depths[p.x + xy.y * p.y + xy.x];
+}
+)WGSL";
+
 inline constexpr const char *kD3d = R"WGSL(
 diagnostic(off, derivative_uniformity);
 struct HVertex { x: f32, y: f32, z: f32, w: f32, u: f32, v: f32, r: f32, g: f32, b: f32, a: f32,
@@ -278,6 +293,7 @@ inline constexpr Program kPrograms[] = {
     {"compositor", kCompositor},
     {"hud", kHud},
     {"surface_upload", kSurfaceUpload},
+    {"depth_upload", kDepthUpload},
     {"d3d", kD3d},
     {"guest_readback", kGuestReadback},
     {"guest_readback_fused", kGuestReadbackFused},

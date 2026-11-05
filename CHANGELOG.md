@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Restore WebGPU Depth32Float checkpoints and CPU uploads through a depth-only
+  render pass instead of the forbidden buffer-to-depth copy. Preserve source
+  row pitch and destination rectangles without changing caller render state.
+
 - Implement WebGPU texture and buffer readback for guest-worker callers,
   parking only the worker while browser mapping completes. Preserve padded
   rows, refresh buffer snapshots, propagate queue failures and wake callers

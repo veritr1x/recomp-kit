@@ -322,7 +322,7 @@ Texture WebGpuDevice::create_texture(const TextureDesc &desc) {
     td.mipLevelCount = uint32_t(levels);
     td.usage =
         WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc;
-    if (desc.usage & UsageRenderTarget)
+    if ((desc.usage & UsageRenderTarget) || desc.format == Format::Depth32F)
         td.usage |= WGPUTextureUsage_RenderAttachment;
     t.texture = wgpuDeviceCreateTexture(device_, &td);
     if (!t.texture)
@@ -356,6 +356,24 @@ bool WebGpuDevice::upload(Texture tex, Region region, const void *bytes, int pit
         return false;
     const Tex &t = it->second;
     const int bpp = bytes_per_pixel(t.desc.format);
+    if (t.desc.format == Format::Depth32F) {
+        if (level != 0 || region.x < 0 || region.y < 0 || region.x > t.desc.width - region.w ||
+            region.y > t.desc.height - region.h || pitch < int64_t(region.w) * 4)
+            return false;
+        // Pack arbitrary CPU row padding into float words for the depth pass.
+        std::vector<uint8_t> packed(size_t(region.w) * region.h * 4);
+        for (int y = 0; y < region.h; ++y)
+            memcpy(packed.data() + size_t(y) * region.w * 4,
+                   static_cast<const uint8_t *>(bytes) + size_t(y) * pitch, size_t(region.w) * 4);
+        Buffer buffer = create_buffer(packed.size(), packed.data());
+        if (!buffer)
+            return false;
+        CommandBuffer command = begin();
+        copy_buffer_to_texture(command, buffer, 0, region.w * 4, tex, region);
+        commit(command);
+        destroy(buffer);
+        return true;
+    }
     WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     dst.texture = t.texture;
     dst.mipLevel = uint32_t(level);
@@ -1065,6 +1083,45 @@ void WebGpuDevice::copy_buffer_to_texture(CommandBuffer cb, Buffer src, uint64_t
     if (!c || b == buffers_.end() || d == textures_.end())
         return;
     end_passes(*c);
+    if (d->second.desc.format == Format::Depth32F) {
+        const auto &desc = d->second.desc;
+        const uint64_t row = uint64_t(dst_region.w) * 4;
+        if (dst_region.x < 0 || dst_region.y < 0 || dst_region.x > desc.width - dst_region.w ||
+            dst_region.y > desc.height - dst_region.h || offset % 4 || pitch < 0 || pitch % 4 ||
+            uint64_t(pitch) < row || offset > b->second.bytes ||
+            uint64_t(pitch) * (dst_region.h - 1) + row > b->second.bytes - offset)
+            return;
+        // A depth-only draw is the browser's legal buffer -> depth path. Use
+        // a separate binding/variant state so the caller's render state stays
+        // intact after this copy ends its preceding pass.
+        RenderState state;
+        state.color_count = 0;
+        state.depth_attachment = true;
+        Cmd restore;
+        restore.pipeline = render_pipeline("depth_upload", state).id;
+        restore.topology = Primitive::TriangleStrip;
+        restore.pass_depth = true;
+        restore.depth.write = true;
+        restore.buffers[4] = {b->second.buffer, 0, b->second.bytes};
+        uint32_t params[] = {uint32_t(offset / 4), uint32_t(pitch / 4), uint32_t(dst_region.x),
+                             uint32_t(dst_region.y)};
+        restore.buffers[5] = stage_bytes(params, sizeof params);
+        WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+        depth.view = d->second.view;
+        depth.depthLoadOp = WGPULoadOp_Load;
+        depth.depthStoreOp = WGPUStoreOp_Store;
+        depth.depthClearValue = 1;
+        WGPURenderPassDescriptor pass = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        pass.depthStencilAttachment = &depth;
+        restore.pass = wgpuCommandEncoderBeginRenderPass(c->encoder, &pass);
+        wgpuRenderPassEncoderSetPipeline(restore.pass, variant_for(restore));
+        wgpuRenderPassEncoderSetViewport(restore.pass, float(dst_region.x), float(dst_region.y),
+                                         float(dst_region.w), float(dst_region.h), 0, 1);
+        bind(restore, false);
+        wgpuRenderPassEncoderDraw(restore.pass, 4, 1, 0, 0);
+        end_passes(restore);
+        return;
+    }
     WGPUTexelCopyBufferInfo from = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
     from.buffer = b->second.buffer;
     from.layout.offset = offset;

@@ -109,6 +109,17 @@ below 64 rows cannot establish or overwrite the render-scale base.
 
 ## Timing, input and settings
 
+The WebGPU device belongs to the browser main thread. Guest-worker readback
+parks only that worker through an Emscripten proxy context; mapping runs
+asynchronously and finishes the context after copying CPU-visible bytes.
+Mapping and queue callbacks defer WebGPU calls out of the binding's event
+lock. Buffer reads refresh a per-buffer CPU snapshot, valid until its next
+read or destruction. Transfer rectangles are owned by the proxy task.
+Depth readback crops a whole-subresource copy, and checkpoint restoration
+uses a depth-only draw because WebGPU forbids buffer-to-depth copies.
+The browser fixture in [testing.md](testing.md) checks these paths on a real
+device, including failed mappings and overlapping self-copies.
+
 The render limit and animation clock are separate from the simulation clock.
 Increasing the presentation limit must not advance game logic or animations faster.
 `mods/animation_timing.cpp` redirects only reviewed visual clock reads.

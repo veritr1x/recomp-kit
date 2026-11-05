@@ -190,6 +190,8 @@ The page reports checks/failures and exposes `gpuReadbackChecks` and
 `gpuReadbackFailures` for automation. It tests odd/padded rows, subregions,
 RGBA/BGRA/R8 data, depth checkpoints, fresh buffer snapshots, all three
 texture-copy paths, self-copies, completion ordering and invalid handles.
+Depth checks also restore a checkpoint and apply a partial CPU depth upload,
+then verify both updated and untouched depth values.
 The final deliberate device destruction must return a failed map rather
 than hang or expose old bytes; its map-failure diagnostic is expected.
 Other WebGPU errors or a timeout fail the check. This does not establish
