@@ -255,7 +255,9 @@ disabled unless explicitly allowed in `web/player/env.mjs`.
 `--stream` explicitly copies the configured private installation into
 `<out>/<game id>/data/` and publishes `manifest.txt`. It verifies the executable
 and prepared auxiliary module hashes, honors bundle exclusions and refreshes
-previously staged files. No game files are published without this option.
+previously staged files. Omitting this option disables streaming metadata and
+copies no installation files. Previously staged data remains on disk; use a
+separate output directory when preparing an import-only distribution.
 The launcher offers **Stream game** alongside folder/ZIP import; **Play**
 uses an imported copy. Direct player URLs prefer imported data when present,
 otherwise use the configured stream. Saves share the same OPFS profile in

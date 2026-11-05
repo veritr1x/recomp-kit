@@ -1,5 +1,24 @@
 # Testing
 
+`test_web_streaming.py` checks private asset staging, pinned hashes, bundle
+exclusions, prepared auxiliary modules and source preservation, then exercises
+the actual local HTTP server's HEAD, ranges, empty files and error responses.
+`test_web_launcher.py` also runs the Node launcher/player suites, including
+the linked fetch-backend source against deterministic byte fixtures. Those
+cover whole-file cross-chunk reads, range/EOF reads, cache eviction/refetch,
+URL encoding, ignored Range, missing/truncated responses and read-only writes.
+Run these alongside `test_web_csp.py` after changing streaming. They require
+no private game assets and do not establish browser game playback.
+
+For a compiled web game, check both folder import and an explicit streamed
+launch in isolated browser contexts, then a streamed launch with an imported
+copy already present. Verify the executable loads from the selected mount,
+the required core mods load, and streamed directory enumeration does not fetch
+the entire installation. Drive briefly, pause/resume and save/reload; switch
+sources on the same origin to check profile sharing. Check manifest failure
+messages as well as the happy path. Keep disposable saves separate from a
+player's profiles and record viewport, browser/GPU, traffic and bounded scope.
+
 `host_keyboard_tests` (`host_tests --keyboard-only`) checks the real input
 gate and USER32 message path without a game or GPU. Host-supplied text is
 delivered once when the guest calls `TranslateMessage`, including a copied

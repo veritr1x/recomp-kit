@@ -34,6 +34,11 @@ class WebLauncherTests(unittest.TestCase):
             self.assertEqual(data[1]["requiredDirs"], ["data"])
             self.assertEqual(data[0]["executable"], "STUB.EXE")
             self.assertEqual(data[0]["sha256"], "0" * 64)
+            web_launcher.stage_streams([ROOT / "games/stub", other], games, [], out)
+            self.assertFalse(any("streamManifest" in g for g in json.loads((out / "games.json").read_text())))
+            self.assertFalse((out / "stub/data").exists())
+            with self.assertRaisesRegex(ValueError, "known game id"):
+                web_launcher.stage_streams([ROOT / "games/stub", other], games, ["unknown"], out)
             with self.assertRaises(ValueError):
                 web_launcher.build([ROOT / "games/stub", ROOT / "games/stub"], tmp / "dup")
 
