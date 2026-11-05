@@ -82,6 +82,9 @@ async function start() {
     preRun: [() => {
       const m = Module;
       m.ENV.RECOMP_PROFILE_DIR = `/opfs/${id}/profile`;
+      // TouchMapper places the guest cursor before emitting its click. SDL's
+      // additional synthetic mouse click would fire first at the old cursor.
+      m.ENV.SDL_TOUCH_MOUSE_EVENTS = "0";
       Object.assign(m.ENV, queryEnvironment(location.search));
     }],
     onRuntimeInitialized() {

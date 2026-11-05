@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Disable SDL's extra mouse events for browser touches. The host gesture
+  mapper already emits clicks after cursor placement; duplicate events could
+  activate the previous menu item before the touched item received its click.
+
 - Retire consumed DirectDraw blit records when D3D11/GDI publishes a complete
   window image. Keep pending Direct3D draw snapshots alive. Prevents offscreen
   coverage records accumulating until the browser reaches its 4 GB memory limit.
