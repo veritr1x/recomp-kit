@@ -122,7 +122,11 @@ enum {
 };
 enum { OS_SEEK_SET = 0, OS_SEEK_CUR = 1, OS_SEEK_END = 2 };
 int os_fd_open(const char *path, int flags);
-int64_t os_fd_read(int fd, void *buf, size_t n);        // bytes read, 0 at EOF, -1 on error
+int64_t os_fd_read(int fd, void *buf, size_t n); // bytes read, 0 at EOF, -1 on error
+// Nonzero where a file read can take long enough to matter to other threads:
+// in a browser, files are fetched through the network or the origin-private
+// file system by another thread. Zero where reads come from the page cache.
+int os_fd_reads_may_block(void);
 int64_t os_fd_write(int fd, const void *buf, size_t n); // bytes written, -1 on error
 int64_t os_fd_seek(int fd, int64_t off, int whence);    // new offset or -1
 int os_fd_close(int fd);
@@ -154,6 +158,9 @@ void os_exit_immediately(int code);
 // Time.
 // ---------------------------------------------------------------------------
 uint64_t os_monotonic_ns(void); // never goes backwards; arbitrary origin
+// Nonzero where reading that clock is costly next to a guest import call (a
+// call out to the browser on the web), so hot paths should read it sparingly.
+int os_monotonic_is_costly(void);
 // Broken-down local and UTC time for a Unix timestamp; 0 or -1.
 int os_localtime(int64_t seconds, struct tm *out);
 int os_gmtime(int64_t seconds, struct tm *out);

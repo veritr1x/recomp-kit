@@ -28,6 +28,9 @@ struct Composite {
 struct Target {
     gpu::Device *device = nullptr;
     HostSceneTarget scene;
+    // The overlay's size, kept here: asking the device for it is a round trip
+    // to the browser's main thread on the web, on every frame.
+    int overlay_w = 0, overlay_h = 0;
     gpu::Texture pixels;
     int pixels_w = 0, pixels_h = 0;
     gpu::Format pixels_format = gpu::Format::RGBA8;
@@ -40,6 +43,7 @@ struct Target {
                 device->destroy(scene.overlay);
         }
         scene = {};
+        overlay_w = overlay_h = 0;
     }
     ~Target() {
         release_scene();

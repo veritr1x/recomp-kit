@@ -37,6 +37,10 @@ void host_d9_texture_drop(uint32_t id);
 // One face/level from the shim's bytes, in the texture's D3DFORMAT.
 void host_d9_texture_upload(uint32_t id, uint32_t face, uint32_t level, const uint8_t *bytes,
                             uint32_t pitch);
+// The same, with the face/level's size in bytes: the bytes are copied into
+// the render thread's queue and the caller does not wait for the upload.
+void host_d9_texture_upload_copy(uint32_t id, uint32_t face, uint32_t level, const uint8_t *bytes,
+                                 uint32_t pitch, uint32_t size);
 // Reads a colour face/level back as the texture's own format (32-bit formats
 // only). Waits for the GPU. Non-zero on success.
 int host_d9_texture_read(uint32_t id, uint32_t face, uint32_t level, uint8_t *bytes,

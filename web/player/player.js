@@ -53,6 +53,9 @@ async function start() {
   } catch {}
   const source = await selectSource(game, gamesUrl, location.search, imported);
   window.recompSource = source.kind;
+  // Streamed data is kept in this origin's storage; ask the browser not to
+  // evict it under storage pressure, as it would the cache of a normal page.
+  if (source.kind === "stream" && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("WebGPU gave no adapter.");
@@ -79,6 +82,18 @@ async function start() {
     printErr: (t) => record(t, true),
     setStatus: (t) => status(t ? t : ""),
     onAbort: (what) => status(`The game stopped: ${what}`, true),
+    // The game's thread ended. Quitting from the game's own menu returns to
+    // the launcher; a game that could not start says why.
+    onGameExit(code) {
+      if (code === 0) {
+        status("The game has quit. Returning to the launcher…");
+        location.assign("../");
+        return;
+      }
+      const last = [...log].reverse().find((t) => /failed|could not|unavailable|missing|error/i.test(t));
+      if (!statusEl.querySelector("a"))
+        status(`The game could not start${last ? `: ${last}` : "."}`, true);
+    },
     preRun: [() => {
       const m = Module;
       m.ENV.RECOMP_PROFILE_DIR = `/opfs/${id}/profile`;
@@ -104,6 +119,34 @@ async function dirForStamp(id) {
   const root = await navigator.storage.getDirectory();
   const game = await (await root.getDirectoryHandle(id)).getDirectoryHandle("game");
   return (await game.getFileHandle(".stamp")).getFile();
+}
+
+// A streamed game keeps what it downloads in this browser and fills in the
+// rest in the background; show how much is local until all of it is.
+if (typeof BroadcastChannel === "function") {
+  const streamEl = document.getElementById("stream");
+  let saved = "", downloading = false;
+  new BroadcastChannel("recomp-stream").onmessage = ({ data }) => {
+    if (!data) return;
+    if ("waiting" in data) {
+      downloading = data.waiting;
+      if (downloading) {
+        streamEl.hidden = false;
+        streamEl.textContent = `Downloading game data… ${(data.rate / 1e6).toFixed(1)} MB/s`;
+      } else {
+        streamEl.hidden = !saved;
+        streamEl.textContent = saved;
+      }
+      return;
+    }
+    if (!data.total) return;
+    saved = data.cached && data.filled < data.total
+      ? `Saving game data to this browser: ${Math.floor(100 * data.filled / data.total)}%` : "";
+    if (!downloading) {
+      streamEl.hidden = !saved;
+      streamEl.textContent = saved;
+    }
+  };
 }
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());

@@ -463,26 +463,18 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     void (*fn)(X86 *) = tramps()[idx].fn;
     uint8_t argc = tramps()[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
-    // across that call, and do not retain a pointer into the movable vector.
-    // This runs for every guest import call, and the game's message loop polls
-    // PeekMessage at a high rate, so copy the name with a bounded memcpy rather
-    // than snprintf's format parse. A guest longjmp across fn(c) can realloc the
-    // vector, so desc must be an owned stack copy, not a pointer into it.
-    char desc[512];
-    {
-        const std::string &d = tramps()[idx].desc;
-        size_t n = d.size();
-        if (n >= sizeof desc)
-            n = sizeof desc - 1;
-        memcpy(desc, d.data(), n);
-        desc[n] = '\0';
-    }
+    // across that call, and do not retain a pointer into the movable vector:
+    // the shim may allocate trampolines and reallocate it. The name is read
+    // from the table where it is used, never held across fn(c); this runs on
+    // every guest import, tens of thousands of times a frame, so it is not
+    // copied unless an observer (which may itself reallocate) is installed.
+    auto desc_now = [idx]() -> const char * { return tramps()[idx].desc.c_str(); };
     ++tramps()[idx].calls;
     ++g_import_calls;
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
-    LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
-    recomp_seh_validate_chain(c, "import enter", desc);
+    LOGV("-> %s (esp=%08x ret=%08x)", desc_now(), c->r[R_ESP], ret_addr);
+    recomp_seh_validate_chain(c, "import enter", desc_now());
 
     // The arguments as they are NOW, before the shim runs: a stdcall shim pops
     // them, so after the call they are gone and this is the only point they
@@ -497,7 +489,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         for (uint32_t i = 0; i < n; ++i)
             args[i] = rd32(c->r[R_ESP] + 4 + 4 * i);
         uint32_t result = 0;
-        if (!g_call_observer(desc, args, n, &result)) {
+        const std::string desc = desc_now(); // the observer may reallocate the table
+        if (!g_call_observer(desc.c_str(), args, n, &result)) {
             set_eax(c, result);
             skip = true;
         }
@@ -510,13 +503,15 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     } else if (fn) {
         fn(c);
     } else {
-        log_once(desc, "unimplemented import %s: returning 0", desc);
+        log_once(desc_now(), "unimplemented import %s: returning 0", desc_now());
         set_eax(c, 0);
     }
     // Read after the shim ran, so the pointer is into the table as it is now.
-    if (g_return_observer)
-        g_return_observer(desc, c->r[R_EAX]);
-    LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
+    if (g_return_observer) {
+        const std::string desc = desc_now();
+        g_return_observer(desc.c_str(), c->r[R_EAX]);
+    }
+    LOGV("<- %s (eax=%08x)", desc_now(), c->r[R_EAX]);
     current_import_target = previous_import;
 
     uint32_t pop = 4;
@@ -524,18 +519,18 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         pop = 4;
     } else if (argc == ARGC_UNKNOWN) {
         pop = 4;
-        char key[sizeof desc + 6];
-        snprintf(key, sizeof key, "%s#argc", desc);
+        char key[512 + 6];
+        snprintf(key, sizeof key, "%.511s#argc", desc_now());
         log_once(key,
                  "%s has an unknown stdcall argument count: not adjusting ESP, "
                  "the guest stack will drift if it is really stdcall",
-                 desc);
+                 desc_now());
     } else {
         pop = 4 + 4u * argc;
     }
     c->r[R_ESP] += pop;
     c->eip = ret_addr;
-    recomp_seh_validate_chain(c, "import leave", desc);
+    recomp_seh_validate_chain(c, "import leave", desc_now());
     return true;
 }
 

@@ -30,6 +30,7 @@
 #include <string.h>
 #include <time.h>
 
+#include <atomic>
 #include <map>
 #include <chrono>
 #include <condition_variable>
@@ -844,6 +845,13 @@ void k_CreateFileA(X86 *c) {
     create_file_named(c, gm_str(arg(c, 0)));
 }
 
+// A read where reads may block (os_fd_reads_may_block): done on a host I/O
+// thread while the calling guest thread waits on an event, so the other guest
+// threads keep running - as on Windows, where ReadFile blocks only its caller.
+// Holding the baton through a streamed read froze the whole game, drawing
+// included, for as long as the bytes took to arrive.
+int64_t file_read(int fd, uint8_t *dst, uint32_t n);
+
 void k_ReadFile(X86 *c) {
     HObj *o = handle_get(arg(c, 0), H_FILE);
     uint32_t buf = arg(c, 1), want = arg(c, 2), pread = arg(c, 3);
@@ -863,7 +871,7 @@ void k_ReadFile(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    int64_t n = os_fd_read(o->fd, g_mem + buf, want);
+    int64_t n = file_read(o->fd, g_mem + buf, want);
     if (recomp_env("TRACE_FILES"))
         LOGW("file: read handle=%08x want=%u got=%lld", arg(c, 0), want, (long long)n);
     if (n < 0) {
@@ -3002,14 +3010,107 @@ void sched_atomic_leave() {
     if (t_atomic)
         --t_atomic;
 }
+namespace {
+struct FileReadJob {
+    int fd;
+    uint8_t *dst;
+    uint32_t n;
+    uint32_t event;
+    int64_t result = -1;
+    std::atomic<bool> done{false};
+};
+std::mutex g_io_m;
+std::condition_variable g_io_cv;
+std::vector<FileReadJob *> g_io_queue;
+bool g_io_started = false;
+
+void *file_read_worker(void *) {
+    for (;;) {
+        FileReadJob *job;
+        {
+            std::unique_lock<std::mutex> lock(g_io_m);
+            g_io_cv.wait(lock, [] { return !g_io_queue.empty(); });
+            job = g_io_queue.front();
+            g_io_queue.erase(g_io_queue.begin());
+        }
+        job->result = os_fd_read(job->fd, job->dst, job->n);
+        // Signal, then release the job: the caller returns only after both, and
+        // closes the event only once its wait saw the signal applied.
+        guest_event_signal_from_host(job->event);
+        job->done.store(true, std::memory_order_release);
+    }
+    return nullptr;
+}
+
+int64_t file_read(int fd, uint8_t *dst, uint32_t n) {
+    static const bool may_block = os_fd_reads_may_block() != 0;
+    // Only a guest thread with company and outside an atomic stretch may wait.
+    // Small reads stay on the baton: a hand-off costs more than they do, and a
+    // game streaming audio makes many. Large reads are the ones that stall.
+    if (!may_block || n < 256u * 1024u || t_atomic || !sched_is_guest_thread() ||
+        threads().size() < 2)
+        return os_fd_read(fd, dst, n);
+    {
+        std::lock_guard<std::mutex> lock(g_io_m);
+        if (!g_io_started) {
+            // Two, so one thread's slow read does not queue another's.
+            for (int i = 0; i < 2; ++i)
+                if (OsThread *t = os_thread_create(file_read_worker, nullptr, 0))
+                    os_thread_detach(t);
+            g_io_started = true;
+        }
+    }
+    FileReadJob job;
+    job.fd = fd;
+    job.dst = dst;
+    job.n = n;
+    job.event = win32_create_event(true, false);
+    {
+        std::lock_guard<std::mutex> lock(g_io_m);
+        g_io_queue.push_back(&job);
+    }
+    g_io_cv.notify_one();
+    const uint32_t handle = job.event;
+    // WAIT_OBJECT_0 once the worker signals. Anything else (the wait was cut
+    // short) still may not return while the worker uses `job`.
+    bool seen = false;
+    while (!seen || !job.done.load(std::memory_order_acquire)) {
+        if (sched_wait_objects(&handle, 1, false, 0xffffffffu) == 0)
+            seen = true;
+        else
+            os_sleep_us(200);
+    }
+    win32_close_handle(handle);
+    return job.result;
+}
+} // namespace
+
 void sched_atomic_unwind_to_esp(uint32_t esp) {
     // A stretch entered below `esp` belongs to a frame being unwound.
     while (t_atomic && t_atomic <= SCHED_ATOMIC_MAX && t_atomic_esp[t_atomic - 1] < esp)
         --t_atomic;
 }
 
+// Whether this checkpoint reads the clock to see if the slice is over. A
+// browser clock read is a call out to JS that costs about a microsecond, and a
+// race makes over ten thousand import calls a frame: reading it on every one
+// took a third of the game thread. Imports come microseconds apart, so every
+// 32nd call keeps slices close to SCHED_SLICE_SECONDS; a forced checkpoint
+// still yields at once.
+static bool slice_clock_due() {
+    static const bool costly = os_monotonic_is_costly() != 0;
+    static __thread unsigned t_calls;
+    return !costly || (++t_calls & 31) == 0;
+}
+
 static void scheduling_checkpoint(bool force) {
     bool yield = false;
+    // Nothing to do unless a slice may be over or the host has signalled:
+    // then the scheduler's lock is not taken at all, which on the web is an
+    // atomic exchange on every guest import.
+    const bool due = force || slice_clock_due();
+    if (!due && !g_host_signals_pending.load(std::memory_order_acquire))
+        return;
     g_sched_m.lock();
     const bool pending = g_host_signals_pending.load(std::memory_order_acquire);
     if (!sched_holds_baton_locked()) {
@@ -3022,7 +3123,7 @@ static void scheduling_checkpoint(bool force) {
     }
     if (pending)
         apply_host_signals_locked();
-    if (threads().size() >= 2 && !t_atomic) {
+    if (threads().size() >= 2 && !t_atomic && due) {
         GuestThread *me = threads()[t_self];
         const double now = sched_now();
         if (force || now - me->last_yield >= SCHED_SLICE_SECONDS) {

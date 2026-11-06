@@ -46,8 +46,15 @@ bool platform_ui_touch_device();
 bool platform_ui_pointer_capture_supported();
 
 // The performance overlay mode a fresh profile starts with: 2 (graph) on the
-// developer's desktop, 0 on a player's tablet.
+// developer's desktop, 0 on a player's tablet or in a player's browser.
 int platform_ui_default_overlay();
+
+// Whether losing keyboard focus deactivates the game (WM_ACTIVATEAPP 0), as
+// switching away from a desktop window does. A browser loses focus whenever
+// the player clicks another window or monitor while the game stays in view,
+// and a game that stops its loop when deactivated would freeze on screen. The
+// web deactivates the game only while its tab is hidden. Desktop and iOS: true.
+bool platform_ui_pause_when_unfocused();
 
 // The guest has exited and the host has torn down: a desktop process returns
 // from main; iOS and Android end the process after SDL_Quit.

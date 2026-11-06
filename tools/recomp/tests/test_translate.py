@@ -658,8 +658,8 @@ def test_jumptable(emu, native, verbose):
     src = None
     # A function with alternate entry points is emitted as a shared body plus
     # thin wrappers, so accept either spelling.
-    markers = ("static void body_0043e8e0(X86 *c, uint32_t entry_) {",
-               "void fn_0043e8e0(X86 *c) {")
+    markers = ("static void body_0043e8e0(X86 *RECOMP_CTX c, uint32_t entry_) {",
+               "void fn_0043e8e0(X86 *RECOMP_CTX c) {")
     for name in sorted(os.listdir(GEN)):
         if not name.endswith(".c"):
             continue
