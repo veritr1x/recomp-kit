@@ -333,6 +333,10 @@ int platform_ui_default_overlay() {
     return 0;
 }
 
+bool platform_ui_pause_when_unfocused() {
+    return true;
+}
+
 void platform_ui_process_exit(int code) {
     // UIApplicationMain never returns, so the game's own Exit would leave its
     // last frame on the screen; the game asked to end, and this ends it.

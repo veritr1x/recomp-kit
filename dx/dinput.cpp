@@ -423,6 +423,38 @@ uint32_t keyboard_enum_objects(X86 *c, ComObj *d, uint32_t cb, uint32_t ref, uin
     return DI_OK;
 }
 
+// GetObjectInfo on the keyboard: the same record EnumObjects gives the key,
+// found by its DIK code (DIPH_BYOFFSET) or its type id (DIPH_BYID). A game's
+// key-binding screen names each bound key this way.
+uint32_t keyboard_get_object_info(ComObj *d, uint32_t out, uint32_t obj, uint32_t how) {
+    static const uint8_t GUID_Key_[16] = {0x20, 0x82, 0x72, 0x55, 0x3C, 0xD3, 0xCF, 0x11,
+                                          0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00};
+    uint32_t size = rd32(out);
+    bool ok =
+        d->di_wide
+            ? (size == DIDEVICEOBJECTINSTANCEW_SIZE || size == DIDEVICEOBJECTINSTANCE_DX3W_SIZE)
+            : (size == DIDEVICEOBJECTINSTANCEA_SIZE || size == DIDEVICEOBJECTINSTANCE_DX3A_SIZE);
+    if (!ok || !gm_valid(out, size) || (how != DIPH_BYOFFSET && how != DIPH_BYID))
+        return DIERR_INVALIDPARAM;
+    uint32_t code = how == DIPH_BYOFFSET ? obj : (obj >> 8) & 0xFFFF;
+    if (how == DIPH_BYID && !(obj & DIDFT_PSHBUTTON))
+        return DIERR_OBJECTNOTFOUND;
+    for (const KeyObject &k : kKeyboardKeys) {
+        if (k.code != code)
+            continue;
+        gm_zero(out + 4, size - 4);
+        memcpy(gm_ptr(out + DIDOI_OFF_guidType), GUID_Key_, 16);
+        wr32(out + DIDOI_OFF_dwOfs, k.code);
+        wr32(out + DIDOI_OFF_dwType, DIDFT_PSHBUTTON | ((uint32_t)k.code << 8));
+        if (d->di_wide)
+            di_put_wide(out + DIDOI_OFF_tszName, k.name, DIDOI_NAME_CHARS);
+        else
+            gm_put_str(out + DIDOI_OFF_tszName, k.name, DIDOI_NAME_CHARS);
+        return DI_OK;
+    }
+    return DIERR_OBJECTNOTFOUND;
+}
+
 void Device_EnumObjects(X86 *c) {
     ComObj *d = this_device(c);
     if (d && is_joystick(d)) {
@@ -748,6 +780,10 @@ void Device_GetObjectInfo(X86 *c) {
     }
     if (d && is_joystick(d)) {
         com_ret(c, joy_get_object_info(d, out, arg(c, 2), arg(c, 3)));
+        return;
+    }
+    if (d && d->dev_type == DIDEVTYPE_KEYBOARD) {
+        com_ret(c, keyboard_get_object_info(d, out, arg(c, 2), arg(c, 3)));
         return;
     }
     log_once("dinput.objectinfo", "dinput: GetObjectInfo is not supported");

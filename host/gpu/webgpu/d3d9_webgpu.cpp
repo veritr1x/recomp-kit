@@ -1041,7 +1041,17 @@ class WebGpuRenderer final : public D9Backend {
                 const uint64_t at = round_up(r.used, align);
                 if (at + aligned <= r.chunk_size) {
                     r.used = at + aligned;
-                    write_padded(r.chunks[r.chunk], at, (const uint8_t *)bytes, size);
+                    // Staged on the CPU and uploaded once per chunk at submit:
+                    // a writeBuffer per draw is a call out to the browser and
+                    // a copy each, thousands of times a frame.
+                    std::vector<uint8_t> &shadow = r.shadow[r.chunk];
+                    if (shadow.size() < at + aligned)
+                        shadow.resize(std::max<uint64_t>(
+                            at + aligned, std::min<uint64_t>(r.chunk_size, shadow.size() * 2)));
+                    memcpy(shadow.data() + at, bytes, size);
+                    if (aligned != size)
+                        memset(shadow.data() + at + size, 0, aligned - size);
+                    r.dirty[r.chunk] = std::max<uint64_t>(r.dirty[r.chunk], at + aligned);
                     *offset = at;
                     return r.chunks[r.chunk];
                 }
@@ -1050,10 +1060,23 @@ class WebGpuRenderer final : public D9Backend {
                 continue;
             }
             r.chunks.push_back(make_buffer(r.chunk_size, usage | WGPUBufferUsage_Index));
+            r.shadow.emplace_back();
+            r.dirty.push_back(0);
         }
+    }
+    // The staged ring bytes go to the GPU before the submit that reads them.
+    void flush_rings() {
+        for (Ring *r : {&uniform_ring_, &vertex_ring_})
+            for (size_t i = 0; i < r->chunks.size(); ++i)
+                if (r->dirty[i]) {
+                    wgpuQueueWriteBuffer(queue_, r->chunks[i], 0, r->shadow[i].data(), r->dirty[i]);
+                    r->dirty[i] = 0;
+                }
     }
     struct Ring {
         std::vector<WGPUBuffer> chunks;
+        std::vector<std::vector<uint8_t>> shadow; // per chunk, CPU copy of this submit's data
+        std::vector<uint64_t> dirty;              // per chunk, bytes written since the last flush
         size_t chunk = 0;
         uint64_t used = 0;
         uint64_t chunk_size = 8u << 20;
@@ -1212,6 +1235,7 @@ class WebGpuRenderer final : public D9Backend {
         WGPUCommandBuffer cb = wgpuCommandEncoderFinish(encoder_, nullptr);
         wgpuCommandEncoderRelease(encoder_);
         encoder_ = nullptr;
+        flush_rings();
         wgpuQueueSubmit(queue_, 1, &cb);
         wgpuCommandBufferRelease(cb);
         if (readback)

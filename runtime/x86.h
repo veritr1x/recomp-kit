@@ -45,6 +45,30 @@ extern "C" {
 #endif
 
 extern uint8_t *g_mem;
+/* Where guest address 0 is, for the accessors below. A build that places the
+ * arena at a fixed address (the web: a static array in the module's memory)
+ * names it directly, so each access is one load or store at a constant
+ * offset instead of a reload of g_mem - which every byte-typed guest store
+ * forces, since such a store could in principle change g_mem itself. */
+#if defined(RECOMP_STATIC_GUEST_ARENA) && RECOMP_STATIC_GUEST_ARENA
+extern uint8_t recomp_guest_arena[];
+#define RECOMP_GUEST_BASE recomp_guest_arena
+#else
+#define RECOMP_GUEST_BASE g_mem
+#endif
+
+/* The translated functions' context. Guest memory (RECOMP_GUEST_BASE) is a separate
+ * arena, so nothing a translated function reads or writes through guest
+ * addresses is the context itself. Saying so lets the compiler keep registers
+ * and flags out of memory across guest loads and stores, and drop flag writes
+ * nothing reads; without it every byte-typed guest store forces them all to be
+ * reloaded and written back. */
+#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS
+/* A null-access fault reads the context through t_ctx, not through c. */
+#define RECOMP_CTX
+#else
+#define RECOMP_CTX __restrict
+#endif
 
 /* Guest memory layout (see plan Global constraints, as corrected):
  *   0x00400000 + SizeOfImage  image (preferred base, no relocation).  The end
@@ -112,24 +136,24 @@ void recomp_null_access(uint32_t addr, int write);
 /* Little-endian host (ARM64) matches the guest, so memcpy is a plain load. */
 RECOMP_HOT_INLINE uint8_t rd8(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
-    return g_mem[a];
+    return RECOMP_GUEST_BASE[a];
 }
 RECOMP_HOT_INLINE uint16_t rd16(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint16_t v;
-    memcpy(&v, g_mem + a, 2);
+    memcpy(&v, RECOMP_GUEST_BASE + a, 2);
     return v;
 }
 RECOMP_HOT_INLINE uint32_t rd32(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint32_t v;
-    memcpy(&v, g_mem + a, 4);
+    memcpy(&v, RECOMP_GUEST_BASE + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE uint64_t rd64(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint64_t v;
-    memcpy(&v, g_mem + a, 8);
+    memcpy(&v, RECOMP_GUEST_BASE + a, 8);
     return v;
 }
 /* A guest-memory watchpoint.  RECOMP_WATCH=<hex address>[:<length>] reports
@@ -177,45 +201,45 @@ static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    g_mem[a] = v;
+    RECOMP_GUEST_BASE[a] = v;
     recomp_watch(a, 1, v);
 }
 RECOMP_HOT_INLINE void wr16(uint32_t a, uint16_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 2);
+    memcpy(RECOMP_GUEST_BASE + a, &v, 2);
     recomp_watch(a, 2, v);
 }
 RECOMP_HOT_INLINE void wr32(uint32_t a, uint32_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 4);
+    memcpy(RECOMP_GUEST_BASE + a, &v, 4);
     recomp_watch(a, 4, v);
 }
 RECOMP_HOT_INLINE void wr64(uint32_t a, uint64_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 8);
+    memcpy(RECOMP_GUEST_BASE + a, &v, 8);
     recomp_watch(a, 8, v);
 }
 RECOMP_HOT_INLINE float rdf32(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     float v;
-    memcpy(&v, g_mem + a, 4);
+    memcpy(&v, RECOMP_GUEST_BASE + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE double rdf64(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     double v;
-    memcpy(&v, g_mem + a, 8);
+    memcpy(&v, RECOMP_GUEST_BASE + a, 8);
     return v;
 }
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 4);
+    memcpy(RECOMP_GUEST_BASE + a, &v, 4);
     if (g_dirty_count != 0)
         recomp_dirty(a, 4);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 8);
+    memcpy(RECOMP_GUEST_BASE + a, &v, 8);
     if (g_dirty_count != 0)
         recomp_dirty(a, 8);
 }
@@ -270,7 +294,7 @@ static inline void wrbcd80(uint32_t a, double v) {
     double r = nearbyint(v);
     if (!(fabs(r) < 1e18)) {
         static const uint8_t indefinite[10] = {0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff};
-        memcpy(g_mem + a, indefinite, 10);
+        memcpy(RECOMP_GUEST_BASE + a, indefinite, 10);
         if (g_dirty_count != 0)
             recomp_dirty(a, 10);
         return;
@@ -285,7 +309,7 @@ static inline void wrbcd80(uint32_t a, double v) {
     }
     if (r < 0 || (r == 0 && signbit(v)))
         out[9] = 0x80;
-    memcpy(g_mem + a, out, 10);
+    memcpy(RECOMP_GUEST_BASE + a, out, 10);
     if (g_dirty_count != 0)
         recomp_dirty(a, 10);
 }

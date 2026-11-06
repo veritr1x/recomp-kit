@@ -20,6 +20,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
 #define OS_HAVE_BACKTRACE 1
@@ -115,8 +118,21 @@ void os_vm_release(void *p, size_t bytes) {
     munmap(p, bytes);
 }
 
+#if defined(__EMSCRIPTEN__) && defined(RECOMP_STATIC_GUEST_ARENA) && RECOMP_STATIC_GUEST_ARENA
+// The arena translated code addresses at a fixed location (runtime/x86.h).
+alignas(65536) uint8_t recomp_guest_arena[GUEST_SIZE];
+static bool g_arena_used = false;
+#endif
+
 void *os_guest_arena_reserve(size_t bytes) {
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && defined(RECOMP_STATIC_GUEST_ARENA) && RECOMP_STATIC_GUEST_ARENA
+    if (bytes > sizeof recomp_guest_arena)
+        return nullptr;
+    if (g_arena_used)
+        memset(recomp_guest_arena, 0, sizeof recomp_guest_arena); // a fresh arena, as mapping gives
+    g_arena_used = true;
+    return recomp_guest_arena;
+#elif defined(__EMSCRIPTEN__)
     return os_vm_reserve(bytes);
 #else
     if (sizeof(size_t) < 8 || bytes == 0 || bytes > UINT64_C(0xffff0000))
@@ -134,7 +150,10 @@ void *os_guest_arena_reserve(size_t bytes) {
 }
 
 void os_guest_arena_release(void *p, size_t bytes) {
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && defined(RECOMP_STATIC_GUEST_ARENA) && RECOMP_STATIC_GUEST_ARENA
+    (void)p;
+    (void)bytes; // static: nothing to give back
+#elif defined(__EMSCRIPTEN__)
     os_vm_release(p, bytes);
 #else
     (void)bytes;
@@ -431,6 +450,20 @@ void os_exit_immediately(int code) {
     _exit(code);
 }
 
+int os_fd_reads_may_block(void) {
+#ifdef __EMSCRIPTEN__
+    return 1;
+#else
+    return 0;
+#endif
+}
+int os_monotonic_is_costly(void) {
+#ifdef __EMSCRIPTEN__
+    return 1;
+#else
+    return 0;
+#endif
+}
 int os_localtime(int64_t seconds, struct tm *out) {
     time_t t = (time_t)seconds;
     return localtime_r(&t, out) ? 0 : -1;
@@ -449,6 +482,11 @@ uint64_t os_monotonic_ns(void) {
     // (gettimeofday); the uptime clock is a plain mach_absolute_time read.
     // Every import call reads this clock, so the difference is large.
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#elif defined(__EMSCRIPTEN__)
+    // clock_gettime is a JS call here that goes through a 64-bit BigInt
+    // conversion; the same monotonic clock as a double is much cheaper, and
+    // every import call reads it.
+    return (uint64_t)(emscripten_get_now() * 1e6);
 #endif
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

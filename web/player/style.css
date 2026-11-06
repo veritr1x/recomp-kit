@@ -3,3 +3,5 @@ html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px 
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
             text-align: center; padding: 0 16px; white-space: pre-line; pointer-events: none; }
   #status a { pointer-events: auto; color: #8cf; }
+  #stream { position: fixed; left: 8px; bottom: 8px; padding: 3px 8px; border-radius: 4px;
+            background: rgba(0, 0, 0, .55); color: #bbb; font-size: 12px; pointer-events: none; }

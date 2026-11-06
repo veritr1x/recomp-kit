@@ -105,6 +105,11 @@ add_compile_definitions(GUEST_IMAGE_BASE=${RECOMP_IMAGE_BASE})
 add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
 add_compile_definitions(GUEST_LAYOUT_END=${RECOMP_LAYOUT_END})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
+# The web build's guest arena is a static array at a fixed address; translated
+# code then reaches guest memory without loading a base pointer (runtime/x86.h).
+if(EMSCRIPTEN)
+  add_compile_definitions(RECOMP_STATIC_GUEST_ARENA=1)
+endif()
 add_compile_definitions($<$<CONFIG:Debug>:RECOMP_NULL_CHECKS=1>)
 option(RECOMP_DEV_LOADERS "Allow environment-selected native code libraries" OFF)
 if(RECOMP_DEV_LOADERS)

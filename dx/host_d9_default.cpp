@@ -11,6 +11,8 @@ HOST_D9_DEFAULT void host_d9_texture_define(const HostD9TextureDesc *) {}
 HOST_D9_DEFAULT void host_d9_texture_drop(uint32_t) {}
 HOST_D9_DEFAULT void host_d9_texture_upload(uint32_t, uint32_t, uint32_t, const uint8_t *,
                                             uint32_t) {}
+HOST_D9_DEFAULT void host_d9_texture_upload_copy(uint32_t, uint32_t, uint32_t, const uint8_t *,
+                                                 uint32_t, uint32_t) {}
 HOST_D9_DEFAULT int host_d9_texture_read(uint32_t, uint32_t, uint32_t, uint8_t *, uint32_t) {
     return 0;
 }

@@ -2,7 +2,7 @@
 """Build the web launcher: the hub page for one or more games.
 
     tools/web_launcher.py --game-dir /abs/game-a [--game-dir /abs/game-b ...] --out <dir>
-        [--web-build <game id>=<build dir> ...] [--serve [port]]
+        [--web-build <game id>=<build dir> ...] [--serve [port]] [--host ADDRESS]
 
 Writes <dir>/index.html, app.js, core.js, worker.js and games.json (each game's
 title, executable, digest, required folders, exclusions and store link from its
@@ -16,6 +16,7 @@ import argparse
 import functools
 import http.server
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -100,9 +101,24 @@ def copy_web_build(game_id, build, out):
             shutil.copy2(f, dest / f.name)
 
 
+def is_stream_data(url_path):
+    """A staged installation file: <game id>/data/<path>."""
+    parts = url_path.split("?", 1)[0].split("/")
+    return len(parts) > 3 and parts[2] == "data"
+
+
 class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map, ".wasm": "application/wasm",
                       ".js": "text/javascript", ".data": "application/octet-stream"}
+    # Keep-alive: over the internet, a new connection per range costs a round trip.
+    protocol_version = "HTTP/1.1"
+
+    def guess_type(self, path):
+        # Streamed game files are opaque bytes. A text type invites a proxy to
+        # compress the manifest, which removes the Content-Length it is sized by.
+        if is_stream_data(self.path):
+            return "application/octet-stream"
+        return super().guess_type(path)
 
     def send_head(self):
         """Serve one byte range; HEAD always describes the complete file."""
@@ -154,13 +170,17 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
         if self.bytes_left is None:
             return super().copyfile(source, outputfile)
         try:
+            outputfile.flush()
+            if hasattr(os, "sendfile") and self.bytes_left:
+                self.connection.sendfile(source, source.tell(), self.bytes_left)
+                return
             while self.bytes_left:
-                block = source.read(min(64 * 1024, self.bytes_left))
+                block = source.read(min(1024 * 1024, self.bytes_left))
                 if not block:
                     break
                 outputfile.write(block)
                 self.bytes_left -= len(block)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def end_headers(self):
@@ -168,14 +188,21 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Content-Security-Policy", CSP)
-        self.send_header("Cache-Control", "no-cache")
+        # The player keeps streamed chunks in the browser's private storage;
+        # an HTTP cache copy would only double that. no-transform keeps a
+        # proxy from re-encoding the bytes it is asked for by range.
+        self.send_header("Cache-Control", "no-store, no-transform" if is_stream_data(self.path) else "no-cache")
         super().end_headers()
 
 
-def serve(out, port):
+def serve(out, port, host="127.0.0.1"):
     handler = functools.partial(IsolatedHandler, directory=str(out))
-    with http.server.ThreadingHTTPServer(("127.0.0.1", port), handler) as httpd:
-        print("serving %s at http://localhost:%d/" % (out, port), flush=True)
+    with http.server.ThreadingHTTPServer((host, port), handler) as httpd:
+        shown = "localhost" if host in ("127.0.0.1", "::1", "localhost") else host
+        print("serving %s at http://%s:%d/" % (out, shown, port), flush=True)
+        if shown != "localhost":
+            print("note: browsers require HTTPS for this page outside localhost; put a TLS proxy in front",
+                  flush=True)
         httpd.serve_forever()
 
 
@@ -185,6 +212,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--web-build", action="append", default=[], metavar="ID=DIR")
     parser.add_argument("--serve", type=int, nargs="?", const=8000, metavar="PORT")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="address --serve listens on (default loopback; 0.0.0.0 in a container)")
     parser.add_argument("--stream", action="append", default=[], metavar="ID[=INSTALL]",
                         help="stage a private installation (optionally select a full install directory)")
     args = parser.parse_args()
@@ -201,7 +230,7 @@ def main():
         copy_web_build(game_id, build_dir, args.out)
     print("web launcher for %s in %s" % (", ".join(g["title"] for g in games), args.out))
     if args.serve is not None:
-        serve(args.out, args.serve)
+        serve(args.out, args.serve, args.host)
 
 
 if __name__ == "__main__":

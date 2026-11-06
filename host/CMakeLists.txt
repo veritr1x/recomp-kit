@@ -306,6 +306,11 @@ if(TARGET recomp_gen)
       --js-library ${POP_ROOT}/web/player/fetch-backend.js
       --preload-file ${web_resources}@/app/resources)
     set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/player/fetch-backend.js)
+    # Function names in the Wasm make browser stacks of a hung or slow guest
+    # readable. Opt in at configure time; they add a few MiB to the download.
+    if(RECOMP_WEB_PROFILING_FUNCS OR "$ENV{RECOMP_WEB_PROFILING_FUNCS}")
+      target_link_options(recomp_app PRIVATE --profiling-funcs)
+    endif()
   elseif(APPLE)
     pop_mac_bundle(recomp_app)
   else()

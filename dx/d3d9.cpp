@@ -1171,7 +1171,10 @@ static void gpu_sync(ComObj *o) {
         if (!s || s->blob.empty())
             continue;
         HostD9Surface r = surface_ref(s);
-        host_d9_texture_upload(o->id, r.face, r.level, resource_bytes(s), s->pitch);
+        // Copied, not waited for: on the web the upload would otherwise wait
+        // for the browser's main thread on every dirty surface.
+        host_d9_texture_upload_copy(o->id, r.face, r.level, resource_bytes(s), s->pitch,
+                                    (uint32_t)s->blob.size());
     }
 }
 

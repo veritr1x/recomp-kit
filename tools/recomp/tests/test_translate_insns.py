@@ -862,7 +862,7 @@ def built():
         fh.write('#include "x86.h"\n')
         entries = [a for case in ok for a in (case.addr,) + case.entries]
         for addr in entries:
-            fh.write("void fn_%08x(X86 *c);\n" % addr)
+            fh.write("void fn_%08x(X86 *RECOMP_CTX c);\n" % addr)
         fh.write("int recomp_is_call_return(uint32_t target) { return target == 0x%08xu; }\n" % MAGIC_RET)
         fh.write("int32_t recomp_index_of(uint32_t target) { switch (target) {\n")
         for index, addr in enumerate(entries):

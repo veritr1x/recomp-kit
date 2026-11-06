@@ -39,7 +39,7 @@ def test_a_withdrawn_block_leaves_a_trap_where_it_was_dispatched_to():
     trip the entry-point gate.  Every spelling of a literal transfer to the
     block becomes `recomp_unknown_call(c, addr); return;`."""
     body = [
-        "void fn_0061e4c0(X86 *c) {",
+        "void fn_0061e4c0(X86 *RECOMP_CTX c) {",
         "{   /* 0061e9ea CALL 0x0064cf1f */",
         "    c->r[4] -= 4; wr32(c->r[4], 0x0061e9efu);",
         "    CALL_FN(0064cf1f);",
@@ -360,7 +360,7 @@ def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch, r
     chunks = "\n".join(p.read_text() for p in out.glob("chunk_*.c"))
     for address in (entry + 7, entry + 12, entry + 18):
         assert ("if (c->eip != %s) return;" % T.hexlit(address) in chunks) == resumable
-        assert ("void fn_%08x(X86 *c)" % address in chunks) == resumable
+        assert ("void fn_%08x(X86 *RECOMP_CTX c)" % address in chunks) == resumable
     text = (out / "table.c").read_text()
     assert "int recomp_is_call_return(uint32_t target)" in text
     array = text.split("recomp_call_returns[] = {", 1)[1].split("};", 1)[0]
@@ -403,7 +403,7 @@ def test_return_switch_requires_pushed_instruction_boundary(target, dispatch):
         assert text.count("case 0x60100bu: RECOMP_BACKEDGE(c); goto L_0060100b;") == 1
         assert "c->r[4] += 12u;" in text
         assert text.count("default: c->eip = r_; recomp_return(c); return;") == 2
-    assert "void fn_00601005(X86 *c) { body_00601000(c, 0x601005u); }" in text
+    assert "void fn_00601005(X86 *RECOMP_CTX c) { body_00601000(c, 0x601005u); }" in text
 
 
 @pytest.mark.parametrize("entries,macro", [([], "TAIL_FN"), ([0x00601005], "TAIL_FN2")])
@@ -579,7 +579,7 @@ def test_finally_cleanup_and_epilogue_belong_to_establishing_body(
     monkeypatch.setattr(sys, "argv", ["translate.py", "--game", str(tmp_path), "--out", str(out), "--quiet"])
     assert T.main() == 0
     text = "\n".join(p.read_text() for p in out.glob("chunk_*.c"))
-    assert "void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (cleanup, entry, T.hexlit(cleanup)) in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }" % (cleanup, entry, T.hexlit(cleanup)) in text
     assert text.count("void fn_%08x(" % cleanup) == 1
     body = text.split("static void body_%08x(" % entry, 1)[1].split("void fn_%08x(" % entry, 1)[0]
     assert "L_%08x: ;" % epilogue in body
@@ -857,7 +857,7 @@ def test_popped_return_avoids_dispatch_when_continuation_is_also_an_entry(tmp_pa
     img.code_pointers = lambda *a, **kw: (set(), set())
     text = translate_entry_fixture(tmp_path, monkeypatch, img,
                                    blocks | {continuation: caller[5:]})
-    done_text = text.split("void fn_%08x(X86 *c) {" % done, 1)[1].split("\n}", 1)[0]
+    done_text = text.split("void fn_%08x(X86 *RECOMP_CTX c) {" % done, 1)[1].split("\n}", 1)[0]
     assert "c->eip = c->r[2]; recomp_return(c); return;" in done_text
     assert "recomp_jump" not in done_text
     table = (tmp_path / "gen/table.c").read_text()
@@ -938,9 +938,9 @@ def test_nested_except_join_keeps_outer_finally_in_establishing_body(tmp_path, m
     assert T.main() == 0
     text = '\n'.join(p.read_text() for p in out.glob('chunk_*.c'))
     for stub in (outer_stub, inner_stub):
-        assert "void fn_%08x(X86 *c) {\n    TAIL_FN(%08x); return;" % (stub, dispatcher) in text
+        assert "void fn_%08x(X86 *RECOMP_CTX c) {\n    TAIL_FN(%08x); return;" % (stub, dispatcher) in text
     # Normal execution must retain the frame until the epilogue restores ESP/EBP.
-    assert 'void fn_%08x(X86 *c) { body_%08x(c, %s); }' % (cleanup, entry, T.hexlit(cleanup)) in text
+    assert 'void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }' % (cleanup, entry, T.hexlit(cleanup)) in text
     body = text.split('static void body_%08x(' % entry, 1)[1].split('void fn_%08x(' % entry, 1)[0]
     assert 'case %s: goto L_%08x;' % (T.hexlit(epilogue), epilogue) in body
 
@@ -1296,7 +1296,7 @@ def test_bare_pointer_to_relocated_routines_ret_is_an_alias(tmp_path, monkeypatc
     text = translate_entry_fixture(tmp_path, monkeypatch, img,
                                    {a: blocks[a] for a in (entry, next_fn)})
     assert "void fn_%08x(" % method in text
-    assert "void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (tail, method, T.hexlit(tail)) in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }" % (tail, method, T.hexlit(tail)) in text
 
 
 def test_speculative_body_keeps_branches_over_cleanup_stub_and_pushed_alias(tmp_path, monkeypatch):
@@ -1344,10 +1344,10 @@ def test_equal_rank_candidates_bound_speculative_sweeps(tmp_path, monkeypatch, t
     img.relocated_pointers = lambda: {guess: slot, method: slot + 4}
     text = translate_entry_fixture(tmp_path, monkeypatch, img,
                                    {a: blocks[a] for a in (entry, next_fn)})
-    assert "void fn_%08x(X86 *c) {\n" % method in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) {\n" % method in text
     assert ("void fn_%08x(" % guess in text) == terminated
     if terminated:
-        body = text.split("void fn_%08x(X86 *c) {" % guess)[1].split("\n}", 1)[0]
+        body = text.split("void fn_%08x(X86 *RECOMP_CTX c) {" % guess)[1].split("\n}", 1)[0]
         assert "XOR EAX,EAX" not in body
         assert "TAIL_FN(%08x)" % method in body
 
@@ -1429,7 +1429,7 @@ def test_protected_call_target_truncates_earlier_scan_guess(
         assert "void fn_%08x(" % guess in text
         assert ("IN AL,DX" in text) == crossing
         return  # a direct edge from another guess earns no stronger rank
-    assert "void fn_%08x(X86 *c) {\n" % method in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) {\n" % method in text
     assert "void fn_%08x(" % guess not in text  # NOP fallthrough is not a terminator.
     assert "IN AL,DX" not in text
 
@@ -1483,9 +1483,9 @@ def test_relocated_method_outranks_bare_guess_but_not_listing(
         if crossing:
             assert "void fn_%08x(" % method not in text
         else:
-            assert "void fn_%08x(X86 *c) { body_%08x" % (method, guess) in text
+            assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x" % (method, guess) in text
     else:
-        assert "void fn_%08x(X86 *c) {\n" % method in text
+        assert "void fn_%08x(X86 *RECOMP_CTX c) {\n" % method in text
         assert "IN AL,DX" not in text
         assert "void fn_%08x(" % guess not in text  # Neither NOP prefix terminates.
 
@@ -1498,7 +1498,7 @@ def test_relocated_alias_keeps_listed_instruction_evidence(tmp_path, monkeypatch
     img = synthetic_image({entry: raw, slot: struct.pack("<I", target)}, base=0x00600000)
     img.relocated_pointers = lambda: {target: slot}
     text = translate_entry_fixture(tmp_path, monkeypatch, img, {entry: raw})
-    assert "void fn_%08x(X86 *c) { body_%08x" % (target, entry) in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x" % (target, entry) in text
 
 
 def test_truncated_guess_drops_its_old_jump_table_site(tmp_path, monkeypatch):
@@ -1595,7 +1595,7 @@ def test_pruned_cleanup_alias_falls_back_to_listed_span(tmp_path, monkeypatch, l
             translate_entry_fixture(tmp_path, monkeypatch, img, listings)
         return
     text = translate_entry_fixture(tmp_path, monkeypatch, img, listings)
-    assert "void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (cleanup, anchor, T.hexlit(cleanup)) in text
+    assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }" % (cleanup, anchor, T.hexlit(cleanup)) in text
     assert "void fn_%08x(" % guess not in text
     assert "void fn_%08x(" % prefix not in text
     if location == "chain":
@@ -1665,7 +1665,7 @@ def test_span_fragment_keeps_its_pushed_interior_alias(tmp_path, monkeypatch):
     img.relocated_pointers = lambda: {epilogue: slot}
     text = translate_entry_fixture(tmp_path, monkeypatch, img,
                                    {a: blocks[a] for a in (entry, next_fn)})
-    assert "void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (
+    assert "void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }" % (
         epilogue, entry, T.hexlit(epilogue)) in text
     body = text.split("static void body_%08x(" % entry, 1)[1].split("void fn_%08x(" % entry, 1)[0]
     assert "case %s: goto L_%08x;" % (T.hexlit(epilogue), epilogue) in body
@@ -1796,7 +1796,7 @@ def test_a_dangling_target_becomes_a_trap_under_the_switch():
     literal target no instruction boundary agrees with. With the switch it
     becomes the trap a withdrawn block gets, at the site that names it."""
     body = [
-        "void fn_00410170(X86 *c) {",
+        "void fn_00410170(X86 *RECOMP_CTX c) {",
         "c->eip = 0x004102f0u; recomp_jump(c, 0x004103cfu); return;",
         "CALL_FN(00410370);",
         "}",
@@ -1825,7 +1825,7 @@ def test_a_truncated_listing_grows_into_its_pushed_continuation(tmp_path, monkey
             or "case 0x00401020u: goto L_00401020;" in text)
     # And it is a block entry, so a second body that shares this code and
     # executes the same JMP reaches it through recomp_jump.
-    assert "void fn_00401020(X86 *c) { body_00401000(c, %s); }" % T.hexlit(cont) in text
+    assert "void fn_00401020(X86 *RECOMP_CTX c) { body_00401000(c, %s); }" % T.hexlit(cont) in text
 def test_a_callee_that_returns_is_not_taken_as_never_returning():
     """Ghidra ends a C++ catch funclet's listing on the call before its
     rethrow, so ending a listing is not proof the callee never returns: a
@@ -1924,3 +1924,27 @@ def test_a_wide_literal_behind_a_halt_is_not_code(tmp_path, monkeypatch):
     import re
     placed = set(re.findall(r"^(L_[0-9a-f]{8}): ;", text, re.M))
     assert set(re.findall(r"goto (L_[0-9a-f]{8});", text)) <= placed
+
+
+def test_flags_end_at_calls_and_returns_unless_a_caller_reads_them(tmp_path, monkeypatch):
+    """Compiled code does not carry flags across CALL or RET, so a function's
+    flags at RET are dead - except for a helper whose caller reads them after
+    the call, which keeps them."""
+    import struct
+    plain, helper, caller = 0x601000, 0x601010, 0x601020
+    plain_code = b"\x83\xc0\x01\xc3"            # add eax, 1; ret
+    helper_code = b"\x83\xf8\x05\xc3"           # cmp eax, 5; ret
+    caller_code = (b"\xe8" + struct.pack("<i", plain - (caller + 5))
+                   + b"\xe8" + struct.pack("<i", helper - (caller + 10))
+                   + b"\x74\x01\x90\xc3")       # call plain; call helper; jz; nop; ret
+    img = synthetic_image({plain: plain_code, helper: helper_code, caller: caller_code},
+                          base=0x600000)
+    img.code_pointers = lambda *a, **kw: (set(), set())
+    text = translate_entry_fixture(tmp_path, monkeypatch, img,
+                                   {plain: plain_code, helper: helper_code, caller: caller_code})
+
+    def body(addr):
+        return text.split("void fn_%08x(" % addr, 1)[1].split("\n}", 1)[0]
+
+    assert "eflags_zf" not in body(plain)
+    assert "eflags_zf" in body(helper)

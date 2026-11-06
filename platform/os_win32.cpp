@@ -636,6 +636,12 @@ uint64_t os_monotonic_ns(void) {
     QueryPerformanceCounter(&c);
     return (uint64_t)((double)c.QuadPart * 1e9 / (double)freq.QuadPart);
 }
+int os_fd_reads_may_block(void) {
+    return 0;
+}
+int os_monotonic_is_costly(void) {
+    return 0;
+}
 uint64_t os_wall_time_us(void) {
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);

@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+- Make streamed web installations playable over the internet. The fetch
+  backend fetches every chunk a read touches in parallel, reads ahead of
+  sequential access and of the other small files in a folder, retries failed
+  or stalled requests, and keeps each fetched chunk in the origin-private file
+  system, keyed by the manifest, so a browser downloads each byte once. The
+  rest of the installation fills in the background (files the game has read
+  first) only while no guest read waits; reads that wait over a second are
+  logged, and the player shows download progress. The manifest is sized from
+  its body, so a compressing proxy can no longer break it.
+
+- `web_launcher.py --serve` keeps connections alive, sends streamed data as
+  `application/octet-stream` with `Cache-Control: no-store, no-transform`, and
+  takes `--host` for container deployments.
+
+- The web build no longer deactivates the game when the page loses keyboard
+  focus (the game froze on screen whenever another window was clicked); it
+  pauses only while the tab is hidden, and releases held keys on blur. The
+  performance overlay starts off in the browser.
+
+- Quitting a web game returns to the launcher instead of leaving its last
+  frame on screen; a game that cannot start says why.
+
+- Keyboard `GetObjectInfo` names keys, so key-binding screens show them.
+
+- The translator ends flags at CALL and RET. A whole-program pass finds the
+  few functions whose callers read the flags they return (Most Wanted: 11)
+  and the ones that read flags at entry (66) and keeps those conservative;
+  everywhere else flag results nobody reads are no longer computed (parity
+  computations in Most Wanted's translation: 140,696 to 3,261). Translated
+  functions also take their context as `__restrict`, and the web build puts
+  the guest arena at a fixed address, so guest loads and stores are a single
+  instruction. The Most Wanted web module shrinks from 139 to 127 MB.
+
+- Fewer waits on the browser's main thread: occlusion-query results are
+  published by the render thread instead of fetched with a round trip,
+  dirty textures are uploaded from a copy instead of in step, per-draw
+  uniform and vertex data is staged and written once per submit, the
+  presenter no longer asks the device for its overlay size each frame, and
+  scheduling checkpoints read the clock on every 32nd import and take no
+  lock when nothing is due. Large file reads in the browser run off the
+  scheduler baton so other guest threads keep running.
+
+- Together these take a Most Wanted race in Chromium (1899x1065, Windows,
+  16-thread desktop CPU) from roughly 15-34 FPS with multi-second freezes to
+  about 55-65 FPS with no stalls in a 60-second drive; menus run at 80-110.
+
+- `RECOMP_WEB_PROFILING_FUNCS=1` at configure time keeps function names in
+  the Wasm for readable browser profiles.
+
 - Supply alpha on the fixed-function WebGPU coverage output so alpha-blended
   pipelines validate while retaining the R8 coverage mask. Fixes the black
   3D level-selection screen reached by Populous in the browser.

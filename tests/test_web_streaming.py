@@ -115,6 +115,9 @@ def server(tmp_path):
     (tmp_path / "data").mkdir()
     (tmp_path / "data/space #%.bin").write_bytes(bytes(range(32)))
     (tmp_path / "data/empty.bin").write_bytes(b"")
+    (tmp_path / "game/data").mkdir(parents=True)
+    (tmp_path / "game/data/manifest.txt").write_text("recomp-stream-v1\n4\tA.BIN\n")
+    (tmp_path / "game/data/A.BIN").write_bytes(b"abcd")
     handler = functools.partial(web_launcher.IsolatedHandler, directory=str(tmp_path))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -160,3 +163,26 @@ def test_head_reports_complete_file_and_empty_files_work(server):
     assert request(server)[2] == bytes(range(32))
     assert request(server, path="/data/empty.bin")[0:3:2] == (200, b"")
     assert request(server, path="/missing")[0] == 404
+
+
+def test_streamed_data_is_opaque_and_not_transformed(server):
+    """A text type invites a proxy to compress the manifest and drop its length."""
+    for path in ("/game/data/manifest.txt", "/game/data/A.BIN"):
+        status, headers, _ = request(server, path=path)
+        assert status == 200
+        assert headers["Content-Type"] == "application/octet-stream"
+        assert headers["Cache-Control"] == "no-store, no-transform"
+    status, headers, _ = request(server, path="/data/empty.bin")
+    assert headers["Cache-Control"] == "no-cache"
+    assert web_launcher.is_stream_data("/game/data/TRACKS/X.BUN")
+    assert not web_launcher.is_stream_data("/game/SpeedRecomp.wasm")
+    assert not web_launcher.is_stream_data("/data/x")
+
+
+def test_ranges_share_one_kept_alive_connection(server):
+    client = http.client.HTTPConnection("127.0.0.1", server)
+    for start in (0, 8, 16):
+        client.request("GET", "/data/space%20%23%25.bin", headers={"Range": "bytes=%d-%d" % (start, start + 7)})
+        response = client.getresponse()
+        assert response.status == 206 and response.read() == bytes(range(start, start + 8))
+    client.close()

@@ -285,7 +285,17 @@ PointRect game_rect_points() {
 // below and applied from pump(), which runs on a thread that holds the baton.
 // ---------------------------------------------------------------------------
 struct PendingInput {
-    enum Kind { MOTION, BUTTON, WHEEL, KEY, MODIFIERS, FOCUS, RELEASE_CAPTURE, PLACE } kind;
+    enum Kind {
+        MOTION,
+        BUTTON,
+        WHEEL,
+        KEY,
+        MODIFIERS,
+        FOCUS,
+        RELEASE_CAPTURE,
+        RELEASE_HELD,
+        PLACE
+    } kind;
     int32_t x = 0, y = 0, dz = 0;
     double dx = 0, dy = 0; // Drawable deltas preserve subpixel motion in the queue.
     int drawable_w = 0, drawable_h = 0;
@@ -760,6 +770,13 @@ void note_focus(bool focused) {
     queue_or_apply(e);
 }
 
+// Focus left a game that keeps running (platform_ui_pause_when_unfocused).
+void release_held_keys() {
+    PendingInput e;
+    e.kind = PendingInput::RELEASE_HELD;
+    queue_or_apply(e);
+}
+
 void apply_input(const PendingInput &e) {
     if (e.kind == PendingInput::MOTION || e.kind == PendingInput::BUTTON ||
         e.kind == PendingInput::WHEEL)
@@ -785,6 +802,13 @@ void apply_input(const PendingInput &e) {
         break;
     case PendingInput::RELEASE_CAPTURE:
         apply_pointer_capture(false);
+        break;
+    case PendingInput::RELEASE_HELD:
+        // Focus went elsewhere but the game stays active: no release of what
+        // is held will be seen, so it all comes up now, as on deactivation.
+        apply_pointer_capture(false);
+        host_gate_release_all();
+        g_buttons = 0;
         break;
     case PendingInput::PLACE:
         host_gate_pointer_place(e.x, e.y);
@@ -1076,9 +1100,13 @@ void handle_event(const SDL_Event &event) {
         break;
     case SDL_EVENT_WINDOW_HIDDEN:
         trace_state("window HIDDEN");
+        if (!platform_ui_pause_when_unfocused())
+            note_focus(false);
         break;
     case SDL_EVENT_WINDOW_SHOWN:
         trace_state("window shown");
+        if (!platform_ui_pause_when_unfocused())
+            note_focus(true);
         break;
     case SDL_EVENT_WINDOW_MINIMIZED:
         trace_state("window MINIMIZED");
@@ -1124,7 +1152,10 @@ void handle_event(const SDL_Event &event) {
         update_platform_pointer_capture();
         g_escape_held = false;
         touch_release_all();
-        note_focus(false);
+        if (platform_ui_pause_when_unfocused())
+            note_focus(false);
+        else
+            release_held_keys();
         break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
         trace_state("focus gained");
@@ -1617,7 +1648,16 @@ namespace {
 std::string g_web_exe;
 std::string g_web_stream_base;
 std::atomic<bool> g_web_guest_done{false};
+// Why the game's thread ended: 0 the game quit, otherwise it could not start.
+std::atomic<int> g_web_exit_status{0};
 int g_web_dw = 0, g_web_dh = 0;
+
+// The game's thread is over. Its last frame stays on the canvas, so the page
+// is told: a game that quit returns to the launcher, a failure is shown.
+void web_guest_finish(int status) {
+    g_web_exit_status.store(status);
+    g_web_guest_done.store(true);
+}
 
 void web_tick() {
     deliver_pending_input();
@@ -1651,8 +1691,15 @@ void web_frame() {
     host_d9_pump();
     host_present_pump();
     host_d9_frame(false);
-    if (g_web_guest_done.load())
+    if (g_web_guest_done.load()) {
         emscripten_cancel_main_loop();
+        EM_ASM(
+            {
+                if (Module.onGameExit)
+                    Module.onGameExit($0);
+            },
+            g_web_exit_status.load());
+    }
 }
 
 // The game's thread: the game's files are read from here, never from the
@@ -1665,7 +1712,7 @@ void web_guest() {
         std::string error;
         if (!web_stream_mount(g_web_stream_base, &error)) {
             fprintf(stderr, "[stream] failed: %s\n", error.c_str());
-            g_web_guest_done.store(true);
+            web_guest_finish(1);
             return;
         }
     }
@@ -1683,14 +1730,14 @@ void web_guest() {
     options.deadline_seconds = 0.0;
     if (!boot_load(options)) {
         fprintf(stderr, RECOMP_APP_NAME ": %s\n", loader_error());
-        g_web_guest_done.store(true);
+        web_guest_finish(2);
         return;
     }
     printf(RECOMP_APP_NAME ": %s, entry %08x\n", loader_exe_path().c_str(), loader_entry_point());
     fflush(stdout);
     host_midi_startup(win32_midi_soundfont_path().c_str());
     boot_run();
-    g_web_guest_done.store(true);
+    web_guest_finish(0);
 }
 
 int web_main(int argc, char **argv) {

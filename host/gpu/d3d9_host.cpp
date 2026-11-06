@@ -28,6 +28,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -92,6 +93,7 @@ D9Backend *backend() {
 }
 
 enum class Op : uint8_t {
+    Publish, // nothing to encode: lets the render thread publish query results
     ShaderCreated,
     Draw,
     Clear,
@@ -100,6 +102,7 @@ enum class Op : uint8_t {
     Drop,
     BufferUpload,
     BufferDrop,
+    TextureUpload,
     QueryBegin,
     QueryEnd,
     QueryDrop,
@@ -123,9 +126,45 @@ struct Command {
     std::function<void()> *call = nullptr; // Op::Call: run on the render thread
 };
 
+// A batch's payload: appended to for every draw (its constants and state
+// tables), so it is a plain growing buffer - no zero fill, no iterator
+// machinery - kept across batches by the pool.
+struct ByteBuf {
+    std::unique_ptr<uint8_t[]> buf;
+    size_t used = 0, cap = 0;
+    uint8_t *data() {
+        return buf.get();
+    }
+    const uint8_t *data() const {
+        return buf.get();
+    }
+    size_t size() const {
+        return used;
+    }
+    void clear() {
+        used = 0;
+    }
+    size_t append(const void *p, size_t n) {
+        const size_t at = used;
+        if (used + n > cap) {
+            size_t grown = cap ? cap * 2 : 64 * 1024;
+            while (grown < used + n)
+                grown *= 2;
+            std::unique_ptr<uint8_t[]> next(new uint8_t[grown]);
+            if (used)
+                memcpy(next.get(), buf.get(), used);
+            buf = std::move(next);
+            cap = grown;
+        }
+        memcpy(buf.get() + used, p, n);
+        used += n;
+        return at;
+    }
+};
+
 struct Batch {
     std::vector<Command> commands;
-    std::vector<uint8_t> bytes;
+    ByteBuf bytes;
     // The last draw's state tables in `bytes`, reused while the version holds.
     uint64_t state_version = 0;
     size_t state_at = 0;
@@ -135,12 +174,7 @@ struct Batch {
         state_version = 0;
     }
     size_t put(const void *p, size_t n) {
-        size_t at = bytes.size();
-        if (n) {
-            const uint8_t *s = (const uint8_t *)p;
-            bytes.insert(bytes.end(), s, s + n); // no zero fill first
-        }
-        return at;
+        return n ? bytes.append(p, n) : bytes.size();
     }
 };
 
@@ -318,6 +352,8 @@ class RenderThread {
         for (Command &cmd : b.commands) {
             const uint8_t *base = b.bytes.data();
             switch (cmd.op) {
+            case Op::Publish:
+                break;
             case Op::ShaderCreated:
                 r_->shader_created(cmd.shader_key, *cmd.program);
                 break;
@@ -361,14 +397,19 @@ class RenderThread {
             case Op::BufferDrop:
                 r_->buffer_drop(cmd.a);
                 break;
+            case Op::TextureUpload:
+                r_->upload(cmd.a, cmd.b, cmd.c, base + cmd.at, cmd.d);
+                break;
             case Op::QueryBegin:
                 r_->query_begin(cmd.a);
                 break;
             case Op::QueryEnd:
                 r_->query_end(cmd.a);
+                ending_[cmd.a] = cmd.b;
                 break;
             case Op::QueryDrop:
                 r_->query_drop(cmd.a);
+                ending_.erase(cmd.a);
                 break;
             case Op::Probe:
                 r_->probe_next(cmd.a ? (const char *)(base + cmd.at) : nullptr);
@@ -378,9 +419,77 @@ class RenderThread {
                 break;
             }
         }
+        publish_queries();
+    }
+
+    // ---- occlusion queries without a round trip ----
+    // A query's result used to be asked for with sync(): the game's thread
+    // waited for the render thread - in a browser, the main thread, part-way
+    // through its frame - on every GetData. Results are published here as the
+    // backend learns them instead, each tagged with the Issue(END) it answers,
+    // and GetData reads the table: an answer to an older Issue is not ready.
+    bool pumped() const {
+        return pumped_;
+    }
+    uint32_t query_issued(uint32_t id) {
+        std::lock_guard<std::mutex> lock(qm_);
+        return ++issued_[id];
+    }
+    int query_peek(uint32_t id, uint32_t *count) {
+        {
+            std::lock_guard<std::mutex> lock(qm_);
+            auto i = issued_.find(id);
+            if (i == issued_.end())
+                return -1;
+            auto p = published_.find(id);
+            if (p != published_.end() && p->second.gen == i->second) {
+                *count = p->second.count;
+                return p->second.result;
+            }
+        }
+        // Not ready: make sure the END is on its way rather than waiting for
+        // the game's next draws to fill a batch.
+        if (threaded_) {
+            if (filling_->commands.empty())
+                filling_->commands.push_back(Command{Op::Publish});
+            hand_over();
+        } else {
+            publish_queries();
+        }
+        return 0;
+    }
+    void query_forget(uint32_t id) {
+        std::lock_guard<std::mutex> lock(qm_);
+        issued_.erase(id);
+        published_.erase(id);
     }
 
   private:
+    // The render thread's side: the ENDs encoded and not yet answered.
+    void publish_queries() {
+        for (auto it = ending_.begin(); it != ending_.end();) {
+            uint32_t count = 0;
+            const int r = r_->query_result(it->first, &count);
+            if (r == 0) {
+                ++it;
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(qm_);
+                published_[it->first] = Published{it->second, r, r > 0 ? count : 1u};
+            }
+            it = ending_.erase(it);
+        }
+    }
+    struct Published {
+        uint32_t gen = 0;
+        int result = 0;
+        uint32_t count = 0;
+    };
+    std::unordered_map<uint32_t, uint32_t> ending_; // render thread only
+    std::mutex qm_;
+    std::unordered_map<uint32_t, uint32_t> issued_;     // under qm_
+    std::unordered_map<uint32_t, Published> published_; // under qm_
     D9Backend *r_;
     bool threaded_ = false;
     bool pumped_ = false;
@@ -484,6 +593,21 @@ void host_d9_texture_upload(uint32_t id, uint32_t face, uint32_t level, const ui
     // The size is the backend's to know, so this one runs in step.
     if (RenderThread *t = render_thread())
         t->sync([&] { backend()->upload(id, face, level, bytes, pitch); });
+}
+void host_d9_texture_upload_copy(uint32_t id, uint32_t face, uint32_t level, const uint8_t *bytes,
+                                 uint32_t pitch, uint32_t size) {
+    RenderThread *t = render_thread();
+    if (!t || !bytes)
+        return;
+    Batch &b = t->batch();
+    Command c{Op::TextureUpload};
+    c.a = id;
+    c.b = face;
+    c.c = level;
+    c.d = pitch;
+    c.at = b.put(bytes, size);
+    b.commands.push_back(c);
+    t->submitted();
 }
 int host_d9_texture_read(uint32_t id, uint32_t face, uint32_t level, uint8_t *bytes,
                          uint32_t pitch) {
@@ -596,13 +720,27 @@ void host_d9_query_begin(uint32_t id) {
     push(Op::QueryBegin, id);
 }
 void host_d9_query_end(uint32_t id) {
-    push(Op::QueryEnd, id);
+    if (RenderThread *t = render_thread()) {
+        Command c{Op::QueryEnd};
+        c.a = id;
+        c.b = t->query_issued(id);
+        t->batch().commands.push_back(c);
+        t->submitted();
+    }
 }
 int host_d9_query_result(uint32_t id, uint32_t *count) {
     RenderThread *t = render_thread();
-    return t && count ? t->sync([&] { return backend()->query_result(id, count); }) : -1;
+    if (!t || !count)
+        return -1;
+    // Only the browser pays a main-thread round trip for this; elsewhere the
+    // answer stays exact and in step, as it always was.
+    if (!t->pumped())
+        return t->sync([&] { return backend()->query_result(id, count); });
+    return t->query_peek(id, count);
 }
 void host_d9_query_drop(uint32_t id) {
+    if (RenderThread *t = render_thread())
+        t->query_forget(id);
     push(Op::QueryDrop, id);
 }
 

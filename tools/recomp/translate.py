@@ -2497,6 +2497,132 @@ class Translator(object):
             live_out[i] = (live_out[i + 1] - d) | u
         return live_out
 
+    #: Set by plan_flags: functions whose callers read the flags they return,
+    #: and functions that read flags at entry. None until planned.
+    flag_returning = None
+    flag_entry = None
+    flag_planned = frozenset()
+
+    def flag_target(self, ins):
+        """A direct CALL/JMP/Jcc target address, or None."""
+        if ins.ops and ins.ops[0].startswith("0x"):
+            return int(ins.ops[0], 16)
+        return None
+
+    def liveness_global(self, fn, returning=None, precise=False):
+        """Flag liveness across this function's whole control-flow graph.
+
+        Compiled x86 code does not carry flags across a call or a return; the
+        few exceptions (hand-written helpers that return a result in ZF or CF)
+        are found by plan_flags and kept conservative. So flags die at a CALL
+        unless the callee reads them at entry, die at a RET unless this
+        function returns them, and leave through a jump only into a function
+        that reads them. Anything whose successors are not modelled - a
+        listing gap, an instruction with nowhere known to go - keeps all six.
+        """
+        n = len(fn.insns)
+        if returning is None:
+            returning = any(a in fn.index for a in self.flag_returning)
+        succ = []
+        extra = []
+        for i, ins in enumerate(fn.insns):
+            m = ins.mnem
+            s_ = self.successors(fn, i)
+            out = NO_FLAGS
+            t = self.flag_target(ins)
+            if (m == "JMP" and t is None and (fn.addr, ins.addr) not in self.jumptables
+                    and self.push_ret_target(fn, i) is None):
+                # An indirect jump with no decoded table leaves the function:
+                # a virtual tail call, or a return through a popped address.
+                # (successors() offers every instruction here, which is right
+                # for emission's targets but not for what flags reach.)
+                s_ = []
+                out = ALL_FLAGS if returning else NO_FLAGS
+            succ.append(s_)
+            if s_ == [] and m == "JMP" and t is None:
+                pass
+            elif m == "RET":
+                out = ALL_FLAGS if returning else NO_FLAGS
+            elif m == "INT3" or m == "CALL":
+                out = NO_FLAGS
+            elif m == "JMP" or m in JCC:
+                if t is not None and t not in fn.index:
+                    out = ALL_FLAGS if t in self.flag_entry else NO_FLAGS
+                elif t is None and m == "JMP" and not s_:
+                    out = ALL_FLAGS  # an indirect jump to somewhere unknown
+            elif not fn.contiguous[i] or not s_:
+                # Emission continues somewhere this does not model. `precise`
+                # asks only what this function's own instructions read.
+                out = NO_FLAGS if precise else ALL_FLAGS
+            extra.append(out)
+        live_in = [NO_FLAGS] * n
+        live_out = [NO_FLAGS] * n
+        changed = True
+        while changed:
+            changed = False
+            for i in range(n - 1, -1, -1):
+                ins = fn.insns[i]
+                lo = extra[i]
+                for j in succ[i]:
+                    lo = lo | live_in[j]
+                if ins.mnem == "CALL":
+                    t = self.flag_target(ins)
+                    li = ALL_FLAGS if (t is not None and t in self.flag_entry) else NO_FLAGS
+                else:
+                    d, u = flag_effect(ins)
+                    li = (lo - d) | u
+                if li != live_in[i] or lo != live_out[i]:
+                    live_in[i], live_out[i] = li, lo
+                    changed = True
+        return live_in, live_out
+
+    def plan_flags(self, parsed):
+        """Find the functions whose flags matter across a call boundary.
+
+        A fixpoint: a function returns flags when a caller reads flags after
+        calling it, or it is tail-jumped to from one that does; a function
+        reads flags at entry when they are live at its first instruction. On
+        no fixpoint within a few passes everything stays straight-line.
+        """
+        self.flag_returning = set()
+        self.flag_entry = set()
+        self.flag_planned = {fn.addr for fn in parsed}
+        for _ in range(6):
+            returning, entry = set(self.flag_returning), set(self.flag_entry)
+            for fn in parsed:
+                li, lo = self.liveness_global(fn)
+                if li and li[0]:
+                    entry.add(fn.addr)
+                fn_returning = any(a in fn.index for a in self.flag_returning)
+                for i, ins in enumerate(fn.insns):
+                    t = self.flag_target(ins)
+                    if ins.mnem == "CALL" and lo[i]:
+                        if t is None and not self.liveness_global(
+                                fn, returning=False, precise=True)[1][i]:
+                            # Live only because this function hands its flags
+                            # back to its caller, or through a path this does
+                            # not model: no instruction here reads what the
+                            # callee leaves. Nothing to keep.
+                            continue
+                        if t is None:
+                            # Flags read after an indirect call: no callee to
+                            # keep conservative, so plan nothing.
+                            print("  flags: read after the indirect call at %08x (%s)"
+                                  % (ins.addr, ins.ops[0] if ins.ops else "?"), file=sys.stderr)
+                            self.flag_returning = self.flag_entry = None
+                            return False
+                        returning.add(t)
+                    elif (fn_returning and ins.mnem == "JMP" and t is not None
+                          and t not in fn.index):
+                        returning.add(t)
+            if returning == self.flag_returning and entry == self.flag_entry:
+                return True
+            print("  flags: pass: %d return flags, %d read them at entry"
+                  % (len(returning), len(entry)), file=sys.stderr)
+            self.flag_returning, self.flag_entry = returning, entry
+        self.flag_returning = self.flag_entry = None
+        return False
+
     def liveness_cfg(self, fn, call_transparent=False):
         """CFG-wide liveness, used only by --check-flags to measure how often
         a flag would cross a call or return boundary."""
@@ -3080,7 +3206,7 @@ class Translator(object):
         if fn.addr in INTRINSIC_BODY:
             self.stats["_intrinsic_body"] += 1
             return ["/* runtime intrinsic */",
-                    "void fn_%08x(X86 *c) { %s }" % (fn.addr, INTRINSIC_BODY[fn.addr])]
+                    "void fn_%08x(X86 *RECOMP_CTX c) { %s }" % (fn.addr, INTRINSIC_BODY[fn.addr])]
         entries = sorted(set(entries) | (fn.msvc_landings & fn.addrs))
         # An alternate entry must be an instruction in THIS body.  A block can
         # be re-recovered between the discovery rounds and the final pass -
@@ -3104,6 +3230,8 @@ class Translator(object):
         fn.seh_escapes = self.seh_escaping_returns(fn)
         if self.opts.eager_flags:
             live_out = [ALL_FLAGS] * len(fn.insns)
+        elif self.flag_returning is not None and fn.addr in self.flag_planned:
+            live_out = self.liveness_global(fn)[1]
         else:
             live_out = self.liveness(fn)
         dead = self.dead_after_noreturn(fn, entries)
@@ -3157,7 +3285,7 @@ class Translator(object):
         prologue = 0                 # lines before the first instruction
         fn.multi = bool(entries)     # body_ (two parameters): jumps use TAIL_FN2
         if entries:
-            out.append("static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
+            out.append("static void body_%08x(X86 *RECOMP_CTX c, uint32_t entry_) {" % fn.addr)
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
@@ -3167,7 +3295,7 @@ class Translator(object):
                        "    default: break;")
             out.append("    }")
         else:
-            out.append("void fn_%08x(X86 *c) {" % fn.addr)
+            out.append("void fn_%08x(X86 *RECOMP_CTX c) {" % fn.addr)
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
@@ -3218,9 +3346,9 @@ class Translator(object):
                                 " | ".join(l.strip() for l in out[:prologue])))
         out.append("}")
         if entries:
-            out.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
+            out.append("void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
             for e in entries:
-                out.append("void fn_%08x(X86 *c) { body_%08x(c, %s); }"
+                out.append("void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }"
                            % (e, fn.addr, hexlit(e)))
         return out
 
@@ -4821,6 +4949,7 @@ def main():
         for fn in parsed:
             tr.prepare(fn)
         check_flags(tr, parsed)
+        print("plan:", tr.plan_flags(parsed))
         return 0
 
     os.makedirs(args.out, exist_ok=True)
@@ -5856,6 +5985,15 @@ def main():
                 continue
             failures.append((fn.addr, "jump table: %s" % e))
     tr.discover_seh_helpers(parsed)
+
+    # Flags across calls: computed once the function bodies are final.
+    if not args.eager_flags:
+        if tr.plan_flags(parsed):
+            print("  flags: %d functions return flags, %d read flags at entry; "
+                  "the rest end flags at CALL and RET"
+                  % (len(tr.flag_returning), len(tr.flag_entry)), file=sys.stderr)
+        else:
+            print("  flags: no plan; straight-line flag liveness only", file=sys.stderr)
 
     # Plan correction 9: every decoded jump-table target inside a function is a
     # block entry, so recomp_jump can reach it.
@@ -6923,6 +7061,17 @@ def check_flags(tr, parsed):
                     if len(examples) < 20:
                         examples.append("after call %08x live-out %s"
                                         % (ins.addr, sorted(lo[i])))
+    # What a CFG-wide liveness that ends flags at CALL and RET would save over
+    # the straight-line one the emitter uses: flag results it computes.
+    kept_line = kept_cfg = 0
+    for fn in parsed:
+        line = tr.liveness(fn)
+        _, cfg = tr.liveness_cfg(fn)
+        for i, ins in enumerate(fn.insns):
+            d, _ = flag_effect(ins)
+            kept_line += len(d & line[i])
+            kept_cfg += len(d & cfg[i])
+    print("flag results computed: %d straight-line, %d CFG-wide" % (kept_line, kept_cfg))
     print("functions with flags live at entry: %d / %d" % (entry_live, len(parsed)))
     print("call sites with flags live afterwards: %d / %d" % (after_call, call_sites))
     for e in examples:
