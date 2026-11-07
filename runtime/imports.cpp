@@ -445,9 +445,15 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // runs before the shim so the guest state is a consistent call boundary -
     // except at an atomic import, and inside a sched_atomic_enter stretch.
     uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
-    if (idx >= tramps().size() || !tramps()[idx].atomic)
+    // The table object stays put; only its elements move when a shim adds a
+    // trampoline, so it is indexed afresh after the call rather than held.
+    std::vector<Tramp> &table = tramps();
+    // Tracing and chain validation only run at log level 2; asking once
+    // saves three calls on every import.
+    const bool verbose = log_level() >= 2;
+    if (idx >= table.size() || !table[idx].atomic)
         sched_checkpoint();
-    if (idx >= tramps().size()) {
+    if (idx >= table.size()) {
         // No shim to say how many arguments to drop, but the return address
         // must still be consumed or the guest stack is displaced from here on.
         LOGW("imports: call to unallocated trampoline %08x (ESP=%08x, return=%08x)", target,
@@ -460,21 +466,23 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // The shim may allocate trampolines (GetProcAddress, a COM shim, a guest
     // callback), which reallocates this vector, so nothing may hold a
     // reference to the element across the call.
-    void (*fn)(X86 *) = tramps()[idx].fn;
-    uint8_t argc = tramps()[idx].argc;
+    void (*fn)(X86 *) = table[idx].fn;
+    uint8_t argc = table[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
     // across that call, and do not retain a pointer into the movable vector:
     // the shim may allocate trampolines and reallocate it. The name is read
     // from the table where it is used, never held across fn(c); this runs on
     // every guest import, tens of thousands of times a frame, so it is not
     // copied unless an observer (which may itself reallocate) is installed.
-    auto desc_now = [idx]() -> const char * { return tramps()[idx].desc.c_str(); };
-    ++tramps()[idx].calls;
+    auto desc_now = [&table, idx]() -> const char * { return table[idx].desc.c_str(); };
+    ++table[idx].calls;
     ++g_import_calls;
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
-    LOGV("-> %s (esp=%08x ret=%08x)", desc_now(), c->r[R_ESP], ret_addr);
-    recomp_seh_validate_chain(c, "import enter", desc_now());
+    if (verbose) {
+        log_msg(2, "-> %s (esp=%08x ret=%08x)", desc_now(), c->r[R_ESP], ret_addr);
+        recomp_seh_validate_chain(c, "import enter", desc_now());
+    }
 
     // The arguments as they are NOW, before the shim runs: a stdcall shim pops
     // them, so after the call they are gone and this is the only point they
@@ -506,12 +514,13 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         log_once(desc_now(), "unimplemented import %s: returning 0", desc_now());
         set_eax(c, 0);
     }
-    // Read after the shim ran, so the pointer is into the table as it is now.
-    if (g_return_observer) {
-        const std::string desc = desc_now();
-        g_return_observer(desc.c_str(), c->r[R_EAX]);
-    }
-    LOGV("<- %s (eax=%08x)", desc_now(), c->r[R_EAX]);
+    // Read after the shim ran, so the name is from the table as it is now.
+    // Return observers only report (the D3D failure log runs on every call),
+    // so the name is passed without a copy.
+    if (g_return_observer)
+        g_return_observer(desc_now(), c->r[R_EAX]);
+    if (verbose)
+        log_msg(2, "<- %s (eax=%08x)", desc_now(), c->r[R_EAX]);
     current_import_target = previous_import;
 
     uint32_t pop = 4;
@@ -530,7 +539,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     }
     c->r[R_ESP] += pop;
     c->eip = ret_addr;
-    recomp_seh_validate_chain(c, "import leave", desc_now());
+    if (verbose)
+        recomp_seh_validate_chain(c, "import leave", desc_now());
     return true;
 }
 

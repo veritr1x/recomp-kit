@@ -74,6 +74,43 @@
 - `RECOMP_WEB_PROFILING_FUNCS=1` at configure time keeps function names in
   the Wasm for readable browser profiles.
 
+- The translator keeps the x87 stack of each straight-line run of x87 and
+  plain integer code in C locals and writes TOP, the tag word, the registers
+  and their exact-integer shadow back once at the run's end (a label, a
+  branch, a call or anything that reads the register file), instead of on
+  every instruction; FNSTSW reads TOP from the run. Every write-back leaves
+  exactly the state the per-instruction helpers would have, which a new
+  differential test checks on random runs (`--x87-direct` keeps the old
+  form). Most Wanted's x87 code is a quarter of the instructions it runs.
+
+- Fewer per-call costs: a translated call tests one flag for profiling and
+  the frame watch instead of three loads, `RET` checks call continuations
+  against a bitmap instead of a binary search, import dispatch asks the log
+  level once, scheduling checkpoints read the browser clock about every 100
+  microseconds however many imports arrive, WebGPU bind groups survive the
+  frame until a texture they name is destroyed, and an effect's samplers
+  find their texture parameter once. The web build compiles the
+  translation at -O3 with Wasm SIMD.
+
+- Short sleeps are precise on the web. A browser worker's timed wait wakes
+  on the OS timer, which on Windows is a 15.6 ms tick, so a 2 ms sleep took
+  about 13 ms and a game's frame limiter lost most of a frame to it, unevenly.
+  `os_sleep_us` now learns how late the thread's timed waits wake, sleeps
+  only the part that cannot overshoot, and spins the rest on the
+  high-resolution clock; when every guest thread is idle the main thread,
+  whose host wait is precise, does the waiting, and hands the baton back by
+  notification.
+
+- An effect pass rewrites only the shader constants whose parameters changed
+  since the same program last bound them, while nothing else has written
+  those registers in between (a write serial per register file).
+
+- Together with the game's native float-to-integer cast these take a Most
+  Wanted race (City Perimeter, Chromium, 1899x1065, 120 Hz) from 55-65 to
+  100-119 new frames a second, 8.1-8.9 ms frames with P95 11-18 ms, and a
+  front-end dialog from 70 to 120. A three-minute drive logged no frame gap
+  over 50 ms.
+
 - Supply alpha on the fixed-function WebGPU coverage output so alpha-blended
   pipelines validate while retaining the R8 coverage mask. Fixes the black
   3D level-selection screen reached by Populous in the browser.

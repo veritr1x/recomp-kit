@@ -109,6 +109,10 @@ add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 # code then reaches guest memory without loading a base pointer (runtime/x86.h).
 if(EMSCRIPTEN)
   add_compile_definitions(RECOMP_STATIC_GUEST_ARENA=1)
+  # Wasm SIMD (every current browser has it) lets the compiler vectorize the
+  # host's copies and the translation's straight-line float code.
+  add_compile_options(-msimd128)
+  add_link_options(-msimd128)
 endif()
 add_compile_definitions($<$<CONFIG:Debug>:RECOMP_NULL_CHECKS=1>)
 option(RECOMP_DEV_LOADERS "Allow environment-selected native code libraries" OFF)

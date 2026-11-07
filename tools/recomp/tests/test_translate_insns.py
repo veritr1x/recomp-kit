@@ -911,6 +911,34 @@ class Emu(object):
         self.interrupts = []
 
 
+def x87_run_setup(rng):
+    """Floats whose sums and products are exact at any precision, an integer
+    for FILD, and EAX zero or not so both sides of the branch run."""
+    values = [rng.choice([-3.0, -0.5, 0.25, 1.0, 2.0, 6.0]) for _ in range(3)]
+    return {"regs": rand_regs(rng, ESI=SCRATCH + 0x300, EDI=SCRATCH + 0x100,
+                              EAX=rng.choice([0, 1])),
+            "mem": [(SCRATCH + 0x300, struct.pack("<3fi", *values, rng.randrange(-99, 99)))]}
+
+
+def check_x87_run(native, emu):
+    area = SCRATCH + 0x140
+    for lo, hi, what in ((0, 12, "environment"), (28, 108, "registers")):
+        assert bytes(native[area + lo:area + hi]) == bytes(emu[area + lo:area + hi]), (
+            "FNSAVE %s image differs: native %s unicorn %s"
+            % (what, bytes(native[area + lo:area + hi]).hex(), bytes(emu[area + lo:area + hi]).hex()))
+
+
+# The translator holds a straight-line run's x87 stack in locals and writes it
+# back at a boundary. FNSAVE at the end shows TOP, every tag and every
+# register value, after pops, exchanges, a branch into the middle of the run,
+# a compare and an exact integer.
+CASES.append(_decoded_case(
+    "x87 run written back across a branch and saved",
+    "d906 d94604 d8c1 d9c9 d91f 85c0 7404 d9e8 dec9 d85608 dd7f04"
+    " db460c d9c0 dec1 d9c9 dd7740 c3",
+    x87_run_setup, ignore=((SCRATCH + 0x140 + 12, 16),), check=check_x87_run))
+
+
 def run_once(case, native, emu, rng):
     state = case.setup(rng)
     regs = dict(rand_regs(rng), **state.get("regs", {}))

@@ -26,6 +26,7 @@
 #include "../runtime/imports.h"
 #include "dxtypes.h"
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -418,7 +419,15 @@ struct ComMethod {
 void com_reset();
 
 ComObj *com_new(ComKind kind);
-ComObj *com_get(uint32_t id);
+// Every object, by id - 1. Exposed so com_get inlines: every Direct3D call
+// looks objects up, many times.
+extern std::deque<ComObj> *g_com_objects;
+inline ComObj *com_get(uint32_t id) {
+    if (!id || !g_com_objects || id > g_com_objects->size())
+        return nullptr;
+    ComObj &o = (*g_com_objects)[id - 1];
+    return o.alive ? &o : nullptr;
+}
 // The object a guest interface pointer refers to, or null when `addr` is not
 // one of ours. `want` may be IF_NONE to accept any interface.
 ComObj *com_this(uint32_t addr, ComIface want = IF_NONE);

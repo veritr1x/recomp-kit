@@ -2062,12 +2062,264 @@ def noreturn_callees_from(parsed, iat_names, image=None):
     return out
 
 
+class X87Direct(object):
+    """The x87 register file as the runtime keeps it: every access through
+    runtime/x86.h, which updates TOP, the tag word and the exact-integer
+    shadow on each instruction."""
+
+    def st(self, n):
+        return "ST(c, %d)" % n
+
+    def set(self, n, v):
+        return "fset(c, %d, %s);" % (n, v)
+
+    def push(self, v):
+        return "fpush(c, %s);" % v
+
+    def push_int(self, v):
+        return "fpush_int(c, %s);" % v
+
+    def push_st(self, i):
+        return "fpush_st(c, %d);" % i
+
+    def drop(self):
+        return "fdrop(c);"
+
+    def copy(self, d, s):
+        return "fcopy(c, %d, %d);" % (d, s)
+
+    def xch(self, i):
+        return "fxch(c, %d);" % i
+
+    def status_word(self):
+        return "fstsw(c)"
+
+
+X87_DIRECT = X87Direct()
+#: A line X87Cache.declarations() emits at the top of a body.
+X87_DECLARATION = re.compile(r"(uint32_t ft0_|double fv\d+_(, fv\d+_)*|uint64_t fb\d+_(, fb\d+_)*);$")
+
+
+class X87Fallback(Exception):
+    """An instruction the cached stack cannot express; it runs on the
+    written-back register file instead."""
+
+
+class X87Cache(object):
+    """The x87 stack of one straight-line run, held in C locals.
+
+    A run starts at the first x87 instruction after a boundary and reads TOP
+    once (ft0_). Stack position p is the physical register (ft0_ + p) & 7;
+    pushes take p below zero. Each value is a fresh local assigned once, so a
+    copy or exchange moves names rather than data. At a boundary (a label, a
+    branch, a call, an instruction that is not plain integer code, or an x87
+    instruction outside VIRTUAL) write_back() leaves st[], st_bits[],
+    st_exact[], the tag word and TOP exactly as the per-instruction helpers
+    would have.
+
+    A value loaded from the register file carries metadata the run does not
+    know (an exact 64-bit integer, a tag FLDENV set), so moving one (FXCH,
+    FLD ST(i), FST ST(i)) falls back. Values produced in the run have known
+    metadata: no exact integer except FILD's, and a tag that follows from the
+    value."""
+
+    VIRTUAL = frozenset((
+        "FLD", "FLD1", "FLDZ", "FLDPI", "FLDLN2", "FLDL2E", "FLDLG2", "FLDL2T", "FILD",
+        "FST", "FSTP",
+        "FADD", "FSUB", "FMUL", "FDIV", "FSUBR", "FDIVR",
+        "FADDP", "FSUBP", "FMULP", "FDIVP", "FSUBRP", "FDIVRP",
+        "FIADD", "FISUB", "FIMUL", "FIDIV", "FISUBR", "FIDIVR",
+        "FCOM", "FCOMP", "FUCOM", "FUCOMP", "FCOMPP", "FUCOMPP", "FICOM", "FICOMP",
+        "FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP", "FTST",
+        "FABS", "FCHS", "FSQRT", "FSIN", "FCOS", "FRNDINT", "FPTAN", "FSINCOS",
+        "FSCALE", "FPATAN", "FYL2X", "FYL2XP1", "F2XM1", "FPREM", "FPREM1",
+        "FXTRACT", "FXCH", "FNOP", "FNSTSW", "FSTSW"))
+
+    def __init__(self):
+        self.count = 0          # value locals declared in this function
+        self.bits_count = 0     # exact-integer locals
+        self.used = False       # ft0_ declared
+        self.reset()
+
+    def reset(self):
+        self.active = False
+        self.r = 0              # TOP relative to ft0_
+        self.flushed_r = 0      # the TOP the register file holds
+        self.live = {}          # position -> (value, bits or None, dirty, known)
+        self.popped = {}        # position -> entry popped since the last write-back
+        self.touched = set()
+        self.pre = []
+
+    def snapshot(self):
+        return (self.active, self.r, self.flushed_r, dict(self.live), dict(self.popped),
+                set(self.touched), list(self.pre), self.count, self.bits_count, self.used)
+
+    def restore(self, s):
+        (self.active, self.r, self.flushed_r, self.live, self.popped, self.touched,
+         self.pre, self.count, self.bits_count, self.used) = s
+
+    def declarations(self):
+        out = []
+        if self.used:
+            out.append("uint32_t ft0_;")
+        if self.count:
+            out.append("double %s;" % ", ".join("fv%d_" % k for k in range(self.count)))
+        if self.bits_count:
+            out.append("uint64_t %s;" % ", ".join("fb%d_" % k for k in range(self.bits_count)))
+        return out
+
+    def begin(self):
+        if not self.active:
+            self.active = True
+            self.used = True
+            self.pre.append("ft0_ = c->fpu_top;")
+
+    def take_pre(self):
+        pre, self.pre = self.pre, []
+        return pre
+
+    @staticmethod
+    def phys(p):
+        return "(ft0_ + %du) & 7u" % (p & 7)
+
+    def touch(self, p):
+        # Eight registers: a run whose positions span more would alias.
+        if any(q != p and (q - p) % 8 == 0 for q in self.touched):
+            raise X87Fallback("stack wraps")
+        self.touched.add(p)
+
+    def new(self):
+        name = "fv%d_" % self.count
+        self.count += 1
+        return name
+
+    def entry(self, n):
+        p = self.r + n
+        if p in self.live:
+            return self.live[p]
+        if p in self.popped:
+            raise X87Fallback("reads a register popped in this run")
+        self.touch(p)
+        name = self.new()
+        self.pre.append("%s = c->st[%s];" % (name, self.phys(p)))
+        e = (name, None, False, False)
+        self.live[p] = e
+        return e
+
+    def st(self, n):
+        return self.entry(n)[0]
+
+    def overwrite(self, p):
+        # A write supersedes whatever the position held, popped or not.
+        self.touch(p)
+        self.popped.pop(p, None)
+
+    def set(self, n, v):
+        p = self.r + n
+        self.overwrite(p)
+        name = self.new()
+        self.live[p] = (name, None, True, True)
+        return "%s = %s;" % (name, v)
+
+    def _push(self, e):
+        self.r -= 1
+        p = self.r
+        self.touch(p)
+        self.popped.pop(p, None)
+        self.live[p] = e
+
+    def push(self, v):
+        name = self.new()
+        self._push((name, None, True, True))
+        return "%s = %s;" % (name, v)
+
+    def push_int(self, v):
+        name = self.new()
+        bits = "fb%d_" % self.bits_count
+        self.bits_count += 1
+        self._push((name, bits, True, True))
+        return "%s = (uint64_t)(int64_t)(%s); %s = (double)(int64_t)%s;" % (bits, v, name, bits)
+
+    def known(self, n):
+        e = self.entry(n)
+        if not e[3]:
+            raise X87Fallback("moves a register loaded from the register file")
+        return e
+
+    def push_st(self, i):
+        v, bits, _, _ = self.known(i)
+        self._push((v, bits, True, True))
+        return ""
+
+    def drop(self):
+        p = self.r
+        if p in self.popped:
+            raise X87Fallback("pops an empty register")
+        self.touch(p)
+        self.popped[p] = self.live.pop(p, None)
+        self.r += 1
+        return ""
+
+    def copy(self, d, s):
+        v, bits, _, _ = self.known(s)
+        self.overwrite(self.r + d)
+        self.live[self.r + d] = (v, bits, True, True)
+        return ""
+
+    def xch(self, i):
+        a, b = self.known(0), self.known(i)
+        self.live[self.r] = (b[0], b[1], True, True)
+        self.live[self.r + i] = (a[0], a[1], True, True)
+        return ""
+
+    def status_word(self):
+        # FNSTSW reports TOP, which the run knows without writing it back.
+        return ("(uint16_t)((c->fpu_sw & (uint16_t)~0x3800u) | (uint16_t)(((ft0_ + %du) & 7u) << 11))"
+                % (self.r & 7))
+
+    def write_back(self):
+        """Store what the run changed; every value stays available, clean."""
+        out = []
+        for p in sorted(self.live):
+            v, bits, dirty, known = self.live[p]
+            if not dirty:
+                continue
+            P = self.phys(p)
+            out.append("c->st[%s] = %s; c->st_bits[%s] = %s; c->st_exact[%s] = %du; "
+                       "ftag_put(c, %s, ftag_classify(%s));"
+                       % (P, v, P, bits or "0", P, 1 if bits else 0, P, v))
+            self.live[p] = (v, bits, False, True)
+        empty = 0
+        for p in sorted(self.popped):
+            e = self.popped[p]
+            P = self.phys(p)
+            if e is not None and e[2]:
+                out.append("c->st[%s] = %s; c->st_bits[%s] = %s;" % (P, e[0], P, e[1] or "0"))
+            out.append("c->st_exact[%s] = 0u;" % P)
+            empty |= 3 << (2 * (p & 7))
+        if empty:
+            # Rotate the empty tags into place by TOP: one update of the word.
+            out.append("{ uint32_t ftm_ = 0x%xu << (2u * ft0_); "
+                       "c->fpu_tag |= (uint16_t)(ftm_ | ftm_ >> 16); }" % empty)
+        self.popped = {}
+        if self.r != self.flushed_r:
+            out.append("c->fpu_top = (ft0_ + %du) & 7u;" % (self.r & 7))
+            self.flushed_r = self.r
+        return out
+
+    def end(self):
+        out = self.write_back() if self.active else []
+        self.reset()
+        return out
+
+
 class Translator(object):
     def __init__(self, image, func_addrs, opts):
         self.image = image
         self.func_addrs = func_addrs      # set of all known function entry points
         self.opts = opts
         self.stats = defaultdict(int)
+        self.x87 = X87_DIRECT
         # Instructions replaced by a trap because this translator cannot model
         # them. Reported at the end of a run: a listing decoding data as code
         # should be visible, not silent.
@@ -3301,12 +3553,18 @@ class Translator(object):
             if head:
                 out.append("    " + self.goto_label(fn.addr))
         prologue = len(out)          # everything emitted so far is dispatch
+        x87 = None if getattr(self.opts, "x87_direct", False) else X87Cache()
         for i, ins in enumerate(fn.insns):
             if i in dead:
                 continue
             if ins.addr in labels:
+                for line in (x87.end() if x87 else []):
+                    out.append("    " + line)
                 out.append("L_%08x: ;" % ins.addr)
-            body = self.emit(fn, i, live_out[i])
+            if x87:
+                body = self.emit_x87_run(fn, i, live_out[i], x87)
+            else:
+                body = self.emit(fn, i, live_out[i])
             for line in body:
                 out.append("    " + line)
             # An INT3 the listing ran into is MSVC's padding between
@@ -3318,7 +3576,7 @@ class Translator(object):
                 self.stats["_listing_gap"] += 1
                 self.notes.append(
                     "%08x: listing gap, %s falls through to %08x" % (ins.addr, ins.mnem, t))
-                for line in self.goto_target(fn, t, ins):
+                for line in (x87.end() if x87 else []) + self.goto_target(fn, t, ins):
                     out.append("    " + line)
         # A function whose last listed instruction is not a terminator falls
         # through into the next function.
@@ -3328,6 +3586,8 @@ class Translator(object):
                 and not self.never_returns(last)):
             t = fn.fallthrough[last_i] or fn.end
             self.stats["_fallthrough_exit"] += 1
+            for line in (x87.end() if x87 else []):
+                out.append("    " + line)
             out.append("    " + " ".join(self.goto_target(fn, t, last)))
         # Invariant: the first thing fn_ADDR does is reach ADDR.  Checked
         # here rather than trusted, because getting it wrong corrupts the
@@ -3344,6 +3604,11 @@ class Translator(object):
                     "fn_%08x starts at %08x, not at its own address; prologue "
                     "was %s" % (fn.addr, fn.insns[0].addr,
                                 " | ".join(l.strip() for l in out[:prologue])))
+        if x87:
+            # A run cannot outlive the body, and its locals are declared once
+            # at the top where every label is in their scope.
+            out.extend("    " + line for line in x87.end())
+            out[1:1] = ["    " + line for line in x87.declarations()]
         out.append("}")
         if entries:
             out.append("void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
@@ -3430,12 +3695,57 @@ class Translator(object):
             self.unmodelled.append((ins.addr, "%s: %s" % (ins.raw.split("  ", 1)[1], e)))
             body = ["recomp_unmodelled(c, 0x%08xu);" % ins.addr]
         self.stats[m] += 1
+        return self.frame(ins, body)
+
+    @staticmethod
+    def frame(ins, body):
+        """An instruction's lines under a comment naming it."""
+        text = ins.raw.split("  ", 1)[1]
+        if not body:
+            return ["/* %08x %s */" % (ins.addr, text)]
         declares = any(body[0].startswith(t) for t in
                        ("uint8_t ", "uint16_t ", "uint32_t ", "uint64_t ", "double "))
         if len(body) == 1 and not declares:
-            return ["%s  /* %08x %s */" % (body[0], ins.addr, ins.raw.split("  ", 1)[1])]
-        return (["{   /* %08x %s */" % (ins.addr, ins.raw.split("  ", 1)[1])]
+            return ["%s  /* %08x %s */" % (body[0], ins.addr, text)]
+        return (["{   /* %08x %s */" % (ins.addr, text)]
                 + ["    " + b for b in body] + ["}"])
+
+    #: Text that marks an instruction body as more than plain register and
+    #: memory code: it transfers control, reaches the runtime, or touches the
+    #: x87, MMX or SSE state. An x87 run ends before such an instruction.
+    X87_RUN_BREAKS = ("recomp_", "CALL_FN", "TAIL_FN", "goto", "return", "fpu", "st[",
+                      "ST(", "mm[", "setjmp", "c->eip", "fpush", "fdrop", "fset", "ftag")
+
+    def emit_x87_run(self, fn, i, live, cache):
+        """emit(), holding the x87 stack of a straight-line run in locals."""
+        ins = fn.insns[i]
+        m = ins.mnem
+        if m in X87Cache.VIRTUAL and ins.addr not in VISUAL_ANIMATION_READS:
+            saved = cache.snapshot()
+            try:
+                ops = [parse_operand(o) for o in ins.ops] if ins.ops else []
+                cache.begin()
+                self.x87 = cache
+                try:
+                    body = self.emit_x87(fn, ins, m, ops)
+                finally:
+                    self.x87 = X87_DIRECT
+                body = cache.take_pre() + [b for b in body if b]
+                self.stats[m] += 1
+                self.stats["_x87_cached"] += 1
+                return self.frame(ins, body)
+            except (X87Fallback, TranslateError):
+                cache.restore(saved)
+        body = self.emit(fn, i, live)
+        if not cache.active:
+            return body
+        text = "\n".join(body)
+        if m in JCC and not any(t in text for t in ("recomp_", "return")):
+            return cache.write_back() + body
+        if (m.startswith("F") or m == "CALL" or m in TERMINATORS
+                or any(t in text for t in self.X87_RUN_BREAKS)):
+            return cache.end() + body
+        return body
 
     STRING_MNEM = frozenset(("STOSB", "STOSW", "STOSD", "MOVSB", "MOVSW", "MOVSD",
                              "LODSB", "LODSW", "LODSD", "SCASB", "SCASW", "SCASD",
@@ -4397,39 +4707,42 @@ class Translator(object):
 
     def emit_x87(self, fn, ins, m, ops):
         L = []
-        st = lambda n: "ST(c, %d)" % n
-        # Writing a register goes through fset so its tag follows the value.
-        setst = lambda n, v: "fset(c, %d, %s);" % (n, v)
+        # Register reads and writes go through a backend: X87Direct spells the
+        # runtime helpers (fset retags, fpush/fdrop move TOP), X87Cache keeps
+        # a straight-line run's stack in locals and writes it back once.
+        xb = self.x87
+        st = xb.st
+        setst = xb.set
 
         if m == "FLD":
             if ops[0].kind == "st":
-                L.append("fpush_st(c, %d);" % ops[0].sti)
+                L.append(xb.push_st(ops[0].sti))
             else:
-                L.append("fpush(c, %s);" % self.x87_mem_value(ops[0]))
+                L.append(xb.push(self.x87_mem_value(ops[0])))
             return L
         if m == "FLD1":
-            return ["fpush(c, 1.0);"]
+            return [xb.push("1.0")]
         if m == "FLDZ":
-            return ["fpush(c, 0.0);"]
+            return [xb.push("0.0")]
         if m == "FLDPI":
-            return ["fpush(c, 3.14159265358979323846);"]
+            return [xb.push("3.14159265358979323846")]
         if m == "FLDLN2":
-            return ["fpush(c, 0.69314718055994530942);"]
+            return [xb.push("0.69314718055994530942")]
         if m == "FLDL2E":
-            return ["fpush(c, 1.44269504088896340736);"]
+            return [xb.push("1.44269504088896340736")]
         if m == "FLDLG2":
-            return ["fpush(c, 0.30102999566398119521);"]
+            return [xb.push("0.30102999566398119521")]
         if m == "FLDL2T":
-            return ["fpush(c, 3.32192809488736234787);"]
+            return [xb.push("3.32192809488736234787")]
         if m == "FBSTP":
             return ["wrbcd80(%s, fpop(c));" % addr_expr(ops[0])]
         if m == "FILD":
-            return ["fpush_int(c, %s);" % self.x87_signed_value(ops[0])]
+            return [xb.push_int(self.x87_signed_value(ops[0]))]
 
         if m in ("FST", "FSTP"):
             if ops and ops[0].kind == "st":
                 if ops[0].sti != 0:
-                    L.append("fcopy(c, %d, 0);" % ops[0].sti)
+                    L.append(xb.copy(ops[0].sti, 0))
             elif ops:
                 op = ops[0]
                 if op.size == 32:
@@ -4441,7 +4754,7 @@ class Translator(object):
                 else:
                     raise TranslateError("bad %s size" % m)
             if m == "FSTP":
-                L.append("fdrop(c);")
+                L.append(xb.drop())
             return L
 
         if m in ("FIST", "FISTP", "FISTTP"):
@@ -4457,7 +4770,7 @@ class Translator(object):
             if m == "FISTTP":
                 L = [line.replace("fist_i", "fisttp_i") for line in L]
             if m in ("FISTP", "FISTTP"):
-                L.append("fdrop(c);")
+                L.append(xb.drop())
             return L
 
         # arithmetic ------------------------------------------------------
@@ -4504,7 +4817,7 @@ class Translator(object):
             d = ops[0].sti if ops else 1
             lhs, rhs = (st(0), st(d)) if rev else (st(d), st(0))
             L.append(setst(d, "fx87(c, %s)" % combine(lhs, o, rhs)))
-            L.append("fdrop(c);")
+            L.append(xb.drop())
             return L
 
         IARITH = {"FIADD": "+", "FISUB": "-", "FIMUL": "*", "FIDIV": "/",
@@ -4531,24 +4844,25 @@ class Translator(object):
             L.append("%s(c, %s, %s);" % ("fucom" if m.startswith("FU") else "fcom",
                                          st(0), other))
             if m.endswith("P"):
-                L.append("fdrop(c);")
+                L.append(xb.drop())
             return L
         if m in ("FCOMPP", "FUCOMPP"):
             L.append("%s(c, %s, %s);" % ("fucom" if m.startswith("FU") else "fcom",
                                          st(0), st(1)))
-            L.append("fdrop(c); fdrop(c);")
+            L.append(xb.drop())
+            L.append(xb.drop())
             return L
         if m in ("FICOM", "FICOMP"):
             L.append("fcom(c, %s, %s);" % (st(0), self.x87_int_value(ops[0])))
             if m == "FICOMP":
-                L.append("fdrop(c);")
+                L.append(xb.drop())
             return L
         if m in ("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP"):
             other = st(ops[-1].sti) if ops else st(1)
             L.append("%s(c, %s, %s);" % ("fucomi" if m.startswith("FU") else "fcomi",
                                          st(0), other))
             if m.endswith("IP"):
-                L.append("fdrop(c);")
+                L.append(xb.drop())
             return L
         if m == "FTST":
             return ["fcom(c, %s, 0.0);" % st(0)]
@@ -4570,29 +4884,29 @@ class Translator(object):
         if m == "FPTAN":
             L.append("double v_ = %s;" % st(0))
             L.append(setst(0, "fx87_exact(c, tan(v_))"))
-            L.append("fpush(c, 1.0);")
+            L.append(xb.push("1.0"))
             return L
         if m == "FSINCOS":
             L.append("double v_ = %s;" % st(0))
             L.append(setst(0, "fx87_exact(c, sin(v_))"))
-            L.append("fpush(c, fx87_exact(c, cos(v_)));")
+            L.append(xb.push("fx87_exact(c, cos(v_))"))
             return L
         if m == "FSCALE":
             return [setst(0, "fx87_exact(c, fscale(%s, %s))" % (st(0), st(1)))]
         if m == "FPATAN":
             L.append(setst(1, "fx87_exact(c, atan2(%s, %s))" % (st(1), st(0))))
-            L.append("fdrop(c);")
+            L.append(xb.drop())
             return L
         if m == "FYL2X":
             L.append(setst(1, "fx87_exact(c, %s * log2(%s))" % (st(1), st(0))))
-            L.append("fdrop(c);")
+            L.append(xb.drop())
             return L
         if m == "FYL2XP1":
             # log2(x+1) loses every significant bit for small x; log1p keeps
             # them.  With ST(0) = 2^-54 and ST(1) = 1 the naive form returns 0.
             L.append(setst(1, "fx87_exact(c, %s * log1p(%s) / M_LN2)"
                            % (st(1), st(0))))
-            L.append("fdrop(c);")
+            L.append(xb.drop())
             return L
         if m == "F2XM1":
             # Likewise 2^x - 1: expm1(x * ln 2) is the same value without the
@@ -4604,7 +4918,7 @@ class Translator(object):
         if m == "FXTRACT":
             L.append("double v_ = %s;" % st(0))
             L.append(setst(0, "fxtract_exponent(v_)"))
-            L.append("fpush(c, fxtract_significand(v_));")
+            L.append(xb.push("fxtract_significand(v_)"))
             return L
         if m == "FDECSTP":
             # Both rotate TOP and clear C1.
@@ -4619,11 +4933,11 @@ class Translator(object):
             # Capstone renders D9 C9 with the implicit ST(0) present, as
             # `FXCH ST0,ST1`, where the listing writes `FXCH ST1`.  Taking
             # ops[0] there selects ST(0) and swaps the register with itself.
-            return ["fxch(c, %d);" % (ops[-1].sti if ops else 1)]
+            return [xb.xch(ops[-1].sti if ops else 1)]
         if m in ("FNSTSW", "FSTSW"):
             if ops and ops[0].kind == "reg":
-                return ["c->r[0] = (c->r[0] & 0xffff0000u) | fstsw(c);"]
-            return ["wr16(%s, fstsw(c));" % addr_expr(ops[0])]
+                return ["c->r[0] = (c->r[0] & 0xffff0000u) | %s;" % xb.status_word()]
+            return ["wr16(%s, %s);" % (addr_expr(ops[0]), xb.status_word())]
         if m in ("FSTCW", "FNSTCW"):
             return ["wr16(%s, c->fpu_cw);" % addr_expr(ops[0])]
         if m == "FLDCW":
@@ -4737,6 +5051,8 @@ def main():
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--eager-flags", action="store_true",
                     help="compute every flag at every instruction (debug)")
+    ap.add_argument("--x87-direct", action="store_true",
+                    help="update the x87 register file at every instruction (debug)")
     ap.add_argument("--check-flags", action="store_true",
                     help="report flags that would cross CALL/RET boundaries")
     ap.add_argument("--report", default=None, help="write a JSON stats file")
@@ -6502,6 +6818,9 @@ def main():
         # or modify its CPU. The first guest operation must still reach ADDR.
         if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":
             lines = lines[1:]
+        # Nor do the declarations of an x87 run's locals (X87Cache).
+        while lines and X87_DECLARATION.match(lines[0].strip()):
+            lines = lines[1:]
         if not lines:
             continue
         first = lines[0].strip()
@@ -6591,16 +6910,16 @@ def main():
         fh.write("#ifdef RECOMP_NO_HOOKS\n"
                  "#define CALL_FN(a) do { if (recomp_profile_enabled) recomp_call(c, %sfunc_addrs[FIDX(a)]); else FN(a)(c); } while (0)\n"
                  "#else\n"
+                 "/* Profiling and the frame watch are off in play: one flag sends a\n"
+                 " * call to table.c's call_slow, which does what this did inline. */\n"
+                 "void %scall_slow(X86 *c, uint32_t i);\n"
                  "#define CALL_FN(a) do {\\\n"
                  "    uint32_t i_ = FIDX(a);\\\n"
-                 "    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;\\\n"
-                 "    if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[i_]); break; }\\\n"
+                 "    if (__builtin_expect(recomp_slow_calls != 0u, 0)) { %scall_slow(c, i_); break; }\\\n"
                  "    if (__builtin_expect(__atomic_load_n(&%shooked[i_],"
                  " __ATOMIC_ACQUIRE) != 0u, 0))\\\n"
                  "        %shook_ptrs[i_](c, i_);\\\n"
                  "    else FN(a)(c);\\\n"
-                 "    if (recomp_frame_watch && c->r[5] != ebp_)\\\n"
-                 "        recomp_frame_changed(c, %sfunc_addrs[i_], ebp_, c->r[5]);\\\n"
                  "} while (0)\n"
                  "#endif\n"
                  "/* A jump into another function (always followed by return) ends in a tail\n"
@@ -6621,8 +6940,7 @@ def main():
                  "#else\n"
                  "#define TAIL_FN_(a, t) do {\\\n"
                  "    uint32_t i_ = FIDX(a);\\\n"
-                 "    if (__builtin_expect(recomp_frame_watch != 0u, 0)) { CALL_FN(a); break; }\\\n"
-                 "    if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[i_]); break; }\\\n"
+                 "    if (__builtin_expect(recomp_slow_calls != 0u, 0)) { %scall_slow(c, i_); break; }\\\n"
                  "    if (__builtin_expect(__atomic_load_n(&%shooked[i_],"
                  " __ATOMIC_ACQUIRE) != 0u, 0)) { %shook_ptrs[i_](c, i_); break; }\\\n"
                  "    t(a);\\\n"
@@ -6739,6 +7057,19 @@ def main():
         for a in entry_names:
             fh.write("    FN(%08x),\n" % a)
         fh.write("};\n\n")
+        # CALL_FN's out-of-line path while profiling or the frame watch is on
+        # (recomp_slow_calls): the same order the inline call used to check.
+        fh.write("#ifndef RECOMP_NO_HOOKS\n"
+                 "void %scall_slow(X86 *c, uint32_t i)\n{\n"
+                 "    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;\n"
+                 "    if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[i]); return; }\n"
+                 "    if (__atomic_load_n(&%shooked[i], __ATOMIC_ACQUIRE))\n"
+                 "        %shook_ptrs[i](c, i);\n"
+                 "    else\n"
+                 "        %sbase_ptrs[i](c);\n"
+                 "    if (recomp_frame_watch && c->r[5] != ebp_)\n"
+                 "        recomp_frame_changed(c, %sfunc_addrs[i], ebp_, c->r[5]);\n"
+                 "}\n#endif\n\n" % (P, P, P, P, P, P))
         fh.write("static void %srun_base(X86 *c, uint32_t i)\n"
                  "{\n    %sbase_ptrs[i](c);\n}\n\n" % (P, P))
         # The untouched translations, beside the possibly-overridden ones: the
@@ -6766,14 +7097,27 @@ def main():
             fh.write("__attribute__((constructor)) static void %sregister(void)\n"
                      "{\n    recomp_module_register(&%smodule);\n}\n" % (P, P))
         else:
+            # Every guest RET asks this. A bitmap over the span of return
+            # addresses answers in one load instead of a binary search over
+            # tens of thousands of them.
+            ret_lo = min(call_returns) if call_returns else 0
+            ret_span = (max(call_returns) - ret_lo + 1) if call_returns else 0
+            bits = bytearray((ret_span + 7) // 8)
+            for a in call_returns:
+                o = a - ret_lo
+                bits[o >> 3] |= 1 << (o & 7)
+            fh.write("static const uint32_t recomp_call_return_lo = 0x%08xu, recomp_call_return_span = %du;\n"
+                     % (ret_lo, ret_span))
+            fh.write("static const uint8_t recomp_call_return_bits[%d] = {\n" % max(1, len(bits)))
+            for k in range(0, len(bits), 32):
+                fh.write("    " + ",".join(str(b) for b in bits[k:k + 32]) + ",\n")
+            if not bits:
+                fh.write("    0,\n")
+            fh.write("};\n\n")
             fh.write("""int recomp_is_call_return(uint32_t target)
 {
-    uint32_t lo = 0, hi = recomp_call_return_count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (recomp_call_returns[mid] < target) lo = mid + 1; else hi = mid;
-    }
-    return lo < recomp_call_return_count && recomp_call_returns[lo] == target;
+    uint32_t o = target - recomp_call_return_lo;
+    return o < recomp_call_return_span && ((recomp_call_return_bits[o >> 3] >> (o & 7u)) & 1u);
 }
 
 const char *recomp_profile_name(uint32_t i) { return i < recomp_func_count ? profile_names[i] : 0; }

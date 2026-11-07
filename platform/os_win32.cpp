@@ -642,6 +642,9 @@ int os_fd_reads_may_block(void) {
 int os_monotonic_is_costly(void) {
     return 0;
 }
+int os_timed_waits_are_coarse(void) {
+    return 0;
+}
 uint64_t os_wall_time_us(void) {
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);

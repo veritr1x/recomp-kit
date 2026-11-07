@@ -53,7 +53,13 @@ if(POP_HAVE_GEN)
     target_include_directories(recomp_gen PRIVATE ${_override_dir})
     message(STATUS "Native overrides: ${RECOMP_OVERRIDE_HEADER}")
   endif()
-  pop_optimize(recomp_gen 2)
+  # The web runs the translation through one more compiler (the browser's),
+  # and -O3's extra inlining of the x86.h helpers pays off there.
+  if(EMSCRIPTEN)
+    pop_optimize(recomp_gen 3)
+  else()
+    pop_optimize(recomp_gen 2)
+  endif()
   # Auxiliary modules (game.toml [modules.aux.<key>]) are translated into
   # gen/aux-<key>/ with their own funcs.h and prefixed tables, so each is its
   # own library; their table.c registers with the runtime's module registry.

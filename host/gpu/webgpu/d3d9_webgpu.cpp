@@ -1143,6 +1143,8 @@ class WebGpuRenderer final : public D9Backend {
     }
 
     void retire(Tex &t) {
+        if (t.sample_view || t.msaa_view || !t.targets.empty())
+            drop_groups(); // they may name this texture's views
         if (t.imported) {
             dev_->destroy(t.imported);
             t.imported = {};
@@ -1246,6 +1248,14 @@ class WebGpuRenderer final : public D9Backend {
         // The rings are free again once the queue has taken their data.
         uniform_ring_.chunk = uniform_ring_.used = 0;
         vertex_ring_.chunk = vertex_ring_.used = 0;
+        // Groups outlive the submit: the ring chunks, samplers and layouts
+        // they name are never released, and retire() drops them all before a
+        // texture view goes, so a recycled handle cannot match a stale key.
+        // Rebuilding every group each frame cost the main thread about 5%.
+        if (groups_.size() > 8192)
+            drop_groups();
+    }
+    void drop_groups() {
         for (auto &kv : groups_)
             wgpuBindGroupRelease(kv.second);
         groups_.clear();

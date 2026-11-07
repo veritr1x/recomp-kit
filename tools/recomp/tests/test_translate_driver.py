@@ -1714,7 +1714,11 @@ def test_auxiliary_module_emits_prefixed_tables_that_self_register(tmp_path, mon
     for main_only in ("void recomp_call(", "void recomp_jump(", "int recomp_is_call_return(",
                       "int recomp_thunk_target_kind(", "recomp_override_hash", "const char *recomp_profile_name("):
         assert main_only not in text
-    assert "recomp_blit_func_addrs[i_]" in header and "recomp_blit_hooked[i_]" in header
+    # Calls test the module's own hook flags; profiling and the frame watch
+    # go through its own call_slow, which reads its own address table.
+    assert "recomp_blit_call_slow(c, i_)" in header and "recomp_blit_hooked[i_]" in header
+    assert "void recomp_blit_call_slow(X86 *c, uint32_t i)" in text
+    assert "recomp_blit_func_addrs[i]" in text
     assert re.search(r"recomp_func_addrs\b", header) is None
 
 
