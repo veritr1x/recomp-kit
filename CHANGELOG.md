@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Type the character a key produces with Shift and Caps Lock applied, so
+  WM_CHAR carries capitals and shifted symbols (a name box received only
+  lowercase before).
+- Report Winsock 2 as present with the network down: WSAStartup succeeds and
+  sockets, name lookups and Netbios fail at once with WSAENETDOWN or
+  WSAHOST_NOT_FOUND. Register each export under its name and its WS2_32
+  ordinal, as executables import them by ordinal. A game's LAN or Online menu
+  no longer stalls on an unimplemented import or crashes through a null call.
+- Pass the guest's own ExitProcess code to the web player. The player says the
+  game has crashed, with the code and the last error it logged, instead of
+  returning to the launcher as if the game had quit.
+- The web launcher counts a game's streamed-data cache as its data: Delete game
+  data is available for a streamed game and removes that cache. The Keep game
+  data note says how to undo it.
+- `web_launcher.py --serve` takes `--tls-cert` and `--tls-key` to serve HTTPS,
+  the secure context browsers require outside localhost, so a LAN can play
+  without a proxy.
+- Replace two invalid UTF-8 bytes in the web player's status text.
+
 - Disable SDL's extra mouse events for browser touches. The host gesture
   mapper already emits clicks after cursor placement; duplicate events could
   activate the previous menu item before the touched item received its click.

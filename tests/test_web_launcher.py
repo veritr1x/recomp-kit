@@ -4,9 +4,12 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import ssl
 import subprocess
 import tempfile
+import threading
 import unittest
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("web_launcher", ROOT / "tools/web_launcher.py")
@@ -54,6 +57,33 @@ class WebLauncherTests(unittest.TestCase):
             web_launcher.copy_web_build("stub", build, tmp / "site")
             copied = sorted(f.name for f in (tmp / "site/stub").iterdir())
             self.assertEqual(copied, ["App.data", "App.js", "App.wasm", "FETCH-NOTICE.txt", "env.mjs", "index.html", "player.js", "source.mjs", "style.css"])
+    def test_https_server(self):
+        openssl = shutil.which("openssl")
+        if not openssl:
+            self.skipTest("openssl is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "index.html").write_text("hub")
+            subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                            "-keyout", str(tmp / "key.pem"), "-out", str(tmp / "cert.pem"),
+                            "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+                           check=True, capture_output=True)
+            with web_launcher.make_server(tmp, 0, "127.0.0.1", tmp / "cert.pem", tmp / "key.pem") as httpd:
+                thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                try:
+                    context = ssl.create_default_context(cafile=str(tmp / "cert.pem"))
+                    url = "https://127.0.0.1:%d/index.html" % httpd.server_port
+                    with urllib.request.urlopen(url, context=context, timeout=10) as response:
+                        self.assertEqual(response.read(), b"hub")
+                        self.assertEqual(response.headers["Cross-Origin-Embedder-Policy"], "require-corp")
+                        self.assertEqual(response.headers["Cross-Origin-Opener-Policy"], "same-origin")
+                finally:
+                    httpd.shutdown()
+                    thread.join()
+            with self.assertRaises(ssl.SSLError):
+                web_launcher.make_server(tmp, 0, "127.0.0.1", tmp / "index.html")
+
     def test_core_suite(self):
         node = shutil.which("node")
         if not node:

@@ -33,7 +33,7 @@ function setBusy(value) {
     for (const b of c.el.querySelectorAll(".import-folder, .import-zip, .import-saves, .delete, .play, .stream"))
       b.disabled = value || (b.classList.contains("play") && c.state !== "ready") ||
                    (b.classList.contains("stream") && !c.streamAvailable) ||
-                   (b.classList.contains("delete") && c.state === "notFound");
+                   (b.classList.contains("delete") && c.state === "notFound" && !c.streamCached);
 }
 
 function show(card, text, bad = false) {
@@ -50,8 +50,9 @@ const STATES = {
 };
 
 async function refresh(card) {
-  const { status, estimate, persisted } = await call("status", { game: card.game });
+  const { status, estimate, persisted, streamCached } = await call("status", { game: card.game });
   card.state = status.state;
+  card.streamCached = !!streamCached;
   const [label, tone] = STATES[status.state];
   card.stateEl.textContent = status.state === "notFound" && card.streamAvailable ? "Streaming available" : label;
   card.stateEl.className = "state " + (card.streamAvailable && status.state === "notFound" ? "ready" : tone);
@@ -79,7 +80,7 @@ function updateStorage(estimate, persisted) {
   }
   persist.hidden = !!persisted || !navigator.storage?.persist;
   note.textContent = persisted
-    ? "The browser will keep game data until you delete it."
+    ? "The browser will keep game data until you delete it (Delete game data, or clear this site's data in the browser's site settings; a page cannot undo Keep game data itself)."
     : "The browser may clear game data when space runs low; choose Keep game data to prevent that.";
 }
 

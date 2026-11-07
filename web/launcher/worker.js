@@ -5,6 +5,29 @@ import { importGame, gameStatus, ZipReader, zipWrite, Sha256 } from "./core.js";
 
 let controller = null;
 
+// The streamed-data caches (player/fetch-backend.js) that belong to a game: the
+// base URL each records ends in the game's data folder. A cache from before
+// the record existed is counted for any game that streams.
+async function streamCaches(game) {
+  if (!game.streamManifest) return [];
+  let root;
+  try {
+    root = await (await navigator.storage.getDirectory()).getDirectoryHandle("stream-cache");
+  } catch {
+    return [];
+  }
+  const names = [];
+  for await (const [name, handle] of root.entries()) {
+    if (handle.kind !== "directory") continue;
+    let base = "";
+    try {
+      base = await (await (await handle.getFileHandle("base.txt")).getFile()).text();
+    } catch {}
+    if (!base || base.replace(/\/$/, "").endsWith("/" + game.id + "/data")) names.push(name);
+  }
+  return names;
+}
+
 async function dirFor(path, create = true) {
   let dir = await navigator.storage.getDirectory();
   for (const part of path.split("/").filter(Boolean))
@@ -144,7 +167,8 @@ const handlers = {
     const status = await gameStatus(game, opfsStore(root));
     const estimate = await navigator.storage.estimate().catch(() => ({}));
     const persisted = await navigator.storage.persisted?.().catch(() => false);
-    return { status, estimate, persisted };
+    const streamCached = (await streamCaches(game)).length > 0;
+    return { status, estimate, persisted, streamCached };
   },
   async import({ game, kind, files, handle, file }) {
     controller = new AbortController();
@@ -168,6 +192,12 @@ const handlers = {
   async delete({ game }) {
     const dir = await dirFor(game.id);
     await dir.removeEntry("game", { recursive: true }).catch(() => {});
+    // What streaming kept in this browser for this game goes too.
+    const caches = await streamCaches(game);
+    if (caches.length) {
+      const root = await (await navigator.storage.getDirectory()).getDirectoryHandle("stream-cache");
+      for (const name of caches) await root.removeEntry(name, { recursive: true }).catch(() => {});
+    }
     return {};
   },
   async exportSaves({ game }) {

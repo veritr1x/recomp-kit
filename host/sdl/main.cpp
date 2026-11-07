@@ -745,10 +745,14 @@ void handle_key(const SDL_KeyboardEvent &event, bool down) {
     e.kind = PendingInput::KEY;
     e.key = key;
     e.down = down;
-    // The character the key produces with no modifier held, which is what a
-    // WM_CHAR for it carries; keycodes above the Unicode range are not characters.
-    const SDL_Keycode plain = SDL_GetKeyFromScancode(event.scancode, SDL_KMOD_NONE, false);
-    e.character = plain < 0x40000000 && plain >= 0x20 ? (uint32_t)plain : 0u;
+    // The character the key types, which is what its WM_CHAR carries: Shift
+    // and Caps Lock apply (Shift+A types 'A', Shift+1 '!'), as the keyboard
+    // layout has it. Read from this event, not when the guest translates the
+    // message, since Shift may be up by then. Ctrl and Alt type no text here.
+    // Keycodes above the Unicode range are not characters.
+    const SDL_Keymod typing = event.mod & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS);
+    const SDL_Keycode typed = SDL_GetKeyFromScancode(event.scancode, typing, false);
+    e.character = typed < 0x40000000 && typed >= 0x20 ? (uint32_t)typed : 0u;
     e.flags = host_modifier_flags_from_sdl(event.mod);
     queue_or_apply(e);
 }
@@ -1648,7 +1652,8 @@ namespace {
 std::string g_web_exe;
 std::string g_web_stream_base;
 std::atomic<bool> g_web_guest_done{false};
-// Why the game's thread ended: 0 the game quit, otherwise it could not start.
+// Why the game's thread ended: 0 the game quit, 1 or 2 it could not start,
+// otherwise the game's own non-zero exit code.
 std::atomic<int> g_web_exit_status{0};
 int g_web_dw = 0, g_web_dh = 0;
 
@@ -1737,7 +1742,9 @@ void web_guest() {
     fflush(stdout);
     host_midi_startup(win32_midi_soundfont_path().c_str());
     boot_run();
-    web_guest_finish(0);
+    // The game's own ExitProcess code: 0 when it quit from its menu, anything
+    // else (a CRT abort is 3) is reported by the page as a crash.
+    web_guest_finish((int)process_exit_code());
 }
 
 int web_main(int argc, char **argv) {

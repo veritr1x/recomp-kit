@@ -3,6 +3,7 @@
 
     tools/web_launcher.py --game-dir /abs/game-a [--game-dir /abs/game-b ...] --out <dir>
         [--web-build <game id>=<build dir> ...] [--serve [port]] [--host ADDRESS]
+        [--tls-cert CERT.pem --tls-key KEY.pem]
 
 Writes <dir>/index.html, app.js, core.js, worker.js and games.json (each game's
 title, executable, digest, required folders, exclusions and store link from its
@@ -10,7 +11,8 @@ game.toml). A game's web build, when one exists, goes in <dir>/<game id>/.
 --web-build copies a game's web build (build/web/recomp: index.html and the
 app's .js/.wasm/.data) there. Serve <dir> over HTTPS or from localhost with
 COOP/COEP headers (the game needs a secure, cross-origin isolated context);
---serve runs such a server for local testing."""
+--serve runs such a server for local testing, over HTTPS with --tls-cert and
+--tls-key, so other machines on a LAN can play."""
 
 import argparse
 import functools
@@ -20,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -195,14 +198,32 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def serve(out, port, host="127.0.0.1"):
+def make_server(out, port, host="127.0.0.1", tls_cert=None, tls_key=None):
+    """The isolated static server for out, over HTTPS when tls_cert is given."""
     handler = functools.partial(IsolatedHandler, directory=str(out))
-    with http.server.ThreadingHTTPServer((host, port), handler) as httpd:
+    httpd = http.server.ThreadingHTTPServer((host, port), handler)
+    if tls_cert:
+        # Browsers give WebGPU and shared memory only to a secure context:
+        # localhost, or HTTPS. A certificate (mkcert, or a self-signed one
+        # each player accepts once) lets a LAN play without a proxy.
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(tls_cert), str(tls_key) if tls_key else None)
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        except BaseException:
+            httpd.server_close()
+            raise
+    return httpd
+
+
+def serve(out, port, host="127.0.0.1", tls_cert=None, tls_key=None):
+    with make_server(out, port, host, tls_cert, tls_key) as httpd:
         shown = "localhost" if host in ("127.0.0.1", "::1", "localhost") else host
-        print("serving %s at http://%s:%d/" % (out, shown, port), flush=True)
-        if shown != "localhost":
-            print("note: browsers require HTTPS for this page outside localhost; put a TLS proxy in front",
-                  flush=True)
+        scheme = "https" if tls_cert else "http"
+        print("serving %s at %s://%s:%d/" % (out, scheme, shown, port), flush=True)
+        if shown != "localhost" and not tls_cert:
+            print("note: browsers require HTTPS for this page outside localhost; pass --tls-cert and "
+                  "--tls-key, or put a TLS proxy in front (docs/web.md)", flush=True)
         httpd.serve_forever()
 
 
@@ -214,9 +235,15 @@ def main():
     parser.add_argument("--serve", type=int, nargs="?", const=8000, metavar="PORT")
     parser.add_argument("--host", default="127.0.0.1",
                         help="address --serve listens on (default loopback; 0.0.0.0 in a container)")
+    parser.add_argument("--tls-cert", type=Path, metavar="PEM",
+                        help="serve HTTPS with this certificate (chain) so other machines can play")
+    parser.add_argument("--tls-key", type=Path, metavar="PEM",
+                        help="the private key for --tls-cert, when it is not in the same file")
     parser.add_argument("--stream", action="append", default=[], metavar="ID[=INSTALL]",
                         help="stage a private installation (optionally select a full install directory)")
     args = parser.parse_args()
+    if args.tls_key and not args.tls_cert:
+        parser.error("--tls-key needs --tls-cert")
     games = build(args.game_dir, args.out)
     try:
         stage_streams(args.game_dir, games, args.stream, args.out)
@@ -230,7 +257,7 @@ def main():
         copy_web_build(game_id, build_dir, args.out)
     print("web launcher for %s in %s" % (", ".join(g["title"] for g in games), args.out))
     if args.serve is not None:
-        serve(args.out, args.serve, args.host)
+        serve(args.out, args.serve, args.host, args.tls_cert, args.tls_key)
 
 
 if __name__ == "__main__":
