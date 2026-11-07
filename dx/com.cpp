@@ -5,14 +5,17 @@
 #include <string.h>
 #include <deque>
 
+std::deque<ComObj> *g_com_objects = nullptr;
+
 namespace {
 
 // Objects are held in a deque so a pointer stays valid while another object is
 // created during a shim call (CreateSurface makes a back buffer, and the
 // caller still holds the ComObj* for the primary).
 std::deque<ComObj> &objects() {
-    static auto *v = new std::deque<ComObj>();
-    return *v;
+    if (!g_com_objects)
+        g_com_objects = new std::deque<ComObj>();
+    return *g_com_objects;
 }
 
 uint32_t g_vtable[IF_COUNT] = {0};
@@ -84,13 +87,6 @@ ComObj *com_new(ComKind kind) {
     o.refs = 1;
     o.alive = true;
     return &o;
-}
-
-ComObj *com_get(uint32_t id) {
-    if (!id || id > objects().size())
-        return nullptr;
-    ComObj &o = objects()[id - 1];
-    return o.alive ? &o : nullptr;
 }
 
 ComIface com_iface_of(uint32_t addr) {

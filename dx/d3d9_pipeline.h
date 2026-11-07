@@ -39,9 +39,12 @@ struct D9Pipeline {
     uint32_t vs_object = 0, ps_object = 0; // held COM objects; effects may bind bytes directly
     float vconst[256][4] = {};             // vertex shader float registers
     float pconst[32][4] = {};              // pixel shader float registers
-    uint32_t sampler_tex[16] = {};         // COM object id of the texture per sampler
-    uint32_t sampler_state[16][14] = {};   // D3DSAMPLERSTATETYPE, indexed as the enum
-    uint32_t rs[256] = {};                 // render states, by D3DRENDERSTATETYPE
+    // A fresh d9_const_serial() at each write of vconst / pconst (0 after a
+    // reset), so a writer can tell its own values are still in place.
+    uint64_t vconst_serial = 0, pconst_serial = 0;
+    uint32_t sampler_tex[16] = {};       // COM object id of the texture per sampler
+    uint32_t sampler_state[16][14] = {}; // D3DSAMPLERSTATETYPE, indexed as the enum
+    uint32_t rs[256] = {};               // render states, by D3DRENDERSTATETYPE
     bool rs_set[256] = {};
     // Changes whenever sampler_state, rs or rs_set may have: a draw passes it
     // on so the host can skip copying state it already holds. 0: unknown.
@@ -130,6 +133,11 @@ struct D9Pipeline {
         }
     }
 };
+// Never repeats and never returns 0.
+inline uint64_t d9_const_serial() {
+    static uint64_t serial = 0;
+    return ++serial;
+}
 
 // The record for one device, created on first use and kept for its lifetime.
 D9Pipeline &d9_pipeline(uint32_t device_id);

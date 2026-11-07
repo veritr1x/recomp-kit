@@ -64,8 +64,14 @@ addToLibrary({
           if (name !== key) await root.removeEntry(name, { recursive: true }).catch(() => {});
         disk = await root.getDirectoryHandle(key, { create: true });
         for await (const [name, handle] of disk.entries())
-          if (handle.kind === 'file' && !name.endsWith('.part')) onDisk.add(name);
+          if (name === 'base.txt') continue;
+          else if (handle.kind === 'file' && !name.endsWith('.part')) onDisk.add(name);
           else await disk.removeEntry(name).catch(() => {});
+        // Which installation this cache holds, so the launcher can delete it
+        // with that game's data.
+        const marker = await (await disk.getFileHandle('base.txt', { create: true })).createWritable();
+        await marker.write(base);
+        await marker.close();
       } catch (error) {
         disk = null;
         console.warn('[stream] persistent cache unavailable:', error.message || error);

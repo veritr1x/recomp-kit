@@ -2860,6 +2860,20 @@ void sched_run_others_locked(size_t me, const char *why) {
             sched_wait_locked(me, 0.0, HOST_IDLE_MAX_SLICE);
             continue;
         }
+        // Where a worker's timed wait wakes on the OS timer tick (a browser
+        // on Windows: about 15.6 ms), the main thread does the idle waiting:
+        // its host waiter sleeps precisely, and hands the baton back by
+        // notification, which is immediate. A worker holding the baton here
+        // used to sit through a whole tick past the main thread's deadline,
+        // so the game's frame limiter overslept by several milliseconds.
+        if (me != 0 && g_idle_waiter && os_timed_waits_are_coarse() && !threads()[0]->finished) {
+            g_baton = 0;
+            record_handoff_locked(me, 0, "idle wait");
+            sched_notify_baton_locked();
+            while (g_baton != me)
+                sched_wait_locked(me, 0.0, HOST_IDLE_BATON_SLICE);
+            continue;
+        }
         // Sleep exactly as far as the earliest deadline, no further and no
         // rounding: a guest that asks for Sleep(1) has to wake in about a
         // millisecond, not on the next tick of some coarser poll.
@@ -3093,14 +3107,29 @@ void sched_atomic_unwind_to_esp(uint32_t esp) {
 
 // Whether this checkpoint reads the clock to see if the slice is over. A
 // browser clock read is a call out to JS that costs about a microsecond, and a
-// race makes over ten thousand import calls a frame: reading it on every one
-// took a third of the game thread. Imports come microseconds apart, so every
-// 32nd call keeps slices close to SCHED_SLICE_SECONDS; a forced checkpoint
-// still yields at once.
+// race makes tens of thousands of import calls a frame: reading it on every
+// one took a third of the game thread. The stride adapts so the clock is read
+// about every 100 microseconds, far inside SCHED_SLICE_SECONDS: it doubles
+// while calls come faster than that (up to 1024) and drops back to 8 as soon
+// as a gap is long, so a guest that slows down still yields on time. A forced
+// checkpoint yields at once.
 static bool slice_clock_due() {
     static const bool costly = os_monotonic_is_costly() != 0;
-    static __thread unsigned t_calls;
-    return !costly || (++t_calls & 31) == 0;
+    if (!costly)
+        return true;
+    static __thread unsigned t_calls, t_stride = 8;
+    static __thread uint64_t t_last;
+    if (++t_calls < t_stride)
+        return false;
+    t_calls = 0;
+    const uint64_t now = os_monotonic_ns();
+    const uint64_t gap = now - t_last;
+    t_last = now;
+    if (gap < 100000 && t_stride < 1024)
+        t_stride *= 2;
+    else if (gap > 400000)
+        t_stride = 8;
+    return true;
 }
 
 static void scheduling_checkpoint(bool force) {

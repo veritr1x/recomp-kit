@@ -81,18 +81,23 @@ async function start() {
     print: (t) => record(t, false),
     printErr: (t) => record(t, true),
     setStatus: (t) => status(t ? t : ""),
-    onAbort: (what) => status(`The game stopped: ${what}`, true),
+    onAbort: (what) => status(`${document.title} has crashed: ${what}`, true),
     // The game's thread ended. Quitting from the game's own menu returns to
-    // the launcher; a game that could not start says why.
+    // the launcher; a game that stopped any other way says so and stays on
+    // this page with the last error it logged: "could not start" before its
+    // window was shown, "has crashed" after.
     onGameExit(code) {
       if (code === 0) {
-        status("The game has quit. Returning to the launcher…");
+        status("The game has quit. Returning to the launcherâ€¦");
         location.assign("../");
         return;
       }
-      const last = [...log].reverse().find((t) => /failed|could not|unavailable|missing|error/i.test(t));
+      const last = [...log].reverse().find((t) => /failed|could not|unavailable|missing|error|fatal/i.test(t) && !/run record/.test(t));
+      const started = log.some((t) => /window [0-9a-f]+ shown/.test(t));
       if (!statusEl.querySelector("a"))
-        status(`The game could not start${last ? `: ${last}` : "."}`, true);
+        status(started
+          ? `${document.title} has crashed (exit code ${code})${last ? `: ${last}` : "."}`
+          : `The game could not start${last ? `: ${last}` : "."}`, true);
     },
     preRun: [() => {
       const m = Module;
@@ -132,7 +137,7 @@ if (typeof BroadcastChannel === "function") {
       downloading = data.waiting;
       if (downloading) {
         streamEl.hidden = false;
-        streamEl.textContent = `Downloading game data… ${(data.rate / 1e6).toFixed(1)} MB/s`;
+        streamEl.textContent = `Downloading game dataâ€¦ ${(data.rate / 1e6).toFixed(1)} MB/s`;
       } else {
         streamEl.hidden = !saved;
         streamEl.textContent = saved;

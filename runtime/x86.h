@@ -548,6 +548,9 @@ extern const int recomp_resumable_stacks;
 extern uint32_t recomp_frame_watch;
 void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, uint32_t after);
 extern const int recomp_profile_enabled;
+/* Nonzero while profiling or the frame watch is on: a translated call then
+ * takes the out-of-line path (the generated call_slow) that handles both. */
+extern uint32_t recomp_slow_calls;
 void recomp_profile_push(uint32_t index);
 void recomp_profile_pop(void);
 

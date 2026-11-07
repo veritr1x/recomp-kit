@@ -340,6 +340,9 @@ struct FxState {
     mutable uint64_t pres_stamp = 0;
     mutable float pres_result = 0.0f;
     mutable bool pres_ok = false;
+    // The effect's parameter indices for this preshader (a node in
+    // fx.ctab_params, which never moves): checked on every pass.
+    mutable const std::vector<int32_t> *pres_params = nullptr;
     uint32_t object() const {
         return value.size() >= 4 ? (uint32_t)(value[0] | value[1] << 8 | value[2] << 16 |
                                               (uint32_t)value[3] << 24)
@@ -355,6 +358,9 @@ struct FxParam {
     std::vector<uint32_t> annotations; // indices into FxEffect::annotations
     bool shared = false;               // D3DX_PARAMETER_SHARED: one value across the effect pool
     uint64_t stamp = 0;                // g_param_stamp at the last write
+    // A sampler's texture parameter, resolved once from its texture state's
+    // object name (fixed when the effect is parsed): -2 unresolved, -1 none.
+    mutable int32_t sampler_tex_param = -2;
 };
 // Counts parameter writes, so a result computed from parameters can tell
 // whether any of them changed.
@@ -399,6 +405,14 @@ struct FxEffect {
     // its constant table entries (-1: none).
     std::unordered_map<std::string, uint32_t> param_index;
     std::unordered_map<uint64_t, std::vector<int32_t>> ctab_params;
+    // For each program, what the last bind left in the registers: the
+    // register file's serial after it, and g_param_stamp then. While the
+    // serial still matches, a constant whose parameter is no older than that
+    // stamp already holds its value.
+    struct ConstBind {
+        uint64_t serial = 0, stamp = 0;
+    };
+    std::unordered_map<uint64_t, ConstBind> const_binds;
     // Shared parameters: for each parameter index, the same parameter in the
     // other effects of the pool, valid while pool_generation matches.
     std::unordered_map<uint32_t, std::vector<struct FxParam *>> peers;
@@ -902,27 +916,39 @@ static FxParam *param_named(FxEffect &fx, const std::string &name) {
 
 // The texture a sampler parameter reads, through the name its texture state
 // carries.
+// Every draw asks, so the name is resolved to a parameter index once.
 static uint32_t sampler_texture(FxEffect &fx, const FxParam &sampler) {
-    for (const FxState &s : sampler.sampler)
-        if (s.op == FXS_SAMPLER_TEXTURE) {
-            auto it = fx.objects.find(s.object());
-            if (it == fx.objects.end() || it->second.param.empty())
-                continue;
-            if (FxParam *tex = param_named(fx, it->second.param))
-                return tex->texture;
-        }
-    return 0;
+    if (sampler.sampler_tex_param == -2) {
+        sampler.sampler_tex_param = -1;
+        for (const FxState &s : sampler.sampler)
+            if (s.op == FXS_SAMPLER_TEXTURE) {
+                auto it = fx.objects.find(s.object());
+                if (it == fx.objects.end() || it->second.param.empty())
+                    continue;
+                const int32_t i = param_index_of(fx, it->second.param);
+                if (i >= 0) {
+                    sampler.sampler_tex_param = i;
+                    break;
+                }
+            }
+    }
+    return sampler.sampler_tex_param < 0 ? 0 : fx.params[(size_t)sampler.sampler_tex_param].texture;
 }
 
 struct D9Pipeline;
 static void apply_state(FxEffect &fx, D9Pipeline &pl, const FxState &s, uint32_t sampler_stage);
 
 static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, float (*reg)[4],
-                               uint32_t limit, D9Pipeline &pl, uint32_t *missing,
-                               uint64_t key = 0) {
+                               uint32_t limit, D9Pipeline &pl, uint32_t *missing, uint64_t key,
+                               uint64_t &serial) {
     uint32_t bound = 0;
     if (!key)
         key = d9sh::code_key(code.data(), code.size());
+    // Every draw rebinds; a parameter nobody has written since this program's
+    // last bind, into registers nobody else has written since, is skipped.
+    FxEffect::ConstBind &last = fx.const_binds[key];
+    const bool intact = last.serial != 0 && last.serial == serial;
+    const uint64_t since = intact ? last.stamp : 0;
     const std::vector<CtabConst> &table = ctab_of(code, key);
     std::vector<int32_t> &resolved = fx.ctab_params[key];
     if (resolved.size() != table.size()) {
@@ -951,6 +977,26 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
             continue;
         }
         ++bound;
+        if (intact && p->stamp <= since)
+            continue; // the registers already hold this value
+        // Every draw rebinds these, so the element reads are hoisted out of
+        // the loops: one type test and one bounds value per constant, not a
+        // call per float.
+        const uint32_t slots = param_slots(*p);
+        const bool is_float = p->t.type == FXT_FLOAT;
+        const uint8_t *raw = p->value.data();
+        auto get = [&](uint32_t i) -> float {
+            if (i >= slots)
+                return 0.0f;
+            if (is_float) {
+                float f;
+                memcpy(&f, raw + 4 * i, 4);
+                return f;
+            }
+            int32_t v;
+            memcpy(&v, raw + 4 * i, 4);
+            return (float)v;
+        };
         if (c.cls == FXC_MATRIX_ROWS || c.cls == FXC_MATRIX_COLUMNS) {
             uint32_t pr = p->t.rows ? p->t.rows : 1, pc = p->t.cols ? p->t.cols : 1;
             for (uint32_t r = 0; r < c.count && c.index + r < limit; ++r) {
@@ -961,23 +1007,23 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
                 for (uint32_t k = 0; k < 4; ++k) {
                     uint32_t row = c.cls == FXC_MATRIX_COLUMNS ? k : line;
                     uint32_t col = c.cls == FXC_MATRIX_COLUMNS ? line : k;
-                    reg[c.index + r][k] = (row < pr && col < pc)
-                                              ? param_get_float(*p, el * pr * pc + row * pc + col)
-                                              : 0.0f;
+                    reg[c.index + r][k] =
+                        (row < pr && col < pc) ? get(el * pr * pc + row * pc + col) : 0.0f;
                 }
             }
         } else {
             // Each element of a scalar or vector starts a new register.
-            uint32_t n = param_slots(*p);
             uint32_t per = (p->t.rows ? p->t.rows : 1) * (p->t.cols ? p->t.cols : 1);
             if (per > 4)
                 per = 4;
             for (uint32_t r = 0; r < c.count && c.index + r < limit; ++r)
                 for (uint32_t k = 0; k < 4; ++k)
-                    reg[c.index + r][k] =
-                        (k < per && r * per + k < n) ? param_get_float(*p, r * per + k) : 0.0f;
+                    reg[c.index + r][k] = k < per ? get(r * per + k) : 0.0f;
         }
     }
+    serial = d9_const_serial();
+    last.serial = serial;
+    last.stamp = g_param_stamp;
     return bound;
 }
 
@@ -1041,7 +1087,8 @@ static bool pres_eval(FxEffect &fx, D9Pipeline &pl, const std::vector<uint8_t> &
     // and bind_constants writes every one of those.
     static float in[256][4];
     uint32_t missing = 0;
-    bind_constants(fx, b, in, 256, pl, &missing, key);
+    uint64_t fresh = 0; // `in` is shared by every preshader: always write it whole
+    bind_constants(fx, b, in, 256, pl, &missing, key, fresh);
     double out[64] = {}, temp[64] = {};
     const uint8_t *w = b.data() + code_at;
     size_t nw = code_words, pc = 0;
@@ -1155,10 +1202,14 @@ static bool state_preshader(FxEffect &fx, D9Pipeline &pl, const FxState &s, floa
     if (!s.preshader_key)
         s.preshader_key = d9sh::code_key(s.preshader.data(), s.preshader.size());
     if (s.pres_effect == fx.self && s.pres_stamp) {
-        auto it = fx.ctab_params.find(s.preshader_key);
-        bool fresh = it != fx.ctab_params.end();
+        if (!s.pres_params) {
+            auto it = fx.ctab_params.find(s.preshader_key);
+            if (it != fx.ctab_params.end())
+                s.pres_params = &it->second;
+        }
+        bool fresh = s.pres_params != nullptr;
         if (fresh)
-            for (int32_t i : it->second)
+            for (int32_t i : *s.pres_params)
                 if (i >= 0 && fx.params[(size_t)i].stamp > s.pres_stamp) {
                     fresh = false;
                     break;
@@ -1169,6 +1220,8 @@ static bool state_preshader(FxEffect &fx, D9Pipeline &pl, const FxState &s, floa
         }
     }
     s.pres_ok = pres_eval(fx, pl, s.preshader, &s.pres_result, s.preshader_key);
+    if (s.pres_effect != fx.self)
+        s.pres_params = nullptr; // another effect's table
     s.pres_effect = fx.self;
     s.pres_stamp = g_param_stamp;
     *f = s.pres_result;
@@ -1274,8 +1327,10 @@ static void apply_pass(FxEffect &fx) {
                     pl.sampler_tex[s.index] = tex->texture;
         }
     uint32_t missing = 0;
-    uint32_t bound = bind_constants(fx, pl.vs.vec(), pl.vconst, 256, pl, &missing, pl.vs_key);
-    bound += bind_constants(fx, pl.ps.vec(), pl.pconst, 32, pl, &missing, pl.ps_key);
+    uint32_t bound =
+        bind_constants(fx, pl.vs.vec(), pl.vconst, 256, pl, &missing, pl.vs_key, pl.vconst_serial);
+    bound +=
+        bind_constants(fx, pl.ps.vec(), pl.pconst, 32, pl, &missing, pl.ps_key, pl.pconst_serial);
     static uint32_t reported = 0;
     if (++reported <= 16) {
         char samplers[160] = "";

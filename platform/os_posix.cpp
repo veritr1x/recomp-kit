@@ -464,6 +464,13 @@ int os_monotonic_is_costly(void) {
     return 0;
 #endif
 }
+int os_timed_waits_are_coarse(void) {
+#ifdef __EMSCRIPTEN__
+    return 1;
+#else
+    return 0;
+#endif
+}
 int os_localtime(int64_t seconds, struct tm *out) {
     time_t t = (time_t)seconds;
     return localtime_r(&t, out) ? 0 : -1;
@@ -497,12 +504,45 @@ uint64_t os_wall_time_us(void) {
     gettimeofday(&tv, nullptr);
     return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
 }
+#ifdef __EMSCRIPTEN__
+// A browser worker's timed wait (Atomics.wait under nanosleep) wakes on the
+// OS timer. On Windows that is the 15.6 ms system tick unless the browser has
+// raised the resolution, so a 2 ms sleep took about 13 ms: Most Wanted's 120 Hz
+// frame limiter sleeps a few milliseconds every frame and lost most of a frame
+// each time, unevenly. Each thread learns how late its waits wake (rising at
+// once, decaying slowly), lets the timer cover only the part that cannot
+// overshoot the deadline, and spins on the high-resolution clock for the
+// rest. Where timers are precise the learned lateness is small and almost
+// nothing is spun.
+void os_sleep_us(uint64_t us) {
+    static thread_local double late_ms = 16.0;
+    const double end = emscripten_get_now() + (double)us / 1000.0;
+    double left = end - emscripten_get_now();
+    if (left > late_ms + 0.5) {
+        const double ask = left - late_ms - 0.5;
+        const double before = emscripten_get_now();
+        struct timespec ts;
+        ts.tv_sec = (time_t)(ask / 1000.0);
+        ts.tv_nsec = (long)((ask - (double)ts.tv_sec * 1000.0) * 1e6);
+        nanosleep(&ts, nullptr);
+        const double over = emscripten_get_now() - before - ask;
+        late_ms = over > late_ms ? over : late_ms * 0.95 + (over > 0 ? over : 0) * 0.05;
+        if (late_ms < 0.25)
+            late_ms = 0.25;
+        if (late_ms > 20.0)
+            late_ms = 20.0;
+    }
+    while (emscripten_get_now() < end) {
+    }
+}
+#else
 void os_sleep_us(uint64_t us) {
     struct timespec ts;
     ts.tv_sec = (time_t)(us / 1000000ull);
     ts.tv_nsec = (long)((us % 1000000ull) * 1000ull);
     nanosleep(&ts, nullptr);
 }
+#endif
 
 int os_strcasecmp(const char *a, const char *b) {
     return strcasecmp(a, b);

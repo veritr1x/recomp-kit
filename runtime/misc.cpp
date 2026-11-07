@@ -1061,6 +1061,53 @@ void w_gethostbyname(X86 *c) {
              gm_str(arg(c, 0), 256).c_str());
     set_eax(c, 0);
 }
+// -------------------------------------------------------------------------
+// WS2_32: Winsock is present and the network is down. A browser has no raw
+// sockets, and a "success" of 0 from every call made Most Wanted's LAN Play
+// wait on events nothing would signal (the game froze for 15-20 s). Every
+// socket operation fails with WSAENETDOWN, as Windows does with no network.
+// -------------------------------------------------------------------------
+namespace {
+constexpr uint32_t WSAENETDOWN_ = 10050, WSAHOST_NOT_FOUND_ = 11001;
+constexpr uint32_t INVALID_SOCKET_ = 0xffffffffu, SOCKET_ERROR_ = 0xffffffffu;
+thread_local uint32_t t_wsa_error = 0;
+void ws2_fail(X86 *c, uint32_t result, uint32_t error = WSAENETDOWN_) {
+    static bool told = false;
+    if (!told) {
+        told = true;
+        log_msg(1, "WS2_32: networking is not available here; socket calls report WSAENETDOWN");
+    }
+    t_wsa_error = error;
+    set_eax(c, result);
+}
+} // namespace
+void s_WSAGetLastError(X86 *c) {
+    set_eax(c, t_wsa_error);
+}
+void s_socket_down(X86 *c) {
+    ws2_fail(c, INVALID_SOCKET_); // socket, accept
+}
+void s_socket_error(X86 *c) {
+    ws2_fail(c, SOCKET_ERROR_); // bind, connect, send, recv, select, setsockopt, ...
+}
+void s_false(X86 *c) {
+    ws2_fail(c, 0); // WSACreateEvent (WSA_INVALID_EVENT), WSASetEvent, WSAGetOverlappedResult, ...
+}
+void s_WSAWaitForMultipleEvents(X86 *c) {
+    ws2_fail(c, 0xffffffffu); // WSA_WAIT_FAILED
+}
+void s_gethostbyname(X86 *c) {
+    ws2_fail(c, 0, WSAHOST_NOT_FOUND_);
+}
+// (PNCB): no adapter. NRC_BRIDGE: the LAN adapter number is not valid. The
+// result is returned and stored in ncb_retcode, as Netbios does.
+void s_Netbios(X86 *c) {
+    const uint32_t ncb = arg(c, 0);
+    if (ncb && gm_valid(ncb, 2))
+        wr8(ncb + 1, 0x23);
+    set_eax(c, 0x23);
+}
+
 void w_inet_ntoa(X86 *c) {
     // The returned pointer is reused across calls, as the real inet_ntoa does.
     // heap_owns re-checks it because mem_init() invalidates the whole heap.
@@ -2283,39 +2330,63 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "waveInStop", 1, nullptr},
     {"WINMM.dll", "waveInReset", 1, nullptr},
     {"WINMM.dll", "waveInGetPosition", 3, nullptr},
-    // Winsock 2: networking is out of scope, but the pop counts are not.
-    {"WS2_32.dll", "WSAStartup", 2, nullptr},
-    {"WS2_32.dll", "WSACleanup", 0, nullptr},
-    {"WS2_32.dll", "WSAGetLastError", 0, nullptr},
-    {"WS2_32.dll", "WSAIoctl", 9, nullptr},
-    {"WS2_32.dll", "WSACreateEvent", 0, nullptr},
-    {"WS2_32.dll", "WSACloseEvent", 1, nullptr},
-    {"WS2_32.dll", "WSASetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAResetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, nullptr},
-    {"WS2_32.dll", "WSARecv", 7, nullptr},
-    {"WS2_32.dll", "WSARecvFrom", 9, nullptr},
-    {"WS2_32.dll", "WSAGetOverlappedResult", 5, nullptr},
-    {"WS2_32.dll", "socket", 3, nullptr},
-    {"WS2_32.dll", "bind", 3, nullptr},
-    {"WS2_32.dll", "connect", 3, nullptr},
-    {"WS2_32.dll", "listen", 2, nullptr},
-    {"WS2_32.dll", "accept", 3, nullptr},
-    {"WS2_32.dll", "send", 4, nullptr},
-    {"WS2_32.dll", "recv", 4, nullptr},
-    {"WS2_32.dll", "sendto", 6, nullptr},
-    {"WS2_32.dll", "recvfrom", 6, nullptr},
-    {"WS2_32.dll", "select", 5, nullptr},
-    {"WS2_32.dll", "shutdown", 2, nullptr},
-    {"WS2_32.dll", "closesocket", 1, nullptr},
-    {"WS2_32.dll", "ioctlsocket", 3, nullptr},
-    {"WS2_32.dll", "getsockopt", 5, nullptr},
-    {"WS2_32.dll", "setsockopt", 5, nullptr},
-    {"WS2_32.dll", "getpeername", 3, nullptr},
-    {"WS2_32.dll", "getsockname", 3, nullptr},
-    {"WS2_32.dll", "gethostbyname", 1, nullptr},
-    {"WS2_32.dll", "gethostname", 2, nullptr},
-    {"NETAPI32.dll", "Netbios", 1, nullptr},
+    // Winsock 2: present, with the network down (see s_socket_error). Like
+    // WSOCK32 above, each export is listed under its name and, where speed.exe
+    // imports it that way, under the WS2_32 ordinal its IAT uses.
+    {"WS2_32.dll", "WSAStartup", 2, w_WSAStartup},
+    {"WS2_32.dll", "ord115", 2, w_WSAStartup},
+    {"WS2_32.dll", "WSACleanup", 0, w_WSACleanup},
+    {"WS2_32.dll", "ord116", 0, w_WSACleanup},
+    {"WS2_32.dll", "WSAGetLastError", 0, s_WSAGetLastError},
+    {"WS2_32.dll", "ord111", 0, s_WSAGetLastError},
+    {"WS2_32.dll", "WSAIoctl", 9, s_socket_error},
+    {"WS2_32.dll", "WSACreateEvent", 0, s_false},
+    {"WS2_32.dll", "WSACloseEvent", 1, s_false},
+    {"WS2_32.dll", "WSASetEvent", 1, s_false},
+    {"WS2_32.dll", "WSAResetEvent", 1, s_false},
+    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, s_WSAWaitForMultipleEvents},
+    {"WS2_32.dll", "WSARecv", 7, s_socket_error},
+    {"WS2_32.dll", "WSARecvFrom", 9, s_socket_error},
+    {"WS2_32.dll", "WSAGetOverlappedResult", 5, s_false},
+    {"WS2_32.dll", "socket", 3, s_socket_down},
+    {"WS2_32.dll", "ord23", 3, s_socket_down},
+    {"WS2_32.dll", "bind", 3, s_socket_error},
+    {"WS2_32.dll", "ord2", 3, s_socket_error},
+    {"WS2_32.dll", "connect", 3, s_socket_error},
+    {"WS2_32.dll", "ord4", 3, s_socket_error},
+    {"WS2_32.dll", "listen", 2, s_socket_error},
+    {"WS2_32.dll", "ord13", 2, s_socket_error},
+    {"WS2_32.dll", "accept", 3, s_socket_down},
+    {"WS2_32.dll", "ord1", 3, s_socket_down},
+    {"WS2_32.dll", "send", 4, s_socket_error},
+    {"WS2_32.dll", "ord19", 4, s_socket_error},
+    {"WS2_32.dll", "recv", 4, s_socket_error},
+    {"WS2_32.dll", "ord16", 4, s_socket_error},
+    {"WS2_32.dll", "sendto", 6, s_socket_error},
+    {"WS2_32.dll", "ord20", 6, s_socket_error},
+    {"WS2_32.dll", "recvfrom", 6, s_socket_error},
+    {"WS2_32.dll", "ord17", 6, s_socket_error},
+    {"WS2_32.dll", "select", 5, s_socket_error},
+    {"WS2_32.dll", "ord18", 5, s_socket_error},
+    {"WS2_32.dll", "shutdown", 2, s_socket_error},
+    {"WS2_32.dll", "ord22", 2, s_socket_error},
+    {"WS2_32.dll", "closesocket", 1, s_socket_error},
+    {"WS2_32.dll", "ord3", 1, s_socket_error},
+    {"WS2_32.dll", "ioctlsocket", 3, s_socket_error},
+    {"WS2_32.dll", "ord10", 3, s_socket_error},
+    {"WS2_32.dll", "getsockopt", 5, s_socket_error},
+    {"WS2_32.dll", "ord7", 5, s_socket_error},
+    {"WS2_32.dll", "setsockopt", 5, s_socket_error},
+    {"WS2_32.dll", "ord21", 5, s_socket_error},
+    {"WS2_32.dll", "getpeername", 3, s_socket_error},
+    {"WS2_32.dll", "ord5", 3, s_socket_error},
+    {"WS2_32.dll", "getsockname", 3, s_socket_error},
+    {"WS2_32.dll", "ord6", 3, s_socket_error},
+    {"WS2_32.dll", "gethostbyname", 1, s_gethostbyname},
+    {"WS2_32.dll", "ord52", 1, s_gethostbyname},
+    {"WS2_32.dll", "gethostname", 2, w_gethostname},
+    {"WS2_32.dll", "ord57", 2, w_gethostname},
+    {"NETAPI32.dll", "Netbios", 1, s_Netbios},
     {"DDRAW.dll", "DirectDrawCreate", 3, nullptr},
     {"DDRAW.dll", "DirectDrawEnumerateA", 2, nullptr},
     {"DINPUT.dll", "DirectInputCreateA", 4, nullptr},

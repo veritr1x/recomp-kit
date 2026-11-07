@@ -26,6 +26,8 @@ uint8_t *g_mem = nullptr;
 // say. Armed from RECOMP_WATCH=<hex address>[:<length>], default length 4.
 // ---------------------------------------------------------------------------
 uint32_t recomp_frame_watch = 0;
+// Constant-initialised, so each switch's static initialiser can only add to it.
+uint32_t recomp_slow_calls = 0;
 
 uint32_t g_watch_base = 0;
 uint32_t g_watch_len = 0;
@@ -36,6 +38,8 @@ namespace {
 struct WatchArm {
     WatchArm() {
         recomp_frame_watch = recomp_env("WATCH_FRAME") ? 1u : 0u;
+        if (recomp_frame_watch)
+            recomp_slow_calls = 1;
         const char *s = recomp_env("WATCH");
         if (!s || !*s)
             return;

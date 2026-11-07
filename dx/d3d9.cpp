@@ -21,6 +21,7 @@
 #include "d3d9_api.h"
 #include "d3d8_program.h"
 #include "host_d9.h"
+#include <deque>
 #include <unordered_map>
 #include <map>
 
@@ -1064,8 +1065,32 @@ struct GpuMirror {
     std::vector<uint8_t> gpu_newer;      // by slot
     uint32_t dirty_lo = 0, dirty_hi = 0; // buffers: the changed byte range
 };
-static std::unordered_map<uint32_t, GpuMirror> &gpu_mirrors() {
-    static auto *m = new std::unordered_map<uint32_t, GpuMirror>();
+// Mirrors by COM id. Ids are small and dense, and draws look mirrors up many
+// times a frame, so this is an indexed table rather than a hash map. A deque
+// keeps every reference valid while the table grows, as the map did.
+struct GpuMirrorTable {
+    std::deque<GpuMirror> slots;
+    std::vector<uint8_t> present;
+    GpuMirror &operator[](uint32_t id) {
+        while (slots.size() <= id) {
+            slots.emplace_back();
+            present.push_back(0);
+        }
+        present[id] = 1;
+        return slots[id];
+    }
+    GpuMirror *find(uint32_t id) {
+        return id < slots.size() && present[id] ? &slots[id] : nullptr;
+    }
+    void erase(uint32_t id) {
+        if (id < slots.size()) {
+            slots[id] = GpuMirror{};
+            present[id] = 0;
+        }
+    }
+};
+static GpuMirrorTable &gpu_mirrors() {
+    static auto *m = new GpuMirrorTable();
     return *m;
 }
 // D3DUSAGE of every texture and surface, by id.
@@ -1184,11 +1209,10 @@ static void gpu_before_lock(ComObj *s) {
         return;
     uint32_t slot;
     uint32_t id = mirror_slot(s, &slot);
-    auto it = gpu_mirrors().find(id);
-    if (it == gpu_mirrors().end() || slot >= it->second.gpu_newer.size() ||
-        !it->second.gpu_newer[slot])
+    GpuMirror *it = gpu_mirrors().find(id);
+    if (!it || slot >= it->gpu_newer.size() || !it->gpu_newer[slot])
         return;
-    it->second.gpu_newer[slot] = 0;
+    it->gpu_newer[slot] = 0;
     if (s->bpp == 32 && !s->blob.empty()) {
         HostD9Surface r = surface_ref(s);
         host_d9_texture_read(id, r.face, r.level, s->blob.data(), s->pitch);
@@ -1212,11 +1236,11 @@ static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi) {
     }
     uint32_t slot;
     uint32_t id = mirror_slot(o, &slot);
-    auto it = gpu_mirrors().find(id);
-    if (it == gpu_mirrors().end())
+    GpuMirror *it = gpu_mirrors().find(id);
+    if (!it)
         return; // not mirrored yet: its first use uploads everything
-    if (slot < it->second.cpu_dirty.size())
-        it->second.cpu_dirty[slot] = 1;
+    if (slot < it->cpu_dirty.size())
+        it->cpu_dirty[slot] = 1;
 }
 static void gpu_drawn_into(ComObj *s) {
     if (!s)
@@ -1249,13 +1273,12 @@ static void gpu_sync_buffer(ComObj *b) {
     m.dirty_lo = m.dirty_hi = 0;
 }
 static void gpu_forget(ComObj *o) {
-    auto it = gpu_mirrors().find(o->id);
-    if (it != gpu_mirrors().end()) {
+    if (GpuMirror *it = gpu_mirrors().find(o->id)) {
         if (o->kind == K_D3D9VB || o->kind == K_D3D9IB)
             host_d9_buffer_drop(o->id);
-        else if (it->second.defined)
+        else if (it->defined)
             host_d9_texture_drop(o->id);
-        gpu_mirrors().erase(it);
+        gpu_mirrors().erase(o->id);
     }
     resource_usage().erase(o->id);
 }
@@ -2747,14 +2770,20 @@ static void write_registers(float (*table)[4], uint32_t limit, uint32_t start, u
 // (this, StartRegister, pConstantData, Vector4fCount)
 void Dev_SetVertexShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (dev)
-        write_registers(d9_pipeline(dev->id).vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3));
+    if (dev) {
+        D9Pipeline &pl = d9_pipeline(dev->id);
+        write_registers(pl.vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3));
+        pl.vconst_serial = d9_const_serial();
+    }
     com_ret(c, D3D_OK9);
 }
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (dev)
-        write_registers(d9_pipeline(dev->id).pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3));
+    if (dev) {
+        D9Pipeline &pl = d9_pipeline(dev->id);
+        write_registers(pl.pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3));
+        pl.pconst_serial = d9_const_serial();
+    }
     com_ret(c, D3D_OK9);
 }
 

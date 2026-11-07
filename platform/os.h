@@ -161,6 +161,10 @@ uint64_t os_monotonic_ns(void); // never goes backwards; arbitrary origin
 // Nonzero where reading that clock is costly next to a guest import call (a
 // call out to the browser on the web), so hot paths should read it sparingly.
 int os_monotonic_is_costly(void);
+// Nonzero where a timed wait on a condition variable or futex can wake a whole
+// OS timer tick late (a browser worker on Windows: about 15.6 ms) while
+// os_sleep_us does not, so precise waiting should go through os_sleep_us.
+int os_timed_waits_are_coarse(void);
 // Broken-down local and UTC time for a Unix timestamp; 0 or -1.
 int os_localtime(int64_t seconds, struct tm *out);
 int os_gmtime(int64_t seconds, struct tm *out);
