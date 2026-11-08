@@ -19,10 +19,12 @@
 #include "../../platform/os.h"
 #include "../d3d_render.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -107,6 +109,7 @@ enum class Op : uint8_t {
     QueryBegin,
     QueryEnd,
     QueryDrop,
+    Present, // a = back buffer, b = width, c = height (the pumped queue)
     Probe,
     Call
 };
@@ -118,6 +121,9 @@ struct Command {
     uint32_t a = 0, b = 0, c = 0, d = 0;
     size_t at = 0;       // payload offset in the batch's bytes
     size_t state_at = 0; // a draw's sampler and render states, in the bytes
+    // A draw's constant registers and label in the bytes: the constants may be an earlier
+    // draw's copy, and the label follows state tables only some draws append.
+    size_t vconst_at = 0, pconst_at = 0, label_at = 0;
     HostD9Draw draw{};
     HostD9TextureDesc desc{};
     HostD9Target target{};
@@ -169,10 +175,17 @@ struct Batch {
     // The last draw's state tables in `bytes`, reused while the version holds.
     uint64_t state_version = 0;
     size_t state_at = 0;
+    // The last copy of each constant register file in `bytes` (constants()).
+    struct Consts {
+        uint64_t serial = 0; // the registers' serial when copied; 0: not known to match
+        size_t at = 0;
+        uint32_t count = 0; // registers copied; 0: none
+    } vconst, pconst;
     void clear() {
         commands.clear();
         bytes.clear();
         state_version = 0;
+        vconst = pconst = Consts{};
     }
     size_t put(const void *p, size_t n) {
         return n ? bytes.append(p, n) : bytes.size();
@@ -188,6 +201,10 @@ class RenderThread {
         threaded_ = true;
         pumped_ = true; // the browser's main loop drains the queue
 #endif
+        // Presents the pumped queue may hold before the next one waits: 2, or
+        // RECOMP_D3D9_FRAMES_AHEAD (1-4).
+        if (const char *ahead = recomp_env("D3D9_FRAMES_AHEAD"); ahead && *ahead)
+            frames_ahead_ = (uint32_t)std::clamp(atoi(ahead), 1, 4);
         if (threaded_ && !pumped_)
             worker_ = std::thread([this] { run(); });
     }
@@ -216,9 +233,82 @@ class RenderThread {
         if (pumped_)
             return sync_on_pump(std::forward<F>(f));
         hand_over();
+        const uint64_t t0 = os_monotonic_ns();
         std::unique_lock<std::mutex> lock(m_);
         idle_cv_.wait(lock, [this] { return queue_.empty() && !busy_; });
+        ++stats_.syncs;
+        stats_.sync_ns += os_monotonic_ns() - t0;
         return f(); // the worker waits on m_ for new work, so it cannot run now
+    }
+
+    // The pumped queue's present: the game waits only while frames_ahead_ presents are
+    // still queued, not for this one, so its next frame runs while the browser's main thread
+    // encodes and presents this one. Waiting for its own present (the earlier behaviour, a
+    // full drain) held the game for every main-thread turn. Anything that needs an answer
+    // (a read, a query in step, a test's switch of device) still drains through sync().
+    void present_pipelined(uint32_t backbuffer, uint32_t w, uint32_t h) {
+        {
+            std::unique_lock<std::mutex> lock(m_);
+            idle_cv_.wait(lock, [this] { return presents_sent_ - presents_done_ < frames_ahead_; });
+            ++presents_sent_;
+        }
+        Command c{Op::Present};
+        c.a = backbuffer;
+        c.b = w;
+        c.c = h;
+        filling_->commands.push_back(c);
+        hand_over();
+    }
+    // The game's side of a present, either way: RECOMP_D3D9_STATS reports where the game
+    // thread waited for the renderer and what the constant bank saved, every 300 frames.
+    void count_present(uint64_t wait_ns) {
+        stats_.present_ns += wait_ns;
+        if (++stats_.frames < 300)
+            return;
+        static const bool on = recomp_env("D3D9_STATS") != nullptr;
+        if (on) {
+            const double f = (double)stats_.frames;
+            const uint64_t copies = stats_.const_copies + stats_.const_reuses;
+            fprintf(stderr,
+                    "d3d9 queue: per frame %.2f syncs (%.2f ms), %.2f ms waiting to present "
+                    "(%u frames ahead%s), constants %.0f KiB copied, %.0f%% of draws reused "
+                    "a copy\n",
+                    stats_.syncs / f, stats_.sync_ns / f / 1e6, stats_.present_ns / f / 1e6,
+                    pumped_ ? frames_ahead_ : 0u, pumped_ ? "" : ", in step",
+                    stats_.const_bytes / f / 1024.0,
+                    copies ? 100.0 * stats_.const_reuses / copies : 0.0);
+        }
+        stats_ = Stats{};
+    }
+    // Constants of one draw (host_d9_draw): their offset in the batch's bytes. The batch's
+    // last copy serves again when it holds at least these registers and they have not
+    // changed: the same serial, or, as the effect framework rebinds before every draw and
+    // takes a new serial each time, the same bytes. Each copy was up to 4 KiB a draw.
+    size_t constants(Batch::Consts &last, const float *regs, uint32_t count, uint64_t serial,
+                     bool bank) {
+        if (!regs || !count)
+            return 0;
+        Batch &b = *filling_;
+        const size_t bytes = (size_t)count * 16;
+        if (bank && last.count >= count) {
+            if (serial && serial == last.serial) {
+                ++stats_.const_reuses;
+                return last.at;
+            }
+            if (memcmp(b.bytes.data() + last.at, regs, bytes) == 0) {
+                // Only a whole match may take the serial: registers past `count` may differ.
+                if (count == last.count)
+                    last.serial = serial;
+                ++stats_.const_reuses;
+                return last.at;
+            }
+        }
+        last.at = b.put(regs, bytes);
+        last.count = count;
+        last.serial = serial;
+        ++stats_.const_copies;
+        stats_.const_bytes += bytes;
+        return last.at;
     }
 
     // The pumped queue: `f` runs on the pumping thread, after everything
@@ -240,8 +330,11 @@ class RenderThread {
         c.call = job;
         filling_->commands.push_back(c);
         hand_over();
+        const uint64_t t0 = os_monotonic_ns();
         std::unique_lock<std::mutex> lock(m_);
         idle_cv_.wait(lock, [this] { return queue_.empty() && !busy_; });
+        ++stats_.syncs;
+        stats_.sync_ns += os_monotonic_ns() - t0;
     }
 
 #ifdef __EMSCRIPTEN__
@@ -367,14 +460,14 @@ class RenderThread {
                     return p;
                 };
                 d.decl = take(d.decl_size);
-                d.vconst = (const float *)take(d.vconst_count * 16u);
-                d.pconst = (const float *)take(d.pconst_count * 16u);
                 d.inline_vertices = take(d.inline_bytes);
                 d.inline_indices = take(d.inline_index_bytes);
+                d.vconst = d.vconst_count ? (const float *)(base + cmd.vconst_at) : nullptr;
+                d.pconst = d.pconst_count ? (const float *)(base + cmd.pconst_at) : nullptr;
                 d.sampler_state = (const uint32_t *)(base + cmd.state_at);
                 d.render_state = (const uint32_t *)(base + cmd.state_at + 16 * 14 * 4);
                 d.render_state_set = base + cmd.state_at + 16 * 14 * 4 + 256 * 4;
-                d.label = cmd.a ? (const char *)take(cmd.a) : nullptr;
+                d.label = cmd.a ? (const char *)(base + cmd.label_at) : nullptr;
                 r_->draw(d);
                 break;
             }
@@ -412,6 +505,13 @@ class RenderThread {
                 r_->query_drop(cmd.a);
                 ending_.erase(cmd.a);
                 break;
+            case Op::Present: {
+                r_->present(cmd.a, cmd.b, cmd.c);
+                std::lock_guard<std::mutex> lock(m_);
+                ++presents_done_;
+                idle_cv_.notify_all();
+                break;
+            }
             case Op::Probe:
                 r_->probe_next(cmd.a ? (const char *)(base + cmd.at) : nullptr);
                 break;
@@ -504,6 +604,14 @@ class RenderThread {
     std::vector<std::unique_ptr<Batch>> spare_;
     std::unique_ptr<Batch> filling_ = std::make_unique<Batch>();
     bool busy_ = false;
+    uint64_t presents_sent_ = 0, presents_done_ = 0; // pipelined presents, under m_
+    uint32_t frames_ahead_ = 2;
+    // The game's side (count_present): waits for the renderer and constant copies.
+    struct Stats {
+        uint32_t frames = 0;
+        uint64_t syncs = 0, sync_ns = 0, present_ns = 0;
+        uint64_t const_copies = 0, const_reuses = 0, const_bytes = 0;
+    } stats_;
 };
 
 RenderThread *render_thread() {
@@ -642,12 +750,18 @@ void host_d9_draw(const HostD9Draw *draw) {
     c.op = Op::Draw;
     c.draw = *draw;
     predecode(c.draw);
+    c.draw.vconst_count = draw->vconst ? draw->vconst_count : 0;
+    c.draw.pconst_count = draw->pconst ? draw->pconst_count : 0;
+    // TEST ONLY (RECOMP_AB_PERIOD): the earlier phase copies every draw's constants. The
+    // phase is set on this (the game's) thread.
+    const bool bank = !recomp_ab::old(recomp_ab::CONSTBANK);
+    c.vconst_at =
+        t->constants(b.vconst, draw->vconst, c.draw.vconst_count, draw->vconst_serial, bank);
+    c.pconst_at =
+        t->constants(b.pconst, draw->pconst, c.draw.pconst_count, draw->pconst_serial, bank);
+    // The declaration and inline data stay together: the render thread takes them in turn.
     c.at = b.put(draw->decl, draw->decl ? draw->decl_size : 0);
     c.draw.decl_size = draw->decl ? draw->decl_size : 0;
-    b.put(draw->vconst, draw->vconst ? draw->vconst_count * 16u : 0);
-    c.draw.vconst_count = draw->vconst ? draw->vconst_count : 0;
-    b.put(draw->pconst, draw->pconst ? draw->pconst_count * 16u : 0);
-    c.draw.pconst_count = draw->pconst ? draw->pconst_count : 0;
     b.put(draw->inline_vertices, draw->inline_vertices ? draw->inline_bytes : 0);
     c.draw.inline_bytes = draw->inline_vertices ? draw->inline_bytes : 0;
     b.put(draw->inline_indices, draw->inline_indices ? draw->inline_index_bytes : 0);
@@ -664,7 +778,7 @@ void host_d9_draw(const HostD9Draw *draw) {
     c.state_at = b.state_at;
     if (draw->label) {
         size_t n = strlen(draw->label) + 1;
-        b.put(draw->label, n);
+        c.label_at = b.put(draw->label, n);
         c.a = (uint32_t)n;
     }
     // Programs are found by key on the render thread.
@@ -710,8 +824,18 @@ void host_d9_stretch(HostD9Surface src, const int32_t src_rect[4], HostD9Surface
 }
 void host_d9_present(uint32_t backbuffer, uint32_t width, uint32_t height) {
     recomp_ab::tick(); // TEST ONLY phase of an in-run A/B; nothing unless RECOMP_AB_PERIOD is set
-    if (RenderThread *t = render_thread())
+    RenderThread *t = render_thread();
+    if (!t)
+        return;
+    const uint64_t t0 = os_monotonic_ns();
+    // The earlier phase of an in-run A/B (PRESENT), and every host whose render thread is
+    // its own, wait for this frame's present. A sync after pipelined presents waits for
+    // them too, so switching phase mid-run keeps the order.
+    if (t->pumped() && !recomp_ab::old(recomp_ab::PRESENT))
+        t->present_pipelined(backbuffer, width, height);
+    else
         t->sync([&] { backend()->present(backbuffer, width, height); });
+    t->count_present(os_monotonic_ns() - t0);
 }
 int host_d9_read_presented(uint8_t *rgb, uint32_t cap, uint32_t *w, uint32_t *h) {
     RenderThread *t = render_thread();
@@ -753,6 +877,14 @@ bool host_d9_use_device_for_test(gpu::Device *device) {
     delete g_test_backend;
     g_test_backend = make_backend(device);
     return g_test_backend != nullptr;
+}
+bool host_d9_use_backend_for_test(D9Backend *b) {
+    if (g_test_backend)
+        if (RenderThread *t = render_thread())
+            t->sync([] {});
+    delete g_test_backend;
+    g_test_backend = b;
+    return b != nullptr;
 }
 void host_d9_probe_next_frame(const char *tag) {
     RenderThread *t = render_thread();

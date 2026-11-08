@@ -31,7 +31,10 @@ async function backend({length=40,chunk=8,known=true,range=true,short=false,badR
   const requests=[];
   let inFlight=0, failures=failFirst;
   const later=(fn,ms)=>ms>=10000?0:setTimeout(fn,ms);
-  const context={wasmFS$backends:{},HEAPU8:new Uint8Array(256),
+  const resident=[];
+  const context={wasmFS$backends:{},HEAPU8:new Uint8Array(256),resident,
+    _recomp_stream_resident:(path,start,end,size,on)=>resident.push([path,start,end,size,on]),
+    stringToUTF8OnStack:s=>s,withStackSave:fn=>fn(),
     __wasmfs_fetch_get_file_url:()=>`https://example.test/prefix/data//${name}`,
     UTF8ToString:p=>p,_recomp_web_stream_size:()=>known?length:-1,
     __wasmfs_fetch_get_chunk_size:()=>chunk,console:{error(){},warn(){},log(){}},
@@ -137,6 +140,44 @@ test("one read fetches all of its chunks at once and reads ahead",async()=>{
   assert.equal(await api.read(1,0,8,24),8);
   assert.deepEqual(context.HEAPU8.slice(0,8),bytes.slice(24,32));
   assert.equal(requests.filter(r=>r.range==="bytes=24-31").length,1, "read-ahead chunk was fetched again");
+});
+test("a prefetch hint fetches the named range's missing chunks once, by manifest name in any case",async()=>{
+  const text="recomp-stream-v1\n40\tTRACKS/STREAM L2.BUN\n12\tGAME.EXE\n";
+  const {api,context,requests}=await backend({name:"manifest.txt",known:false,chunk:8,
+                                              body:new TextEncoder().encode(text)});
+  assert.equal(context.recompStream.prefetch("tracks\\stream l2.bun",10,20),0,"hint before the manifest");
+  assert.equal(await api.read(1,0,64,0),text.length);
+  assert.equal(context.recompStream.prefetch("missing.bun",0,8),0);
+  assert.equal(context.recompStream.prefetch("tracks\\stream l2.bun",10,20),3);
+  assert.equal(context.recompStream.prefetch("TRACKS/STREAM L2.BUN",10,20),0,"queued twice");
+  assert.equal(context.recompStream.prefetch("TRACKS/STREAM L2.BUN",36,100),1,"clamped to the file");
+  await new Promise(r=>setTimeout(r,20));
+  const ranges=requests.filter(r=>r.url==="https://example.test/prefix/data/TRACKS/STREAM%20L2.BUN").map(r=>r.range);
+  assert.deepEqual(ranges.sort(),["bytes=16-23","bytes=24-31","bytes=32-39","bytes=8-15"]);
+});
+test("chunks entering and leaving memory are published to the runtime by manifest path",async()=>{
+  // One file whose bytes are the manifest itself, so every fetch serves it.
+  const head="recomp-stream-v1\n48\tTRACKS/A.BUN\n";
+  const text=head+"x".repeat(48-head.length);
+  const {api,context}=await backend({name:"manifest.txt",known:false,chunk:8,limit:24,
+                                     body:new TextEncoder().encode(text)});
+  assert.equal(await api.read(1,0,64,0),48);
+  assert.deepEqual(context.resident,[],"the manifest itself is not a cached chunk");
+  assert.equal(context.recompStream.prefetch("tracks/a.bun",0,48),6);
+  await new Promise(r=>setTimeout(r,30));
+  const on=context.resident.filter(r=>r[4]===1), off=context.resident.filter(r=>r[4]===0);
+  assert.equal(on.length,6);
+  assert.equal(off.length,3,"three chunks no longer fit in 24 bytes");
+  for(const [path,start,end,size] of context.resident){
+    assert.equal(path,"TRACKS/A.BUN");
+    assert.equal(size,48);
+    assert.equal(start%8,0);
+    assert.equal(end,start+8);
+  }
+  // Whatever stayed resident was published last as resident.
+  const last=new Map();
+  for(const [,start,,,state] of context.resident) last.set(start,state);
+  assert.equal([...last.values()].filter(v=>v===1).length,3);
 });
 test("a failed request is retried rather than failing the guest read",async()=>{
   const {api,context,bytes,requests}=await backend({length:12,failFirst:1,attempts:3});

@@ -72,7 +72,11 @@ std::string g_game_dir =
     std::string(RECOMP_DEVELOPER_EXE).substr(0, std::string(RECOMP_DEVELOPER_EXE).rfind('/'));
 std::string g_cur_dir = RECOMP_GUEST_ROOT;
 static std::string g_guest_exe_dir = RECOMP_GUEST_ROOT;
-uint32_t g_last_error = 0;
+// Per guest thread, as Windows keeps it in each TEB: every guest thread runs on a host thread
+// of its own, and with one shared value a thread switch between a failing call and its
+// GetLastError (or a thread running free beside the baton holder) read another thread's error
+// (HommaRe).
+__thread uint32_t g_last_error = 0;
 jmp_buf g_exit_jmp;
 bool g_exit_jmp_valid = false;
 bool g_exited = false;
@@ -851,8 +855,9 @@ void k_CreateFileA(X86 *c) {
 // thread while the calling guest thread waits on an event, so the other guest
 // threads keep running - as on Windows, where ReadFile blocks only its caller.
 // Holding the baton through a streamed read froze the whole game, drawing
-// included, for as long as the bytes took to arrive.
-int64_t file_read(int fd, uint8_t *dst, uint32_t n);
+// included, for as long as the bytes took to arrive. `o` names the file for
+// the residency check and the slow-read report.
+int64_t file_read(const HObj *o, uint8_t *dst, uint32_t n);
 
 void k_ReadFile(X86 *c) {
     HObj *o = handle_get(arg(c, 0), H_FILE);
@@ -873,7 +878,7 @@ void k_ReadFile(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    int64_t n = file_read(o->fd, g_mem + buf, want);
+    int64_t n = file_read(o, g_mem + buf, want);
     if (recomp_env("TRACE_FILES"))
         LOGW("file: read handle=%08x want=%u got=%lld", arg(c, 0), want, (long long)n);
     if (n < 0) {
@@ -1854,26 +1859,57 @@ void k_TlsFree(X86 *c) {
     set_eax(c, 1);
 }
 
-// One microsecond tick, driven by the same clock as GetTickCount so a guest
-// that mixes the two never sees them disagree.
+// Ten million ticks a second, as Windows 10 reports, on the same time line as
+// GetTickCount so a guest that mixes the two never sees them disagree.
 void k_QueryPerformanceFrequency(X86 *c) {
     uint32_t p = arg(c, 0);
     if (p) {
-        wr32(p, 1000000);
+        wr32(p, 10000000);
         wr32(p + 4, 0);
     }
     set_eax(c, 1);
 }
 
-void k_QueryPerformanceCounter(X86 *c) {
-    host_note_cadence("QueryPerformanceCounter");
-    uint32_t p = arg(c, 0);
+// The counter counts the microsecond clock (host_micros), never repeats a value
+// and never reaches the next microsecond. It used to be GetTickCount's
+// millisecond times 1000: a frame limiter then saw time only in whole
+// milliseconds, and two reads in one millisecond matched, which games that
+// treat "now <= last" as a wrap read as 4295 seconds passing (Star Wars
+// Battlefront II auto-repeated every held key; austynoconnor/recomp-kit). A
+// repeat within one microsecond gets one 100 ns tick more, at most nine of
+// them, so a game spinning on the counter cannot push it ahead of real time.
+// Atomic, because a thread running free reads it beside the baton holder.
+namespace {
+std::atomic<uint64_t> g_qpc_last{0};
+
+uint64_t qpc_ticks(uint64_t micros) {
+    const uint64_t base = micros * 10ull;
+    uint64_t prev = g_qpc_last.load(std::memory_order_relaxed);
+    for (;;) {
+        uint64_t ticks = base;
+        if (ticks <= prev)
+            ticks = prev + 1 < base + 10ull ? prev + 1 : prev;
+        if (ticks == prev)
+            return ticks;
+        if (g_qpc_last.compare_exchange_weak(prev, ticks, std::memory_order_relaxed))
+            return ticks;
+    }
+}
+
+void put_qpc(X86 *c, uint64_t micros) {
+    const uint32_t p = arg(c, 0);
     if (p) {
-        uint64_t ticks = (uint64_t)host_millis() * 1000ull;
+        const uint64_t ticks = qpc_ticks(micros);
         wr32(p, (uint32_t)ticks);
         wr32(p + 4, (uint32_t)(ticks >> 32));
     }
     set_eax(c, 1);
+}
+} // namespace
+
+void k_QueryPerformanceCounter(X86 *c) {
+    host_note_cadence("QueryPerformanceCounter");
+    put_qpc(c, host_micros());
 }
 
 // Host atomics (x86.h recomp_lock_*): a guest thread running free beside the baton holder
@@ -2046,7 +2082,20 @@ void k_WaitForMultipleObjects(X86 *c) {
 //                            (the pre-scheduler behaviour, for bisection)
 // -------------------------------------------------------------------------
 const uint32_t STILL_ACTIVE_ = 0x103;
-const uint32_t THREAD_STACK_BYTES = 0x00040000u; // 256 KB, committed
+// The smallest guest thread stack, committed. A thread gets at least what its
+// creator asked for and at least the image's SizeOfStackReserve, as on Windows,
+// where a 0 or small dwStackSize still reserves the image's default: Heroes V's
+// network threads (HommaRe) keep half a megabyte of locals in one routine and
+// on a 256 KB stack wrote over whatever the heap kept below it. NFSMW reserves
+// 1 MB. Capped, because the stack is committed from the guest heap.
+const uint32_t THREAD_STACK_BYTES = 0x00040000u; // 256 KB
+const uint32_t THREAD_STACK_MAX = 0x01000000u;   // 16 MB
+
+uint32_t thread_stack_bytes(uint32_t requested) {
+    uint32_t n = std::max(requested, loader_stack_reserve());
+    n = std::min(std::max(n, THREAD_STACK_BYTES), THREAD_STACK_MAX);
+    return (n + 0xffffu) & ~0xffffu;
+}
 const uint32_t WAIT_TIMEOUT_ = 0x102;
 
 // What a blocked thread is waiting for.  A blocked thread is not runnable and
@@ -2087,7 +2136,12 @@ struct GuestThread {
     bool has_deadline = false;
     double deadline = 0.0;    // monotonic seconds
     uint32_t wait_result = 0; // what the wait returns once released
-    double last_yield = 0.0;  // for the bounded scheduling checkpoint
+    // When this thread last took the baton, for the bounded scheduling
+    // checkpoint. Set on getting it back, not on giving it up: the time spent
+    // waiting for the baton is not part of the slice (wraitii/recomp-toolkit),
+    // and counting it made a thread that had just come back yield at its first
+    // checkpoint.
+    double slice_started = 0.0;
     // Running guest code without the baton (win32.h sched_free_run_enter). Not runnable for
     // the baton meanwhile: it is running already, and asks for it when it comes back.
     bool free_run = false;
@@ -3051,8 +3105,8 @@ uint32_t guest_block(const char *why) {
         g_sched_m.unlock();
         return 0x102;
     }
-    me->last_yield = sched_now();
     sched_run_others_locked(me->index, why);
+    me->slice_started = sched_now();
     uint32_t r = me->wait_result;
     g_sched_m.unlock();
     if (g_exit_requested)
@@ -3077,7 +3131,6 @@ bool guest_yield() {
         g_sched_m.unlock();
         return false;
     }
-    me->last_yield = sched_now();
     sched_expire_locked();
     size_t next = sched_next_runnable_locked(me->index);
     bool moved = next != NO_THREAD && next != me->index;
@@ -3087,6 +3140,7 @@ bool guest_yield() {
         sched_notify_baton_locked();
         wait_baton_locked(me->index);
     }
+    me->slice_started = sched_now();
     g_sched_m.unlock();
     if (moved && g_exit_requested)
         thread_finish_exit_process();
@@ -3179,6 +3233,49 @@ std::condition_variable g_io_cv;
 std::vector<FileReadJob *> g_io_queue;
 bool g_io_started = false;
 
+// What the streamed-file backend (web/player/fetch-backend.js) says it holds in
+// memory, by 1 MiB block of each file under the mount, published through
+// recomp_stream_resident below from the backend's own worker. A read of bytes
+// it holds is a copy and stays on the baton; one it does not hold waits for
+// the network, and a small one used to keep the baton for that whole round
+// trip, every guest thread standing still behind it. Until the backend
+// publishes anything the 256 KiB rule below is all there is.
+const char k_stream_mount[] = "/data/";
+const unsigned k_stream_block_shift = 20;
+struct StreamFile {
+    std::vector<uint8_t> resident; // by block
+    uint64_t size = 0;
+};
+std::mutex g_stream_m;
+std::map<std::string, StreamFile> g_stream_files; // by path under the mount
+std::atomic<bool> g_stream_reported{false};
+
+// 1 when every byte of the read is in the backend's memory, 0 when some is not,
+// -1 when nobody says (not a streamed file, or a backend that publishes nothing).
+int stream_read_resident(const std::string &host_path, int fd, uint32_t n) {
+    if (!g_stream_reported.load(std::memory_order_acquire) ||
+        host_path.compare(0, sizeof k_stream_mount - 1, k_stream_mount) != 0)
+        return -1;
+    const int64_t off = os_fd_seek(fd, 0, OS_SEEK_CUR);
+    if (off < 0)
+        return -1;
+    std::lock_guard<std::mutex> lock(g_stream_m);
+    const auto found = g_stream_files.find(host_path.substr(sizeof k_stream_mount - 1));
+    if (found == g_stream_files.end())
+        return 0; // nothing of it was ever fetched
+    const StreamFile &f = found->second;
+    uint64_t end = (uint64_t)off + n;
+    if (f.size && end > f.size)
+        end = f.size;
+    if (end <= (uint64_t)off)
+        return 1; // at or past the end: nothing to wait for
+    for (uint64_t b = (uint64_t)off >> k_stream_block_shift; b <= (end - 1) >> k_stream_block_shift;
+         ++b)
+        if (b >= f.resident.size() || !f.resident[b])
+            return 0;
+    return 1;
+}
+
 void *file_read_worker(void *) {
     for (;;) {
         FileReadJob *job;
@@ -3197,13 +3294,17 @@ void *file_read_worker(void *) {
     return nullptr;
 }
 
-int64_t file_read(int fd, uint8_t *dst, uint32_t n) {
+int64_t file_read_on(const HObj *o, uint8_t *dst, uint32_t n) {
+    const int fd = o->fd;
     static const bool may_block = os_fd_reads_may_block() != 0;
     // Only a guest thread with company and outside an atomic stretch may wait.
-    // Small reads stay on the baton: a hand-off costs more than they do, and a
-    // game streaming audio makes many. Large reads are the ones that stall.
-    if (!may_block || n < 256u * 1024u || t_atomic || !sched_is_guest_thread() ||
-        threads().size() < 2)
+    // Small reads stay on the baton when their bytes are at hand: a hand-off
+    // costs more than they do, and a game streaming audio makes many. Large
+    // reads, and any read the streamed-file backend does not hold, are the ones
+    // that stall.
+    if (!may_block || t_atomic || !sched_is_guest_thread() || threads().size() < 2)
+        return os_fd_read(fd, dst, n);
+    if (n < 256u * 1024u && stream_read_resident(o->path, fd, n) != 0)
         return os_fd_read(fd, dst, n);
     {
         std::lock_guard<std::mutex> lock(g_io_m);
@@ -3237,6 +3338,49 @@ int64_t file_read(int fd, uint8_t *dst, uint32_t n) {
     }
     win32_close_handle(handle);
     return job.result;
+}
+} // namespace
+
+// Called on the streamed-file backend's worker (web/player/fetch-backend.js):
+// bytes [start, end) of `path` (as the manifest names it, under the mount) are
+// now in its memory (resident 1) or have left it (0). `size` is the file's
+// length. The spans are the backend's chunks, so they begin on a block.
+extern "C" void recomp_stream_resident(const char *path, double start, double end, double size,
+                                       int resident) {
+    if (!path || !(end > start) || start < 0)
+        return;
+    std::lock_guard<std::mutex> lock(g_stream_m);
+    StreamFile &f = g_stream_files[path];
+    if (size > 0)
+        f.size = (uint64_t)size;
+    const uint64_t first = (uint64_t)start >> k_stream_block_shift;
+    const uint64_t last = ((uint64_t)end - 1) >> k_stream_block_shift;
+    if (last >= (1ull << 24))
+        return; // past 16 TiB: not a file this tracks
+    if (f.resident.size() <= last)
+        f.resident.resize(last + 1, 0);
+    for (uint64_t b = first; b <= last; ++b)
+        f.resident[b] = resident ? 1 : 0;
+    g_stream_reported.store(true, std::memory_order_release);
+}
+
+namespace {
+// The read, timed: one that waits long enough to show as a hitch names itself,
+// so a stall can be traced to the file, the offset and the guest thread that
+// waited (austynoconnor/recomp-kit). Thread 0 is the game's main thread.
+int64_t file_read(const HObj *o, uint8_t *dst, uint32_t n) {
+    const uint64_t from = os_monotonic_ns();
+    const int64_t got = file_read_on(o, dst, n);
+    const uint64_t ms = (os_monotonic_ns() - from) / 1000000ull;
+    static std::atomic<int> reported{0};
+    if (ms >= 40 && reported.fetch_add(1, std::memory_order_relaxed) < 400) {
+        // The descriptor ends where the read ended.
+        const int64_t at = os_fd_seek(o->fd, 0, OS_SEEK_CUR) - (got > 0 ? got : 0);
+        fprintf(stderr, "[stall] slow read: %s at %lld, %u bytes, %llu ms, guest thread %zu\n",
+                (o->guest_name.empty() ? o->path : o->guest_name).c_str(), (long long)at, n,
+                (unsigned long long)ms, (size_t)t_self);
+    }
+    return got;
 }
 } // namespace
 
@@ -3357,7 +3501,7 @@ uint32_t sched_free_run_leave() {
     wait_baton_locked(t_self);
     if (held)
         g_baton_wanted.fetch_sub(1, std::memory_order_relaxed);
-    me->last_yield = sched_now();
+    me->slice_started = sched_now();
     g_sched_m.unlock();
     free_run_stats(os_monotonic_ns() - asked);
     if (g_exit_requested)
@@ -3459,11 +3603,10 @@ static void scheduling_checkpoint(bool force) {
         // A thread back from free run is waiting for the baton: hand it over now, slice or
         // not (sched_free_run_leave). It asks once per free-run call and gives the baton back
         // at its own slice's end, so this cannot starve the holder.
-        if (force || now - me->last_yield >= SCHED_SLICE_SECONDS ||
-            g_baton_wanted.load(std::memory_order_relaxed) > 0) {
-            me->last_yield = now;
+        // guest_yield restarts the slice once the baton is back.
+        if (force || now - me->slice_started >= SCHED_SLICE_SECONDS ||
+            g_baton_wanted.load(std::memory_order_relaxed) > 0)
             yield = true;
-        }
     }
     g_sched_m.unlock();
     if (yield)
@@ -3539,6 +3682,13 @@ uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_
 
     // Satisfiable right now?  Taken here so a zero timeout still consumes.
     g_sched_m.lock();
+    // Host signals are applied at the import's checkpoint; one that landed
+    // since (a finished file read, a timer) would miss this wait, a zero-time
+    // poll included, until another import or the timeout (Galavic). Callers
+    // that wait without an import in front (file_read's I/O wait) see it too.
+    // The baton holder owns the handle table under this lock.
+    if (g_host_signals_pending.load(std::memory_order_acquire) && sched_holds_baton_locked())
+        apply_host_signals_locked();
     bool ready = true, abandoned = false;
     uint32_t index = 0;
     if (wait_all) {
@@ -3714,6 +3864,7 @@ void *thread_host_main(void *arg) {
         t->condition.wait(g_sched_m);
     }
     bool exiting = g_exit_requested;
+    t->slice_started = sched_now(); // its first slice starts now, not at its creation
     g_sched_m.unlock();
     // Created before the exit, first scheduled after it: Windows would never
     // run this body, so neither does this thread. It still ends through the
@@ -3833,11 +3984,11 @@ bool request_process_exit(uint32_t code) {
 // TEB with the SEH head empty and the stack bounds Windows records there, and
 // a TLS array with the image's initial block and all other slots zeroed.
 // Returns false when the guest heap cannot supply them.
-bool thread_prepare_context(GuestThread *t) {
-    t->stack_lo = heap_alloc(THREAD_STACK_BYTES, true, 16);
+bool thread_prepare_context(GuestThread *t, uint32_t stack_bytes) {
+    t->stack_lo = heap_alloc(stack_bytes, true, 16);
     if (!t->stack_lo)
         return false;
-    t->stack_hi = t->stack_lo + THREAD_STACK_BYTES;
+    t->stack_hi = t->stack_lo + stack_bytes;
     uint32_t block = heap_alloc(TEB_SIZE + TLS_SLOTS * 4, true, 16);
     if (!block) {
         heap_free(t->stack_lo);
@@ -3912,13 +4063,13 @@ void run_thread_body(X86 *c, uint32_t h) {
 // Starts a cooperative thread.  It does not run yet: CreateThread returns to
 // its caller first, exactly as on Windows, and the new thread gets the baton
 // the first time somebody yields.
-bool thread_spawn(uint32_t h) {
+bool thread_spawn(uint32_t h, uint32_t stack_bytes) {
     cur_thread(); // main is threads()[0]
     GuestThread *t = new GuestThread();
     t->index = threads().size();
     t->handle = h;
     t->id = g_next_thread_id++;
-    if (!thread_prepare_context(t)) {
+    if (!thread_prepare_context(t, stack_bytes)) {
         delete t;
         return false;
     }
@@ -3974,7 +4125,9 @@ void k_CreateThread(X86 *c) {
         return;
     }
 
-    if (!thread_spawn(h)) {
+    // dwStackSize; STACK_SIZE_PARAM_IS_A_RESERVATION only says which of
+    // reserve and commit it names, and the stack here is committed whole.
+    if (!thread_spawn(h, thread_stack_bytes(arg(c, 1)))) {
         LOGW("CreateThread(%08x): no context available, reporting failure", start);
         handles()[h].exit_code = 0;
         handles()[h].thread_ran = true;
@@ -4176,7 +4329,7 @@ uint32_t guest_runtime_thread_create(uint32_t start, uint32_t param) {
     handles()[h].thread_start = start;
     handles()[h].thread_param = param;
     handles()[h].exit_code = STILL_ACTIVE_;
-    if (!thread_spawn(h)) {
+    if (!thread_spawn(h, thread_stack_bytes(0))) {
         handles().erase(h);
         return 0;
     }
@@ -4886,8 +5039,8 @@ bool sched_drive_until_stopped(double timeout_seconds) {
         t->wait_n = 0;
         t->has_deadline = true;
         t->deadline = sched_now() + kYield;
-        t->last_yield = sched_now();
         sched_run_others_locked(me, "shutdown drive");
+        t->slice_started = sched_now();
         t->blocked = false;
         t->has_deadline = false;
     }
@@ -5647,16 +5800,10 @@ bool kf_QueryPerformanceFrequency(X86 *c) {
     return true;
 }
 bool kf_QueryPerformanceCounter(X86 *c) {
-    uint32_t now;
-    if (!host_millis_quiet(&now))
+    uint64_t now;
+    if (!host_micros_quiet(&now))
         return false;
-    const uint32_t p = arg(c, 0);
-    if (p) {
-        const uint64_t ticks = (uint64_t)now * 1000ull;
-        wr32(p, (uint32_t)ticks);
-        wr32(p + 4, (uint32_t)(ticks >> 32));
-    }
-    set_eax(c, 1);
+    put_qpc(c, now);
     return true;
 }
 // Nobody waits on a thread running free, so it sleeps on its own host thread instead of in

@@ -6,8 +6,10 @@
 // resources are mirrored under the shim's ids, draws are recorded into a
 // command encoder that Present submits. WebGPU's differences shape the rest:
 //
-// - A queue write takes effect when it is made, so writing a buffer or
-//   texture the open encoder already draws from submits that encoder first.
+// - A queue write takes effect when it is made, so writing a texture the
+//   open encoder already draws from submits that encoder first. A buffer is
+//   written beside what recorded draws read, or drawn from a copy until the
+//   submit (buffer_upload), before it comes to that.
 // - Nothing can be read back synchronously: read() and read_presented()
 //   report nothing; occlusion query results arrive a few frames later.
 // - There is no partial clear or scaled copy: both draw with small utility
@@ -275,7 +277,18 @@ struct Tex {
 struct Buf {
     WGPUBuffer buffer = nullptr;
     std::vector<uint8_t> shadow;
-    uint64_t used = 0;
+    uint64_t used = 0; // the encoder serial that last drew from it
+    // What the open encoder's draws read of what they bind (the version below, if any, else
+    // `buffer`), as bytes of the shadow: valid while `used` is the open encoder's serial.
+    uint64_t read_lo = 0, read_hi = 0;
+    // A copy of the shadow in the vertex ring that draws bind instead of `buffer` until the
+    // open encoder is submitted (buffer_upload); `buffer` gets the shadow right after.
+    WGPUBuffer version = nullptr;
+    uint64_t version_offset = 0;
+    size_t version_chunk = 0;
+    // Rewritten while draws read it: indexed draws scan their indices for the exact vertices
+    // they read of it, so that a write elsewhere in it needs no submit.
+    bool hot = false;
 };
 
 class WebGpuRenderer final : public D9Backend {
@@ -423,8 +436,10 @@ class WebGpuRenderer final : public D9Backend {
         Tex &t = *tp;
         if (level >= t.levels || t.depth)
             return;
-        if (t.used == serial_ && encoder_)
+        if (t.used == serial_ && encoder_) {
+            ++stat_.texture_submits;
             submit(); // draws already recorded read the old contents
+        }
         uint32_t w = std::max<uint32_t>(t.desc.width >> level, 1);
         uint32_t h = std::max<uint32_t>((t.cube ? t.desc.width : t.desc.height) >> level, 1);
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -520,24 +535,71 @@ class WebGpuRenderer final : public D9Backend {
     void buffer_upload(uint32_t id, uint32_t total, uint32_t offset, const uint8_t *bytes,
                        uint32_t size) override {
         Buf &b = buffers_[id];
-        if (offset + size > total || !bytes)
+        if ((uint64_t)offset + size > total || !bytes)
             return;
         if (b.shadow.size() < total)
             b.shadow.resize(total, 0);
         memcpy(b.shadow.data() + offset, bytes, size);
         const uint64_t need = (total + 3) & ~3u;
         if (!b.buffer || wgpuBufferGetSize(b.buffer) < need) {
+            // Draws already recorded keep the old buffer (the encoder holds it).
             if (b.buffer)
                 wgpuBufferRelease(b.buffer);
             b.buffer = make_buffer(std::max<uint64_t>(need, 4),
                                    WGPUBufferUsage_Vertex | WGPUBufferUsage_Index);
             write_padded(b.buffer, 0, b.shadow.data(), b.shadow.size());
+            b.version = nullptr;
             b.used = 0;
             return;
         }
-        if (b.used == serial_ && encoder_)
-            submit(); // draws already recorded read the old contents
-        write_padded(b.buffer, offset, bytes, size);
+        if (!size)
+            return;
+        // What the queue write covers: both ends on a 4-byte boundary, the bytes around the
+        // guest's range taken from the shadow.
+        const uint64_t lo = offset & ~3ull;
+        const uint64_t hi = std::min(round_up((uint64_t)offset + size, 4), need);
+        const bool open = encoder_ && b.used == serial_;
+        // TEST ONLY (RECOMP_AB_PERIOD): the earlier phase submits whenever the open encoder
+        // draws from the buffer at all.
+        if (recomp_ab::old(recomp_ab::SUBMIT)) {
+            if (open || (encoder_ && b.version)) {
+                ++stat_.buffer_submits;
+                submit(); // draws already recorded read the old contents
+            }
+            write_shadow(b, lo, hi);
+            return;
+        }
+        // A queue write takes effect before the open encoder's commands run. It is a submit
+        // only when draws already recorded read the bytes it changes; otherwise the write
+        // goes ahead (dynamic buffers append behind what was drawn), or, for a buffer of up
+        // to 256 KiB, the draws from here on bind a copy of it in the vertex ring and the
+        // buffer itself gets the new bytes after the submit. A submit ends the render pass
+        // and makes the next draws begin another, with every binding again.
+        if (open && lo < b.read_hi && hi > b.read_lo) {
+            b.hot = true;
+            const uint64_t copy = round_up(b.shadow.size(), 4);
+            if (copy <= kRenameMax && renamed_bytes_ + copy <= kRenameBudget) {
+                if (!b.version)
+                    renamed_.push_back(id);
+                b.version = ring_write(b.shadow.data(), b.shadow.size(), &b.version_offset,
+                                       WGPUBufferUsage_Vertex);
+                b.version_chunk = vertex_ring_.chunk;
+                b.read_lo = b.read_hi = 0; // nothing has read the new copy yet
+                renamed_bytes_ += copy;
+                ++stat_.renames;
+                return;
+            }
+            ++stat_.buffer_submits;
+            submit(); // gives the buffer its whole shadow back if it had a copy
+            write_shadow(b, lo, hi);
+            return;
+        }
+        if (open)
+            ++stat_.disjoint;
+        if (b.version)
+            write_version(b, lo, hi); // the buffer gets the shadow after the submit
+        else
+            write_shadow(b, lo, hi);
     }
     void buffer_drop(uint32_t id) override {
         auto it = buffers_.find(id);
@@ -642,9 +704,9 @@ class WebGpuRenderer final : public D9Backend {
             vkey = last_vkey_;
             vlp = last_vl_;
         } else {
-            vkey = mix(mix(mix((uint64_t)d.decl_id << 32 | d.decl_size, vs_key),
-                           fnv(d.decl, d.decl_size)),
-                       strides);
+            vkey = mix(
+                mix(mix((uint64_t)d.decl_id << 32 | d.decl_size, vs_key), fnv(d.decl, d.decl_size)),
+                strides);
             vlp = &vertex_layout(d, vp, vkey);
             last_vl_ = vlp;
             last_vkey_ = vkey;
@@ -709,6 +771,11 @@ class WebGpuRenderer final : public D9Backend {
         ps.bias = (int32_t)std::lround(bias * 16777215.0f);
         ps.slope = slope;
         ps.colors = d9msl::pixel_color_outputs(pp);
+        // Fans become indexed lists (encode_primitives); only true strips name a format.
+        if ((topology == WGPUPrimitiveTopology_TriangleStrip ||
+             topology == WGPUPrimitiveTopology_LineStrip) &&
+            (d.index_buffer || d.inline_indices))
+            ps.strip_index = d.index_size == 4 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16;
         WGPURenderPipeline pso = pipeline(ps, vkey);
         if (!pso) {
             skip("no pipeline");
@@ -824,27 +891,42 @@ class WebGpuRenderer final : public D9Backend {
             memcpy(es_.group_offsets, offsets, sizeof offsets);
         }
 
+        VertexRange range;
         for (uint32_t i = 0; i < 8; ++i) {
             if (!(vl.streams >> i & 1))
                 continue;
             const HostD9Stream &st = d.stream[i];
             WGPUBuffer vb = nullptr;
-            uint64_t off = 0;
+            uint64_t off = 0, span = WGPU_WHOLE_SIZE;
             if (st.buffer) {
                 auto b = buffers_.find(st.buffer);
                 if (b == buffers_.end() || !b->second.buffer) {
                     skip("missing vertex buffer");
                     return;
                 }
-                b->second.used = serial_;
-                vb = b->second.buffer;
-                off = st.offset;
+                Buf &buf = b->second;
+                uint64_t lo = 0, hi = buf.shadow.size();
+                stream_bytes(d, st, vl.buffers[vl.slot_of[i]].arrayStride, buf.hot, range, &lo,
+                             &hi);
+                note_read(buf, lo, hi);
+                if (buf.version) {
+                    if (st.offset >= buf.shadow.size()) {
+                        skip("vertex buffer offset out of range");
+                        return;
+                    }
+                    vb = buf.version;
+                    off = buf.version_offset + st.offset;
+                    span = round_up(buf.shadow.size(), 4) - st.offset;
+                } else {
+                    vb = buf.buffer;
+                    off = st.offset;
+                }
             } else if (d.inline_vertices) {
                 vb = ring_write(d.inline_vertices, d.inline_bytes, &off, WGPUBufferUsage_Vertex);
             } else {
                 vb = zero_;
             }
-            set_vertex_buffer(vl.slot_of[i], vb, off);
+            set_vertex_buffer(vl.slot_of[i], vb, off, span);
         }
         if (vl.zero)
             set_vertex_buffer(vl.zero_slot, zero_, 0);
@@ -1071,6 +1153,42 @@ class WebGpuRenderer final : public D9Backend {
         bd.usage = usage | WGPUBufferUsage_CopyDst;
         return wgpuDeviceCreateBuffer(device_, &bd);
     }
+    // Bytes [lo, hi) of a buffer's shadow (4-byte aligned) into the buffer itself.
+    void write_shadow(Buf &b, uint64_t lo, uint64_t hi) {
+        if (hi <= lo)
+            return;
+        if (hi <= b.shadow.size()) {
+            wgpuQueueWriteBuffer(queue_, b.buffer, lo, b.shadow.data() + lo, hi - lo);
+            return;
+        }
+        pad_.assign(b.shadow.data() + lo, b.shadow.data() + b.shadow.size());
+        pad_.resize(hi - lo, 0);
+        wgpuQueueWriteBuffer(queue_, b.buffer, lo, pad_.data(), hi - lo);
+    }
+    // The same into the buffer's copy in the vertex ring, staged like the ring's other data.
+    void write_version(Buf &b, uint64_t lo, uint64_t hi) {
+        Ring &r = vertex_ring_;
+        uint8_t *dst = r.shadow[b.version_chunk].data() + b.version_offset;
+        const uint64_t end = std::min<uint64_t>(hi, b.shadow.size());
+        if (end > lo)
+            memcpy(dst + lo, b.shadow.data() + lo, (size_t)(end - lo));
+        if (hi > end)
+            memset(dst + end, 0, (size_t)(hi - end));
+        auto &span = r.dirty[b.version_chunk];
+        span.first = std::min(span.first, b.version_offset + lo);
+        span.second = std::max(span.second, b.version_offset + hi);
+    }
+    // A draw reads bytes [lo, hi) of what it binds of `b` (buffer_upload).
+    void note_read(Buf &b, uint64_t lo, uint64_t hi) {
+        if (b.used != serial_ || b.read_hi <= b.read_lo) {
+            b.used = serial_;
+            b.read_lo = lo;
+            b.read_hi = hi;
+        } else if (hi > lo) {
+            b.read_lo = std::min(b.read_lo, lo);
+            b.read_hi = std::max(b.read_hi, hi);
+        }
+    }
     void write_padded(WGPUBuffer b, uint64_t offset, const uint8_t *bytes, uint64_t size) {
         const uint64_t aligned = round_up(size, 4);
         if (aligned == size) {
@@ -1260,8 +1378,18 @@ class WebGpuRenderer final : public D9Backend {
     }
 
     void retire(Tex &t) {
-        if (t.sample_view || t.msaa_view || !t.targets.empty())
-            drop_groups(); // they may name this texture's views
+        // A cached bind group may name this texture's views, and a later view may take a
+        // released one's handle, which would alias its cache key. Draws' groups name only
+        // sample views (targets are attachments; utility quads' groups are released at
+        // once), so only the groups of this one go: a race streams textures in and out, and
+        // dropping every group each time made the next frames create them all again, each a
+        // call into the browser. The earlier phase of an in-run A/B (GROUPS) drops them all.
+        if (recomp_ab::old(recomp_ab::GROUPS)) {
+            if (t.sample_view || t.msaa_view || !t.targets.empty())
+                drop_groups();
+        } else if (t.sample_view) {
+            drop_groups_of(t.sample_view);
+        }
         if (t.imported) {
             dev_->destroy(t.imported);
             t.imported = {};
@@ -1357,6 +1485,19 @@ class WebGpuRenderer final : public D9Backend {
         flush_rings();
         wgpuQueueSubmit(queue_, 1, &cb);
         wgpuCommandBufferRelease(cb);
+        ++stat_.submits;
+        // Buffers the submitted draws read through a ring copy (buffer_upload) get their
+        // shadow now: a queue write after the submit, so none of those draws sees it.
+        for (uint32_t id : renamed_) {
+            auto it = buffers_.find(id);
+            if (it == buffers_.end() || !it->second.version)
+                continue;
+            Buf &b = it->second;
+            b.version = nullptr;
+            write_shadow(b, 0, round_up(b.shadow.size(), 4));
+        }
+        renamed_.clear();
+        renamed_bytes_ = 0;
         if (readback)
             read_queries(serial_, readback, nq, resolve, qs);
         else if (qs)
@@ -1378,7 +1519,28 @@ class WebGpuRenderer final : public D9Backend {
     void drop_groups() {
         for (auto &kv : groups_)
             wgpuBindGroupRelease(kv.second);
+        stat_.groups_dropped += groups_.size();
         groups_.clear();
+        view_groups_.clear();
+        view_group_entries_ = 0;
+        es_.group = nullptr; // a new group may get a released one's handle
+    }
+    void drop_groups_of(WGPUTextureView view) {
+        auto it = view_groups_.find(view);
+        if (it == view_groups_.end())
+            return;
+        for (uint64_t key : it->second) {
+            auto g = groups_.find(key);
+            if (g == groups_.end())
+                continue; // dropped with another of its views
+            if (g->second == es_.group)
+                es_.group = nullptr; // a new group may get a released one's handle
+            wgpuBindGroupRelease(g->second);
+            groups_.erase(g);
+            ++stat_.groups_dropped;
+        }
+        view_group_entries_ -= std::min(view_group_entries_, (uint64_t)it->second.size());
+        view_groups_.erase(it);
     }
     void read_queries(uint64_t serial, WGPUBuffer readback, uint32_t n, WGPUBuffer resolve,
                       WGPUQuerySet qs) {
@@ -1779,12 +1941,15 @@ class WebGpuRenderer final : public D9Backend {
         int32_t bias;
         float slope;
         uint32_t colors;
+        // An indexed strip's index format; Undefined for everything else.
+        WGPUIndexFormat strip_index = WGPUIndexFormat_Undefined;
     };
     WGPURenderPipeline pipeline(const PipeState &p, uint64_t vkey) {
         const uint32_t *rs = p.rs;
         uint64_t key = mix(mix((uint64_t)(uintptr_t)p.vmod, (uint64_t)(uintptr_t)p.fmod), vkey);
-        key = mix(key, (uint64_t)p.topology | (uint64_t)p.cull << 8 |
-                           (uint64_t)pass_samples_ << 16 | (uint64_t)pass_color_count_ << 24);
+        key =
+            mix(key, (uint64_t)p.topology | (uint64_t)p.cull << 8 | (uint64_t)pass_samples_ << 16 |
+                         (uint64_t)pass_color_count_ << 24 | (uint64_t)p.strip_index << 32);
         key = mix(key, (uint64_t)(uintptr_t)p.layout->pipeline);
         for (int i = 0; i < 4; ++i)
             key = mix(key, (uint64_t)pass_formats_[i] + 1000 * (uint64_t)i);
@@ -1902,14 +2067,20 @@ class WebGpuRenderer final : public D9Backend {
         pd.vertex.bufferCount = p.vl->buffers.size();
         pd.vertex.buffers = p.vl->buffers.data();
         pd.primitive.topology = p.topology;
-        if (strip)
-            pd.primitive.stripIndexFormat = WGPUIndexFormat_Undefined;
+        // WebGPU draws an indexed strip only with a pipeline that names the index format
+        // (drawIndexed fails validation otherwise, and with it the whole command buffer).
+        // That format also makes the all-ones index a strip restart, which Direct3D 9 does
+        // not have; a 65535th vertex in a 16-bit strip would be lost.
+        pd.primitive.stripIndexFormat = strip ? p.strip_index : WGPUIndexFormat_Undefined;
         pd.primitive.frontFace = WGPUFrontFace_CW;
         pd.primitive.cullMode = p.cull;
         pd.depthStencil = pass_depth_view_ ? &ds : nullptr;
         pd.multisample.count = pass_samples_;
         pd.fragment = &fs;
+        const uint64_t t0 = os_monotonic_ns();
         WGPURenderPipeline pso = wgpuDeviceCreateRenderPipeline(device_, &pd);
+        ++stat_.pipelines;
+        stat_.pipeline_ns += os_monotonic_ns() - t0;
         pipelines_[key] = pso;
         last_pipeline_key_ = key;
         last_pipeline_ = pso;
@@ -1928,6 +2099,8 @@ class WebGpuRenderer final : public D9Backend {
         auto it = groups_.find(key);
         if (it != groups_.end())
             return it->second;
+        if (view_group_entries_ > (1u << 16))
+            drop_groups();
         std::vector<WGPUBindGroupEntry> e;
         for (uint32_t i = 0; i < 4; ++i) {
             WGPUBindGroupEntry b = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -1955,6 +2128,22 @@ class WebGpuRenderer final : public D9Backend {
         d.entries = e.data();
         WGPUBindGroup g = wgpuDeviceCreateBindGroup(device_, &d);
         groups_[key] = g;
+        ++stat_.groups;
+        // Indexed by the sample views it names (drop_groups_of), placeholders aside: they
+        // are never retired. Keys of groups dropped with another view linger until the
+        // index is too big, when every group goes (above, before this one was made).
+        for (uint32_t s = 0; s < 16; ++s) {
+            WGPUTextureView v = k.views[s];
+            if (!v || v == black_ || v == black_cube_ || v == far_depth_view_)
+                continue;
+            bool seen = false;
+            for (uint32_t p = 0; p < s && !seen; ++p)
+                seen = k.views[p] == v;
+            if (seen)
+                continue;
+            view_groups_[v].push_back(key);
+            ++view_group_entries_;
+        }
         return g;
     }
 
@@ -2124,7 +2313,10 @@ class WebGpuRenderer final : public D9Backend {
             (copy_format == WGPUTextureFormat_Undefined && pass_depth_view_) ? &ds : nullptr;
         pd.multisample.count = pass_samples_;
         pd.fragment = &fs;
+        const uint64_t t0 = os_monotonic_ns();
         WGPURenderPipeline pso = wgpuDeviceCreateRenderPipeline(device_, &pd);
+        ++stat_.pipelines;
+        stat_.pipeline_ns += os_monotonic_ns() - t0;
         pipelines_[key] = pso;
         return pso;
     }
@@ -2170,6 +2362,102 @@ class WebGpuRenderer final : public D9Backend {
                 memcpy(out + (size_t)def.first * 16, def.second.data(), 16);
     }
 
+    // The vertex numbers a draw reads, [first, end) before a stream's offset: worked out at
+    // most once per draw, and only when one of its streams' buffers asks (stream_bytes).
+    struct VertexRange {
+        int state = 0; // 0: not yet, 1: known, 2: not known (indexed, not scanned)
+        bool scanned = false;
+        int64_t first = 0, end = 0;
+    };
+    // The vertices, or indices when indexed, that a primitive count takes.
+    static uint64_t element_count(uint32_t primitive, uint32_t n) {
+        switch (primitive) {
+        case 1:
+            return n;
+        case 2:
+            return 2ull * n;
+        case 3:
+            return n ? n + 1ull : 0;
+        case 4:
+            return 3ull * n;
+        case 5:
+        case 6:
+            return n ? n + 2ull : 0;
+        default:
+            return 0;
+        }
+    }
+    bool vertex_range(const HostD9Draw &d, bool scan, VertexRange &r) {
+        if (r.state == 1)
+            return true;
+        if (r.state == 2 && (!scan || r.scanned))
+            return false;
+        const uint64_t n = element_count(d.primitive, d.primitive_count);
+        if (!d.index_buffer && !d.inline_indices) {
+            r.first = d.start;
+            r.end = (int64_t)(d.start + n);
+            r.state = 1;
+            return true;
+        }
+        r.state = 2;
+        if (!scan || n > (1u << 16)) // a big draw costs more to scan than a submit saves
+            return false;
+        r.scanned = true;
+        const uint64_t isize = d.index_size == 4 ? 4 : 2;
+        const uint8_t *p = nullptr;
+        if (d.inline_indices) {
+            if (n * isize > d.inline_index_bytes)
+                return false;
+            p = d.inline_indices;
+        } else {
+            auto b = buffers_.find(d.index_buffer);
+            if (b == buffers_.end() || (d.start + n) * isize > b->second.shadow.size())
+                return false;
+            p = b->second.shadow.data() + (size_t)d.start * isize;
+        }
+        uint32_t lo = UINT32_MAX, hi = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t v;
+            if (isize == 4) {
+                memcpy(&v, p + i * 4, 4);
+            } else {
+                uint16_t h;
+                memcpy(&h, p + i * 2, 2);
+                v = h;
+            }
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        const int64_t base = d.inline_indices ? 0 : d.base_vertex;
+        r.first = n ? base + lo : 0;
+        r.end = n ? base + hi + 1 : 0;
+        r.state = 1;
+        return true;
+    }
+    // The bytes of a stream's buffer a draw reads, [*lo, *hi): left as they are (the whole
+    // buffer) when its vertices are not known. `scan` lets an indexed draw read its indices
+    // to know them, for a buffer the game rewrites while drawing from it.
+    void stream_bytes(const HostD9Draw &d, const HostD9Stream &st, uint64_t stride, bool scan,
+                      VertexRange &r, uint64_t *lo, uint64_t *hi) {
+        if (!stride)
+            return;
+        if (st.frequency & HOST_D9_STREAM_INSTANCE) {
+            const uint64_t n = d.instance_count ? d.instance_count : 1;
+            *lo = st.offset;
+            *hi = st.offset + n * stride;
+            return;
+        }
+        if (!vertex_range(d, scan, r))
+            return;
+        const int64_t first = std::max<int64_t>(r.first, 0);
+        if (r.end <= first) {
+            *lo = *hi = st.offset;
+            return;
+        }
+        *lo = st.offset + (uint64_t)first * stride;
+        *hi = st.offset + (uint64_t)r.end * stride;
+    }
+
     void encode_primitives(const HostD9Draw &d) {
         const uint32_t instances = d.instance_count ? d.instance_count : 1;
         uint32_t count = d.primitive_count;
@@ -2210,10 +2498,15 @@ class WebGpuRenderer final : public D9Backend {
                 auto b = buffers_.find(d.index_buffer);
                 if (b == buffers_.end() || !b->second.buffer)
                     return;
-                if ((uint64_t)(d.start + count) * isize > b->second.shadow.size())
+                Buf &buf = b->second;
+                if ((uint64_t)(d.start + count) * isize > buf.shadow.size())
                     return;
-                b->second.used = serial_;
-                set_index_buffer(b->second.buffer, itype, 0, WGPU_WHOLE_SIZE);
+                note_read(buf, (uint64_t)d.start * isize, (uint64_t)(d.start + count) * isize);
+                if (buf.version)
+                    set_index_buffer(buf.version, itype, buf.version_offset,
+                                     round_up(buf.shadow.size(), 4));
+                else
+                    set_index_buffer(buf.buffer, itype, 0, WGPU_WHOLE_SIZE);
                 wgpuRenderPassEncoderDrawIndexed(pass_, count, instances, d.start, d.base_vertex,
                                                  0);
             } else {
@@ -2304,6 +2597,21 @@ class WebGpuRenderer final : public D9Backend {
                 "d3d9 webgpu: frame %llu: %.1f fps, %.0f draws/frame, %zu textures, %zu pipelines",
                 (unsigned long long)presents_, fps, double(draws_ - report_draws_) / double(frames),
                 textures_.size(), pipelines_.size());
+        // Per frame: submits (one is the present's; the rest end a render pass mid-frame,
+        // for a buffer write or a texture upload that recorded draws read), what buffer
+        // writes did instead (a copy in the vertex ring; a write beside what was drawn), and
+        // objects made on this thread.
+        const Counters &a = stat_, &b = stat_reported_;
+        const double f = double(frames);
+        fprintf(stderr,
+                ", %.2f submits (%.2f buffer, %.2f texture), %.2f buffer copies, %.2f disjoint "
+                "writes, %.2f new pipelines (%.2f ms), %.1f new groups, %.1f dropped groups",
+                (a.submits - b.submits) / f, (a.buffer_submits - b.buffer_submits) / f,
+                (a.texture_submits - b.texture_submits) / f, (a.renames - b.renames) / f,
+                (a.disjoint - b.disjoint) / f, (a.pipelines - b.pipelines) / f,
+                (a.pipeline_ns - b.pipeline_ns) / f / 1e6, (a.groups - b.groups) / f,
+                (a.groups_dropped - b.groups_dropped) / f);
+        stat_reported_ = stat_;
         for (auto &s : skips_)
             fprintf(stderr, ", %s %llu", s.first.c_str(), (unsigned long long)s.second);
         fprintf(stderr, "\n");
@@ -2332,17 +2640,20 @@ class WebGpuRenderer final : public D9Backend {
         uint64_t ib_offset = 0, ib_size = 0;
     };
 
-    void set_vertex_buffer(uint32_t slot, WGPUBuffer b, uint64_t offset) {
+    void set_vertex_buffer(uint32_t slot, WGPUBuffer b, uint64_t offset,
+                           uint64_t size = WGPU_WHOLE_SIZE) {
+        // A buffer and offset name one span: a ring copy's span is the rest of that copy.
         if (slot < 16 && es_.vb[slot] == b && es_.vb_offset[slot] == offset)
             return;
-        wgpuRenderPassEncoderSetVertexBuffer(pass_, slot, b, offset, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetVertexBuffer(pass_, slot, b, offset, size);
         if (slot < 16) {
             es_.vb[slot] = b;
             es_.vb_offset[slot] = offset;
         }
     }
     void set_index_buffer(WGPUBuffer b, WGPUIndexFormat format, uint64_t offset, uint64_t size) {
-        if (es_.ib == b && es_.ib_format == format && es_.ib_offset == offset && es_.ib_size == size)
+        if (es_.ib == b && es_.ib_format == format && es_.ib_offset == offset &&
+            es_.ib_size == size)
             return;
         wgpuRenderPassEncoderSetIndexBuffer(pass_, b, format, offset, size);
         es_.ib = b;
@@ -2405,6 +2716,14 @@ class WebGpuRenderer final : public D9Backend {
     uint32_t last_decl_id_ = 0, last_decl_size_ = 0;
     bool ab_old_ = false; // RECOMP_AB_PERIOD (test only): this draw takes the earlier behaviour
     std::unordered_map<uint64_t, WGPUBindGroup> groups_;
+    // The keys of the groups that name each sample view (drop_groups_of).
+    std::unordered_map<WGPUTextureView, std::vector<uint64_t>> view_groups_;
+    uint64_t view_group_entries_ = 0;
+    // Buffers drawn through a ring copy until the open encoder is submitted (buffer_upload):
+    // one of at most kRenameMax bytes, and at most kRenameBudget of them per submit.
+    static constexpr uint64_t kRenameMax = 256u << 10, kRenameBudget = 4u << 20;
+    std::vector<uint32_t> renamed_;
+    uint64_t renamed_bytes_ = 0;
     std::unordered_map<uint64_t, WGPUSampler> samplers_;
     WGPUSampler shadow_sampler_ = nullptr;
     std::unordered_map<uint64_t, WGPUTextureView> fitted_;
@@ -2417,6 +2736,11 @@ class WebGpuRenderer final : public D9Backend {
     uint64_t draws_ = 0, presents_ = 0, stat_calls_ = 0;
     double report_time_ = 0;
     uint64_t report_frames_ = 0, report_draws_ = 0;
+    // RECOMP_D3D9_STATS (report): totals, and their values at the last report.
+    struct Counters {
+        uint64_t submits = 0, buffer_submits = 0, texture_submits = 0, renames = 0, disjoint = 0;
+        uint64_t pipelines = 0, pipeline_ns = 0, groups = 0, groups_dropped = 0;
+    } stat_, stat_reported_;
     std::map<std::string, uint64_t> skips_;
 };
 

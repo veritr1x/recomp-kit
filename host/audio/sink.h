@@ -20,3 +20,9 @@ struct AudioSink {
     virtual void pause(bool paused) = 0;
 };
 std::unique_ptr<AudioSink> make_sdl_sink();
+#ifdef __EMSCRIPTEN__
+// The browser's output (web_sink.cpp): an AudioWorklet fed from a ring by a sink thread,
+// playing through `fallback` when Web Audio does not start. make_sdl_sink returns it unless
+// RECOMP_AUDIO_SINK=sdl.
+std::unique_ptr<AudioSink> make_web_sink(std::unique_ptr<AudioSink> fallback);
+#endif

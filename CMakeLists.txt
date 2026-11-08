@@ -15,6 +15,22 @@ if(EMSCRIPTEN)
   # EM_ASM and EM_JS, in SDL and in the web host, need the GNU dialects.
   set(CMAKE_C_EXTENSIONS ON)
   set(CMAKE_CXX_EXTENSIONS ON)
+  # Wasm-native exceptions and setjmp/longjmp, set with the other whole-build
+  # flags in the web preset (CMakePresets.json) so every object agrees,
+  # third-party libraries and FetchContent subprojects included. Emscripten's
+  # JavaScript setjmp/longjmp makes each call that might unwind in a function
+  # with a setjmp (the runtime's guest SEH and resumable stacks, Lua's error
+  # handling) an invoke_* import: a Wasm -> JS -> Wasm round trip per call. One
+  # object compiled the old way fails the link (emscripten_longjmp undefined,
+  # as Lua did when only the link flag was set), so a configure without the
+  # flags says so here rather than there.
+  foreach(lang C CXX)
+    if(NOT CMAKE_${lang}_FLAGS MATCHES "-fwasm-exceptions" OR
+       NOT CMAKE_${lang}_FLAGS MATCHES "SUPPORT_LONGJMP=wasm")
+      message(WARNING "Web build without -fwasm-exceptions -sSUPPORT_LONGJMP=wasm in "
+        "CMAKE_${lang}_FLAGS: configure with the web preset, or pass both to every object")
+    endif()
+  endforeach()
 endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(ANDROID)

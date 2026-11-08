@@ -476,6 +476,11 @@ std::vector<uint32_t> &announced() {
 }
 
 void announce_once(const ComObj *b, uint32_t from) {
+    // Only when tracing (RECOMP_AUDIO_TRACE): the peak scan reads the whole
+    // buffer and the list is searched linearly, both on every first Play of a
+    // game that makes a buffer per sound effect.
+    if (!audio_trace_budget())
+        return;
     for (uint32_t id : announced())
         if (id == b->id)
             return;
@@ -780,8 +785,14 @@ void Buffer_Play(X86 *c) {
         com_ret(c, DS_OK);
         return;
     }
-    if (b->channel < 0)
+    if (b->channel < 0) {
         b->channel = dx_alloc_audio_channel();
+        // A reused host channel still carries the rate a SetFrequency gave its
+        // last owner, and that override would outlive the rate this buffer
+        // plays at; this buffer's own frequency goes with every Play.
+        if (b->channel >= 0)
+            host_audio_set_frequency(b->channel, 0);
+    }
     if (b->channel < 0) {
         com_ret(c, DSERR_ALLOCATED);
         return;
@@ -1329,13 +1340,14 @@ void L3D_SetVelocity(X86 *c) {
 void L3D_GetAllParameters(X86 *c) {
     uint32_t out = arg(c, 1);
     // DS3DLISTENER: dwSize, vPosition, vVelocity, vOrientFront, vOrientTop,
-    // flDistanceFactor, flRolloffFactor, flDopplerFactor = 68 bytes.
+    // flDistanceFactor, flRolloffFactor, flDopplerFactor = 64 bytes. Asking
+    // for 68 refused every game that filled in sizeof(DS3DLISTENER).
     if (!out || !gm_valid(out, 4)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
     uint32_t size = rd32(out);
-    if (size < 68 || !gm_valid(out, size)) {
+    if (size < 64 || !gm_valid(out, size)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1356,7 +1368,7 @@ void L3D_GetAllParameters(X86 *c) {
 
 void L3D_SetAllParameters(X86 *c) {
     uint32_t in = arg(c, 1);
-    if (!in || !gm_valid(in, 68)) {
+    if (!in || !gm_valid(in, 64)) { // sizeof(DS3DLISTENER)
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1638,7 +1650,7 @@ void DS_GetSpeakerConfig(X86 *c) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
-    wr32(out, 2); // DSSPEAKER_STEREO
+    wr32(out, 4); // DSSPEAKER_STEREO (2 is DSSPEAKER_MONO)
     com_ret(c, DS_OK);
 }
 

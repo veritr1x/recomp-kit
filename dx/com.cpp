@@ -5,17 +5,44 @@
 #include <string.h>
 #include <deque>
 
-std::deque<ComObj> *g_com_objects = nullptr;
+std::deque<std::unique_ptr<ComObj>> *g_com_objects = nullptr;
 
 namespace {
 
-// Objects are held in a deque so a pointer stays valid while another object is
-// created during a shim call (CreateSurface makes a back buffer, and the
-// caller still holds the ComObj* for the primary).
-std::deque<ComObj> &objects() {
+// Objects are allocated one by one and owned by the deque, so a pointer stays
+// valid while another object is created during a shim call (CreateSurface
+// makes a back buffer, and the caller still holds the ComObj* for the primary).
+std::deque<std::unique_ptr<ComObj>> &objects() {
     if (!g_com_objects)
-        g_com_objects = new std::deque<ComObj>();
+        g_com_objects = new std::deque<std::unique_ptr<ComObj>>();
     return *g_com_objects;
+}
+
+// A dead object used to stay in the table for the rest of the run: about 4 KB
+// each plus whatever its members held, and a Direct3D 9 game makes a few every
+// frame (NFS Carbon measured about 1 GB an hour). Dead ids wait here, oldest
+// first, and are freed once COM_GRAVEYARD later objects have died, so nothing
+// destroyed recently - a shim may still hold its pointer, as com_release does
+// after a reference hook - is freed under its caller. The table is read and
+// changed only by the thread holding the baton (the baton-free DirectSound
+// calls keep their own pointers, dropped before an object dies), so this needs
+// no lock, like the table itself.
+constexpr size_t COM_GRAVEYARD = 1024;
+std::deque<uint32_t> &graveyard() {
+    static auto *v = new std::deque<uint32_t>();
+    return *v;
+}
+void bury(uint32_t id) {
+    graveyard().push_back(id);
+    while (graveyard().size() > COM_GRAVEYARD) {
+        const uint32_t old = graveyard().front();
+        graveyard().pop_front();
+        if (old && old <= objects().size()) {
+            std::unique_ptr<ComObj> &slot = objects()[old - 1];
+            if (slot && !slot->alive)
+                slot.reset();
+        }
+    }
 }
 
 uint32_t g_vtable[IF_COUNT] = {0};
@@ -71,6 +98,7 @@ uint32_t build_vtable(const VtDef &d) {
 // ---------------------------------------------------------------------------
 void com_reset() {
     objects().clear();
+    graveyard().clear();
     // Objects held guest heap blocks that mem_init() already discarded; the
     // vtables did too, so rebuild them at their new addresses.
     for (uint32_t i = 0; i < IF_COUNT; ++i)
@@ -80,8 +108,8 @@ void com_reset() {
 }
 
 ComObj *com_new(ComKind kind) {
-    objects().emplace_back();
-    ComObj &o = objects().back();
+    objects().emplace_back(std::make_unique<ComObj>());
+    ComObj &o = *objects().back();
     o.id = (uint32_t)objects().size(); // ids are 1-based; 0 means none
     o.kind = kind;
     o.refs = 1;
@@ -286,6 +314,7 @@ void com_destroy(ComObj *o) {
         }
     }
     o->alive = false;
+    bury(o->id);
 }
 
 // ---------------------------------------------------------------------------
@@ -819,8 +848,8 @@ uint32_t com_object_count() {
 
 uint32_t com_live_count() {
     uint32_t n = 0;
-    for (const ComObj &o : objects())
-        if (o.alive)
+    for (const auto &o : objects())
+        if (o && o->alive)
             ++n;
     return n;
 }
@@ -830,9 +859,10 @@ void com_dump(FILE *out) {
                                   "d3ddevice", "viewport", "material", "light",   "dsound",
                                   "dsbuffer",  "dinput",   "didevice"};
     fprintf(out, "live COM objects (%u of %zu created):\n", com_live_count(), objects().size());
-    for (const ComObj &o : objects()) {
-        if (!o.alive)
+    for (const auto &p : objects()) {
+        if (!p || !p->alive)
             continue;
+        const ComObj &o = *p;
         const char *k = (size_t)o.kind < sizeof kinds / sizeof *kinds ? kinds[o.kind] : "?";
         fprintf(out, "  #%-3u %-10s refs=%-3d", o.id, k, o.refs);
         if (o.kind == K_SURFACE)

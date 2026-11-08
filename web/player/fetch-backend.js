@@ -28,10 +28,24 @@ addToLibrary({
     backgroundSlots: 3,      // concurrent requests for the background fill
     timeoutMs: 45000,        // a request that delivers nothing is retried
     attempts: 6,
+    prefetchBudget: 64 * 1024 * 1024,  // bytes one prefetch hint may queue
+  },
+  // A game's hint that it will soon read `length` bytes at `offset` of `path`
+  // (relative to the streamed installation, any case, '/' separated). The
+  // caller is a guest thread; the backend lives on the WasmFS proxy worker,
+  // so the hint travels over a BroadcastChannel. Nothing is read into guest
+  // memory: the backend only brings the chunks into its caches.
+  $recompStreamHints: null,
+  recomp_web_stream_prefetch__deps: ['$recompStreamHints', '$UTF8ToString'],
+  recomp_web_stream_prefetch: function(path, offset, length) {
+    if (typeof BroadcastChannel != 'function') return;
+    if (!recompStreamHints) recompStreamHints = new BroadcastChannel('recomp-stream-prefetch');
+    recompStreamHints.postMessage({ path: UTF8ToString(path), offset, length });
   },
   _wasmfs_create_fetch_backend_js__deps: [
     '$wasmFS$backends', '$recompStream',
     '_wasmfs_fetch_get_file_url', '_wasmfs_fetch_get_chunk_size', 'recomp_web_stream_size',
+    'recomp_stream_resident', '$stringToUTF8OnStack', '$withStackSave',
   ],
   _wasmfs_create_fetch_backend_js: async function(backend) {
     const cfg = recompStream;
@@ -132,6 +146,21 @@ addToLibrary({
     }
 
     // ---- memory cache --------------------------------------------------------
+    // The runtime keeps a guest thread's small read on the scheduler baton only
+    // while its bytes are in this memory cache (runtime/kernel32.cpp
+    // stream_read_resident): each chunk entering or leaving it is published by
+    // its manifest path under the mount. A chunk kept only in OPFS is not
+    // resident: reading it back still takes a round trip through this worker.
+    function publish(key, resident) {
+      const at = key.lastIndexOf('@');
+      const name = key.slice(0, at), index = Number(key.slice(at + 1));
+      const size = manifest && manifest.sizes.get(name);
+      if (at <= 0 || !(size > 0) || !Number.isInteger(index)) return;
+      const step = span(size);
+      const start = index * step, end = Math.min(size, start + step);
+      if (end <= start) return;
+      withStackSave(() => _recomp_stream_resident(stringToUTF8OnStack(name), start, end, size, resident ? 1 : 0));
+    }
     function remembered(key) {
       const bytes = memory.get(key);
       if (bytes) { memory.delete(key); memory.set(key, bytes); }
@@ -143,11 +172,13 @@ addToLibrary({
         const oldest = memory.keys().next().value;
         memoryBytes -= memory.get(oldest).length;
         memory.delete(oldest);
+        publish(oldest, false);
       }
       cfg.memoryBytes = memoryBytes;
       memory.set(key, bytes);
       memoryBytes += bytes.length;
       cfg.memoryBytes = memoryBytes;  // for tests
+      publish(key, true);
       return bytes;
     }
 
@@ -287,11 +318,14 @@ addToLibrary({
         const tab = line.indexOf('\t');
         if (tab > 0) files.push([line.slice(tab + 1), Number(line.slice(0, tab))]);
       }
-      manifest = { base: info.base, text, bytes: new TextEncoder().encode(text), files, folders: new Map() };
+      manifest = { base: info.base, text, bytes: new TextEncoder().encode(text), files, folders: new Map(),
+                   byName: new Map(), sizes: new Map() };
       for (const [path, size] of files) {
         const folder = path.slice(0, path.lastIndexOf('/') + 1);
         if (!manifest.folders.has(folder)) manifest.folders.set(folder, []);
         manifest.folders.get(folder).push([path, size]);
+        manifest.byName.set(path.toLowerCase(), [path, size]);
+        manifest.sizes.set(path, size);
       }
       ready = openCache(text, info.base).then(() => { setTimeout(fill, 0); setInterval(report, 30000); });
       return manifest;
@@ -327,6 +361,40 @@ addToLibrary({
         const step = span(size);
         for (let index = 0; index * step < Math.max(size, 1); ++index) chunk(info, index, 1).catch(() => {});
       }
+    }
+
+    // ---- prefetch hints -----------------------------------------------------
+    // The game names a byte range it expects to read soon (recomp_web_stream_
+    // prefetch). Chunks not already kept are fetched at read-ahead priority,
+    // behind any read the guest waits on, and kept like any other. Returns the
+    // number of chunks queued.
+    function prefetch(path, offset, length) {
+      if (!manifest || typeof path != 'string') return 0;
+      const found = manifest.byName.get(path.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase());
+      if (!found) return 0;
+      const [name, size] = found;
+      offset = Math.max(0, Math.floor(Number(offset) || 0));
+      const end = Math.min(size, offset + Math.min(Math.floor(Number(length) || 0), cfg.prefetchBudget));
+      if (end <= offset) return 0;
+      const info = { url: manifest.base + '/' + name.split('/').map(encodeURIComponent).join('/'), path: name, size };
+      const step = span(size);
+      let queued = 0;
+      touched.add(name);
+      for (let index = Math.floor(offset / step); index * step < end; ++index) {
+        const key = name + '@' + index;
+        if (onDisk.has(chunkName(name, index)) || memory.has(key) || pending.has(key)) continue;
+        chunk(info, index, 1).catch(() => {});
+        queued++;
+      }
+      return queued;
+    }
+    cfg.prefetch = prefetch;  // for tests
+    if (typeof BroadcastChannel == 'function') {
+      const hints = new BroadcastChannel('recomp-stream-prefetch');
+      hints.onmessage = event => {
+        const hint = event.data || {};
+        if (ready) ready.then(() => prefetch(hint.path, hint.offset, hint.length));
+      };
     }
 
     // ---- background fill ----------------------------------------------------

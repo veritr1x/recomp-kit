@@ -2,6 +2,139 @@
 
 ## Unreleased
 
+- Direct3D 9, DirectSound and D3DX shims:
+  - Draws with no vertex or pixel shader bound are drawn with vs_2_0/ps_2_0
+    programs generated from the fixed-function state (`dx/d3d9_ffp.cpp`,
+    adapted from the HommaRe kit, cached per state) instead of being skipped;
+    SetFVF, SetMaterial, SetLight and LightEnable are implemented for it.
+  - CreateDevice masks FPU exceptions unless D3DCREATE_FPU_PRESERVE is passed
+    (precision control is left as the guest set it).
+  - Shader `exp`/`expp` are base 2 (vs_1_1 `expp` returns its partial split),
+    and a relative constant read uses the a0 component (or aL) it names.
+  - A dynamic vertex or index buffer keeps its staged guest copy between
+    locks and compares only the locked ranges at Unlock; static buffers drop
+    the copy (A/B switch `locks`).
+  - Releasing a texture destroys its levels and faces; a level holds one
+    texture reference while the game holds it; SetRenderTarget and
+    SetDepthStencilSurface hold the bound surface; Reset releases only the
+    device's own automatic depth buffer; GetDepthStencilSurface with none set
+    answers D3DERR_NOTFOUND.
+  - Destroyed COM objects are freed once 1024 later objects have died; ids are
+    never reused.
+  - GetRenderState, GetSamplerState, GetTextureStageState, GetTexture and
+    GetRenderTarget return the bound state; draws above MaxPrimitiveCount are
+    refused with D3DERR_INVALIDCALL and the UP draws size in 64 bits.
+  - D3DX binds a 3x4 matrix parameter read by a 4x3 shader constant
+    transposed, and a matrix set with SetMatrix* from its whole 4x4; an effect
+    bind that writes no register keeps the constant serial.
+  - DirectSound reports DSSPEAKER_STEREO, accepts the 64-byte DS3DLISTENER,
+    keeps first-play announcements behind RECOMP_AUDIO_TRACE, clears a reused
+    channel's frequency override, and an unchanged SetPan/SetFrequency no
+    longer marks a playing channel stopped; a playing streaming ring is
+    rebuilt in place rather than replaced by a looping copy.
+- Translated code and the runtime (regenerate to pick them up where noted):
+  - Guest stores test the watch and the dirty ranges with one unlikely
+    compare and call an out-of-line, cold `recomp_store_hooks` when either is
+    armed, instead of inlining both checks and the dirty loop into every
+    store. Behaviour is unchanged. Regenerate.
+  - REP MOVS/STOS of 32 bytes or more inside the guest arena run as one
+    memmove or fill when no watch is armed and the copy direction cannot
+    replicate a pattern; memory, dirty spans, ECX, ESI and EDI end as the
+    element loop leaves them, and anything else falls back to the loop
+    (`recomp_rep_bulk`, A/B switch `reps`). Regenerate.
+  - QueryPerformanceFrequency reports 10 MHz and QueryPerformanceCounter counts
+    a microsecond clock on GetTickCount's time line (`host_micros`, anchored to
+    host_millis and advanced by the monotonic clock), never repeating a value
+    and never passing the next microsecond; a pinned clock still reads whole
+    milliseconds. The free-run and baton paths share one atomic last value.
+  - A guest thread's stack is the larger of its dwStackSize and the image's
+    SizeOfStackReserve, at least 256 KiB and at most 16 MiB (NFSMW: 1 MiB).
+  - A thread's scheduler slice starts when it gets the baton back, not when it
+    gave it up.
+  - GetLastError/SetLastError are per guest thread.
+  - Operand-redirect seeds copy only up to the next redirected location (or
+    the width a generated table gives in `recomp_operand_redirect_widths`), so
+    neighbouring four-byte slots no longer overwrite each other.
+  - SEH checkpoints below the restored FS:[0] head are dropped at the restore.
+  - The translator writes each operand-redirect width into
+    `recomp_operand_redirect_widths` (byte 1 to tword 10), in pair order.
+    Regenerate.
+  - Translator speedups, each a `game.toml` `[translate.speedups]` switch
+    (`tools/game_config.py` TRANSLATE_SPEEDUPS; `RECOMP_TRANSLATE_SPEEDUPS`
+    or `translate.py --speedup name=0|1` override one for a regeneration, and
+    the report lists them under `speedups`). Regenerate. On by default:
+    `shim_first` (recomp_call/recomp_jump test the shim range before the
+    lookups), `icall_shim_inline` (an indirect CALL calls a shim itself),
+    and the x87 write-back trims `x87_trim_popped` (a popped register gets
+    only its empty tag), `x87_skip_inexact_bits` (st_bits only where
+    st_exact), `x87_batch_tags` (one tag-word update) and `x87_part_dirty`
+    (no repeated st_exact = 0). Off by default: `x87_carry` (the x87 stack
+    stays in locals across labels and branches; only edges whose shapes
+    differ write back), `x87_st0_leaves` (a CALL to a `[translate]
+    st0_leaves` entry hands ST(0) to its recipe in `runtime/x87_leaves.h`,
+    `ftol2` for MSVC `_ftol2`), `devirt` with `icall_profile_record` (sites
+    call the at most four translated targets a recorded run found,
+    `runtime/icall_profile.h`, `[translate] icall_profile`) and
+    `seh_separate_restores` (a body that only restores FS:[0] retires its
+    frame).
+  - A wait applies host signals that landed since the import's checkpoint;
+    callback records are reused (32 per thread); the unknown-argument-count
+    warning no longer formats a string on every call.
+- Web build and hosts:
+  - The web preset compiles and links every object with `-fwasm-exceptions
+    -sSUPPORT_LONGJMP=wasm`: setjmp/longjmp and C++ exceptions unwind natively
+    instead of through `invoke_*` JavaScript trampolines. Reconfigure the web
+    build; a configure without the flags warns.
+  - A streamed file read the fetch backend reports as not in its memory gives
+    up the baton for its wait, whatever its size (`recomp_stream_resident`,
+    called by the backend); reads of 40 ms or more log `[stall] slow read:`
+    with the file, offset, time and guest thread.
+  - Browser gamepads reach the game in `pad = "mapped"` mode: the web start
+    initialises SDL's gamepad subsystem and installs the controls hooks.
+  - The desktop idle wait sleeps a sub-millisecond remainder instead of
+    polling in a loop.
+  - `tools/build.py` keeps the timestamps of regenerated files whose bytes did
+    not change, so only changed translated sources recompile.
+
+- The web player's fetch backend takes prefetch hints: a game's native code
+  calls `recomp_web_stream_prefetch(path, offset, length)` (a JS library
+  function in `web/player/fetch-backend.js`), which posts on the
+  `recomp-stream-prefetch` BroadcastChannel; the backend fetches that range's
+  missing chunks at read-ahead priority into its memory and OPFS caches,
+  at most 64 MiB a hint, without any guest read. Paths match the manifest in
+  any case.
+- The fetch backend publishes each chunk entering or leaving its memory cache
+  to the runtime (`recomp_stream_resident`, by manifest path under `/data/`),
+  so a small guest read of bytes it does not hold in memory releases the
+  baton. Chunks kept only in OPFS count as not resident.
+- Browser rendering, each with an in-run A/B switch (`platform/ab_phase.h`) that
+  takes the earlier behaviour during the A/B's earlier phase:
+  - Present no longer waits for the page's main thread to encode and present
+    the frame. It queues the present and waits only while 2 presents are
+    still queued (`RECOMP_D3D9_FRAMES_AHEAD`, 1-4); reads, query results in
+    step and device switches still wait for everything (`present`).
+  - A full presenter target pool on the page's main thread drops the frame at
+    once instead of freezing the page for 250 ms (`present`).
+  - A draw's shader constants are copied into the render queue only when they
+    changed since the batch's last copy: the same register serial, or the same
+    bytes (`constbank`). `HostD9Draw` carries `vconst_serial`/`pconst_serial`.
+  - A vertex or index buffer rewritten while recorded draws use it no longer
+    submits the frame's commands when the write misses the bytes those draws
+    read; otherwise a buffer of up to 256 KiB is drawn from a copy in the
+    vertex ring until the submit (`submit`).
+  - Retiring a texture drops only the bind groups that name its view, not all
+    of them (`groups`).
+  - Indexed triangle and line strips name their index format in the pipeline,
+    as WebGPU requires for an indexed strip draw (no switch: a fix).
+  - `RECOMP_D3D9_STATS` adds a `d3d9 queue:` line (the game thread's waits for
+    the renderer, constant bytes copied) and, on the WebGPU line, submits,
+    buffer copies, disjoint writes, new pipelines (with their creation time)
+    and new and dropped bind groups per frame.
+- Browser audio plays through an AudioWorklet (`host/audio/web_sink.cpp`)
+  that copies from a ring rendered ahead by a thread of its own, instead of
+  SDL's ScriptProcessorNode on the page's main thread. `RECOMP_AUDIO_SINK=sdl`
+  brings back SDL's output, which is also used when Web Audio cannot start;
+  `RECOMP_AUDIO_AHEAD` sets the backlog (4096 frames).
 - In the browser the scheduler's import checkpoint reads the clock on every
   256th import call, counted with a plain integer, instead of the adaptive
   8-1024 stride with thread-local counters; a pinned clock keeps the adaptive

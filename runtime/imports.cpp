@@ -36,6 +36,8 @@ struct Tramp {
     uint32_t calls = 0;
     // Entered without a scheduling checkpoint (see atomic_import).
     bool atomic = false;
+    // The unknown-argument-count warning has been logged for this one.
+    bool argc_warned = false;
     // Held around the shim as well as the baton (imports_serialize_dll).
     std::recursive_mutex *serial = nullptr;
 };
@@ -723,12 +725,18 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
         pop = 4;
     } else if (argc == ARGC_UNKNOWN) {
         pop = 4;
-        char key[512 + 6];
-        snprintf(key, sizeof key, "%.511s#argc", desc_now());
-        log_once(key,
-                 "%s has an unknown stdcall argument count: not adjusting ESP, "
-                 "the guest stack will drift if it is really stdcall",
-                 desc_now());
+        // Once per trampoline, by a flag on it: formatting the key for
+        // log_once on every call cost a string format per call of a shim the
+        // game may call every frame (Galavic).
+        if (!table[idx].argc_warned) {
+            table[idx].argc_warned = true;
+            char key[512 + 6];
+            snprintf(key, sizeof key, "%.511s#argc", desc_now());
+            log_once(key,
+                     "%s has an unknown stdcall argument count: not adjusting ESP, "
+                     "the guest stack will drift if it is really stdcall",
+                     desc_now());
+        }
     } else {
         pop = 4 + 4u * argc;
     }
@@ -750,10 +758,33 @@ struct Callback {
     jmp_buf env;
     uint32_t saved_esp, saved_eip, return_sp, profile_depth;
 };
+// A thread's callback records, and the ones it has finished with. A window
+// procedure, a timer or a mod hook calls guest code from a shim many times a
+// frame; each record holds a jmp_buf, and allocating and freeing one per call
+// was a heap round trip for every one of them (Galavic). Up to kPoolMax are
+// kept for reuse; deeper nesting allocates as before.
 struct Callbacks {
+    static constexpr size_t kPoolMax = 32;
     std::vector<Callback *> stack;
+    std::vector<Callback *> pool;
+    Callback *acquire() {
+        if (pool.empty())
+            return new Callback{};
+        Callback *call = pool.back();
+        pool.pop_back();
+        *call = Callback{};
+        return call;
+    }
+    void release(Callback *call) {
+        if (pool.size() < kPoolMax)
+            pool.push_back(call);
+        else
+            delete call;
+    }
     ~Callbacks() {
         for (Callback *call : stack)
+            delete call;
+        for (Callback *call : pool)
             delete call;
     }
 };
@@ -769,7 +800,7 @@ void recomp_callback_truncate(uint32_t depth) {
         // Delphi and C++ landings both abandon native callback records.
         // Dispatcher authorization must die with the record it described.
         recomp_msvc_callback_leave(callbacks.stack.back()->cpu, uint32_t(callbacks.stack.size()));
-        delete callbacks.stack.back();
+        callbacks.release(callbacks.stack.back());
         callbacks.stack.pop_back();
     }
 }
@@ -777,7 +808,7 @@ void recomp_callback_truncate(uint32_t depth) {
 void recomp_callback_reset(X86 *c) {
     for (size_t i = callbacks.stack.size(); i-- > 0;)
         if (!c || callbacks.stack[i]->cpu == c) {
-            delete callbacks.stack[i];
+            callbacks.release(callbacks.stack[i]);
             callbacks.stack.erase(callbacks.stack.begin() + i);
         }
 }
@@ -798,7 +829,7 @@ void recomp_callback_return(X86 *c) {
 }
 
 uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
-    Callback *call = new Callback{};
+    Callback *call = callbacks.acquire();
     call->cpu = c;
     call->saved_esp = c->r[R_ESP];
     call->saved_eip = c->eip;
@@ -820,7 +851,7 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     c->r[R_ESP] = call->saved_esp;
     c->eip = call->saved_eip;
     callbacks.stack.pop_back();
-    delete call;
+    callbacks.release(call);
     return eax;
 }
 

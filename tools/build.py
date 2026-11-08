@@ -7,6 +7,7 @@ outputs (the translation, the texture pack, the apps, the logs) go under
 build/. The kit's own default is games/stub, a game that does not exist."""
 
 import argparse
+import filecmp
 import json
 import os
 from pathlib import Path
@@ -304,6 +305,26 @@ def android_install_and_launch(apk, bundle_id, device=None, console=False, *, ga
         subprocess.run(command + ["logcat"], check=True)
 
 
+def keep_unchanged_timestamps(stage, gen):
+    """Give each staged file identical to its published one that file's times.
+
+    A regeneration rewrites every file, so every translated chunk looked newer
+    than its object and recompiled, though a change to the game's config
+    usually changes one table and leaves the chunks byte for byte the same
+    (austynoconnor/recomp-kit). A file whose bytes are unchanged keeps the time
+    its object was built against; any other file keeps its new time. Publishing
+    stays a rename of the whole tree."""
+    if not gen.is_dir():
+        return
+    for source in stage.rglob("*"):
+        if not source.is_file():
+            continue
+        previous = gen / source.relative_to(stage)
+        if previous.is_file() and filecmp.cmp(source, previous, shallow=False):
+            before = previous.stat()
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
 def publish_generated(build_root, translate):
     """Stage a translation, then publish gen/ and symbols.json by rename.
 
@@ -323,6 +344,7 @@ def publish_generated(build_root, translate):
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
+    keep_unchanged_timestamps(stage, gen)
     shutil.rmtree(old, ignore_errors=True)
     if gen.exists():
         gen.rename(old)

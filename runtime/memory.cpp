@@ -4,6 +4,7 @@
 #include "win32.h"
 #include "loader.h"
 
+#include "../platform/ab_phase.h"
 #include "../platform/os.h"
 #if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
 #include <execinfo.h>
@@ -119,6 +120,85 @@ extern "C" void recomp_watch_hit(uint32_t addr, uint32_t n, uint64_t value) {
     static uint32_t hits = 0;
     LOGW("watch: %08x %u = %llx by %s (hit %u)", addr, n, (unsigned long long)value, watch_writer(),
          ++hits);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk REP MOVS/STOS (declared in x86.h beside STRING_OPS). The element loop
+// costs a loop iteration and the store hooks per element; a memmove or fill of
+// the whole run leaves the same bytes, registers and dirty spans whenever the
+// conditions below hold, and otherwise this returns 0 having touched nothing.
+// ---------------------------------------------------------------------------
+extern "C" int recomp_rep_bulk(X86 *c, uint32_t width, int stos) {
+    if (recomp_ab::old(recomp_ab::REPS))
+        return 0;
+    // A watch reports each element's store with its value; the loop does that.
+    if (g_watch_len != 0)
+        return 0;
+    const uint32_t count = c->r[R_ECX];
+    const uint64_t bytes = (uint64_t)count * width;
+    if (bytes < RECOMP_REP_BULK_MIN)
+        return 0;
+    const bool down = c->eflags_df != 0;
+    // The lowest byte each run covers. Going down, the first element is the
+    // highest one and the run ends (count - 1) elements below it.
+    const uint64_t back = bytes - width;
+    const uint32_t edi = c->r[R_EDI], esi = c->r[R_ESI];
+    if (down && (edi < back || (!stos && esi < back)))
+        return 0; // the loop would wrap below address 0
+    const uint64_t dst = down ? edi - back : edi;
+    const uint64_t src = down ? esi - back : esi;
+    // Inside the arena and clear of the null page: the loop's own accessors are
+    // what fault there (RECOMP_NULL_CHECKS) or reach past the arena, so leave
+    // those to it.
+    if (dst < GUEST_NULL_LIMIT || dst + bytes > GUEST_SIZE)
+        return 0;
+    if (!stos && (src < GUEST_NULL_LIMIT || src + bytes > GUEST_SIZE))
+        return 0;
+    uint8_t *const mem = RECOMP_GUEST_BASE;
+    if (stos) {
+        const uint32_t v = c->r[R_EAX];
+        const uint8_t b0 = (uint8_t)v;
+        if (width == 1 || (width == 2 && (uint8_t)(v >> 8) == b0) || v == b0 * 0x01010101u) {
+            memset(mem + dst, b0, (size_t)bytes);
+        } else {
+            // Whole elements, every one the same, so the direction is moot.
+            uint8_t *p = mem + dst;
+            for (uint32_t i = 0; i < count; ++i, p += width)
+                memcpy(p, &v, width);
+        }
+    } else {
+        // memmove equals the element loop unless a later element reads a byte
+        // an earlier one wrote: going up that is a destination above an
+        // overlapping source, going down one below it. There the loop
+        // replicates a pattern, which the loop itself does best.
+        const bool overlap = dst < src + bytes && src < dst + bytes;
+        if (overlap && (down ? dst < src : dst > src))
+            return 0;
+        if (dst != src)
+            memmove(mem + dst, mem + src, (size_t)bytes);
+    }
+    // Each element widens the span of every dirty range it touches; the
+    // elements are contiguous, so the union over them is the run clipped to the
+    // range and rounded out to the element boundaries.
+    for (uint32_t i = 0; i < g_dirty_count; ++i) {
+        RecompDirty *d = &g_dirty[i];
+        const uint64_t lo = std::max<uint64_t>(dst, d->base);
+        const uint64_t hi = std::min<uint64_t>(dst + bytes, (uint64_t)d->base + d->len);
+        if (lo >= hi)
+            continue;
+        const uint64_t first = dst + (lo - dst) / width * width;
+        const uint64_t last = dst + (hi - dst + width - 1) / width * width;
+        if (first < d->lo)
+            d->lo = (uint32_t)first;
+        if (last > d->hi)
+            d->hi = (uint32_t)last;
+    }
+    const uint32_t step = (uint32_t)bytes;
+    c->r[R_EDI] = down ? edi - step : edi + step;
+    if (!stos)
+        c->r[R_ESI] = down ? esi - step : esi + step;
+    c->r[R_ECX] = 0;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

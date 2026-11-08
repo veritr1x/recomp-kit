@@ -52,6 +52,10 @@ class D9Backend {
     virtual void probe_next(const char *tag) = 0;
 };
 
+// Tests: the host_d9_* entry points drive `backend` (owned from here on; nullptr: none) after
+// the queued work for the previous one has run. True when one is set.
+bool host_d9_use_backend_for_test(D9Backend *backend);
+
 // Each returns nullptr when `device` is not its API's, or when the renderer
 // could not start. Defined by the backends this platform builds.
 #ifdef __APPLE__

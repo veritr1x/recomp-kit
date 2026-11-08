@@ -1319,10 +1319,25 @@ int service(double seconds) {
     bool first = true;
     for (;;) {
         bool got;
-        if (first && seconds > 0.0)
-            got = SDL_WaitEventTimeout(&event, int(seconds * 1000.0));
-        else
+        const int ms = int(seconds * 1000.0);
+        if (first && ms >= 1) {
+            got = SDL_WaitEventTimeout(&event, ms);
+        } else if (first && seconds > 0.0) {
+            // SDL waits in whole milliseconds, and int() made a sub-millisecond
+            // remainder a zero timeout, which is an immediate poll. The
+            // scheduler hands over the time left to the guest's own deadline,
+            // routinely under a millisecond, and takes a return as a serviced
+            // slice, so the host spun polling with the guest asleep
+            // (syleront/recomp-kit measured ~105k calls a second). Poll, then
+            // sleep out the remainder precisely, then poll again.
             got = SDL_PollEvent(&event);
+            if (!got) {
+                SDL_DelayNS(uint64_t(seconds * 1e9));
+                got = SDL_PollEvent(&event);
+            }
+        } else {
+            got = SDL_PollEvent(&event);
+        }
         first = false;
         if (!got)
             break;
@@ -1760,7 +1775,9 @@ int web_main(int argc, char **argv) {
         fprintf(stderr, RECOMP_APP_NAME ": the page gave no --exe\n");
         return 2;
     }
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+    // The gamepad subsystem as on the desktop: SDL reads the browser's Gamepad
+    // API through it, and without it no controller ever opens.
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, RECOMP_APP_NAME ": SDL_Init failed: %s\n", SDL_GetError());
         return 3;
     }
@@ -1797,6 +1814,18 @@ int web_main(int argc, char **argv) {
     mods_display_load_modes(classic_modes_path().c_str());
     host_present_on_mode_change(on_mode_change);
     host_input_set_notify(dinput_host_input_changed);
+    // The same controls hooks as the desktop start (austynoconnor/recomp-kit):
+    // without them pad = "mapped" keeps its empty default table and nowhere to
+    // send its keys, so a browser controller reached the virtual pad but never
+    // the game.
+    {
+        controls::HostHooks hooks;
+        hooks.key = push_touch_key;
+        hooks.touch_actions = push_touch_actions;
+        hooks.system_keyboard = toggle_system_keyboard;
+        hooks.open_settings = open_settings_page;
+        controls::host_init(hooks);
+    }
     host_present_start(g_surface, dw, dh);
     if (!host_d9_web_start(g_gpu.get()))
         fprintf(stderr,

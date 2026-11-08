@@ -9,6 +9,12 @@ extern const uint32_t recomp_operand_redirect_pairs[];
 extern const uint32_t recomp_operand_redirect_count;
 __attribute__((weak)) const uint32_t recomp_operand_redirect_pairs[2] = {0, 0};
 __attribute__((weak)) const uint32_t recomp_operand_redirect_count = 0;
+// The operand's width per pair, in the pairs' order, when the table carries it
+// (count equal to the pairs' count); otherwise the loader infers it (below).
+extern const uint8_t recomp_operand_redirect_widths[];
+extern const uint32_t recomp_operand_redirect_width_count;
+__attribute__((weak)) const uint8_t recomp_operand_redirect_widths[1] = {0};
+__attribute__((weak)) const uint32_t recomp_operand_redirect_width_count = 0;
 extern const uint32_t recomp_data_seed_pairs[];
 extern const uint32_t recomp_data_seed_count;
 __attribute__((weak)) const uint32_t recomp_data_seed_pairs[2] = {0, 0};
@@ -38,6 +44,7 @@ namespace {
 std::string g_error;
 std::string g_exe_path;
 uint32_t g_base = 0, g_size = 0, g_entry = 0, g_iat_patched = 0, g_iat_data = 0;
+uint32_t g_stack_reserve = 0; // the image's SizeOfStackReserve
 std::vector<SectionInfo> g_sections;
 LoaderModule g_main;
 X86 g_ctx;
@@ -507,6 +514,7 @@ void loader_test_reset_modules() {
     g_aux_pending.clear();
     g_main = LoaderModule{};
     g_base = g_size = g_entry = 0;
+    g_stack_reserve = 0;
     g_error.clear();
 }
 bool loader_test_map_module(const char *name, const char *path, const char *sha256, uint32_t base,
@@ -605,6 +613,9 @@ uint32_t loader_image_size() {
 }
 uint32_t loader_image_limit() {
     return g_base && g_size ? g_base + g_size : 0;
+}
+uint32_t loader_stack_reserve() {
+    return g_stack_reserve;
 }
 uint32_t loader_entry_point() {
     return g_entry;
@@ -714,6 +725,7 @@ bool loader_load(const char *exe_path) {
     g_base = image_base;
     g_size = size_image;
     g_entry = image_base + entry_rva;
+    g_stack_reserve = opt_size >= 76 ? rd<uint32_t>(file, opt_off + 72) : 0;
     g_main.name = RECOMP_EXECUTABLE;
     g_main.path = g_exe_path;
     g_main.base = g_base;
@@ -766,12 +778,31 @@ bool loader_load(const char *exe_path) {
     }
 
     // game.toml operand_redirects: each new location starts with the value of
-    // the one it replaces (8 bytes, enough for a double).
-    for (uint32_t i = 0; i < recomp_operand_redirect_count; ++i) {
-        uint32_t from = recomp_operand_redirect_pairs[2 * i],
-                 to = recomp_operand_redirect_pairs[2 * i + 1];
-        if ((uint64_t)from + 8 <= GUEST_SIZE && (uint64_t)to + 8 <= GUEST_SIZE)
-            memcpy(g_mem + to, g_mem + from, 8);
+    // the one it replaces. The copy is the operand's width when the table says
+    // it. Otherwise it is 8 bytes (enough for a double) cut short at the next
+    // redirected location: the table lists pairs by source, so a blind 8-byte
+    // copy let a slot's neighbour land on it after it was written (NFSMW's
+    // four-byte camera slots 0x00a37800-0x00a3781c ended up holding the bytes
+    // after 0x008970f0 and 0x008933d4 rather than their own values).
+    {
+        const uint32_t n = recomp_operand_redirect_count;
+        const bool widths = recomp_operand_redirect_width_count == n;
+        std::vector<uint32_t> dests;
+        for (uint32_t i = 0; i < n; ++i)
+            dests.push_back(recomp_operand_redirect_pairs[2 * i + 1]);
+        std::sort(dests.begin(), dests.end());
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t from = recomp_operand_redirect_pairs[2 * i],
+                           to = recomp_operand_redirect_pairs[2 * i + 1];
+            uint32_t width = widths ? recomp_operand_redirect_widths[i] : 8u;
+            if (!widths) {
+                const auto next = std::upper_bound(dests.begin(), dests.end(), to);
+                if (next != dests.end() && *next - to < width)
+                    width = *next - to;
+            }
+            if (width && (uint64_t)from + width <= GUEST_SIZE && (uint64_t)to + width <= GUEST_SIZE)
+                memcpy(g_mem + to, g_mem + from, width);
+        }
     }
 
     // game.toml data_seeds: slots the translation's patches read.

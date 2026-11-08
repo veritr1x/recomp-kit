@@ -117,6 +117,10 @@ typedef struct HostD9Draw {
     // Nonzero: the three state tables above are unchanged for as long as this
     // is, so a host may reuse its copy from an earlier draw with the same value.
     uint64_t state_version;
+    // Nonzero: a fresh value at each write of the vertex / pixel constant registers that
+    // vconst / pconst point into, so a host may reuse its copy from an earlier draw with the
+    // same value. Zero: unknown; the registers are read every time.
+    uint64_t vconst_serial, pconst_serial;
     const char *label; // what bound the shaders, for diagnostics; may be null
 } HostD9Draw;
 

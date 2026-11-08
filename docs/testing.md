@@ -274,6 +274,14 @@ decodes the jump-table shapes on synthetic functions over a fake image;
 leaves behind. Add a case there first when the translator meets an
 instruction or table shape it does not handle.
 
+The `[translate.speedups]` switches have their own suites, which need no C
+compiler: `test_x87_carry.py` runs random branchy x87 functions through
+`cmini.py`, a small interpreter of the generated C, with `--x87-direct` and
+with the x87 cache under each switch set (trimmed write-back, label carry),
+and `test_translate_speedups.py` pins the text the other switches change.
+`test_x87_cache.py` makes the x87 comparison on compiled code where clang
+builds a POSIX shared library.
+
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

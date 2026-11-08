@@ -199,6 +199,32 @@ static void shader_features() {
         vertex.pixel = false;
         CHECK(!d9msl::vertex_source(vertex, &source, &why));
     }
+    // Assembly exponentials are base 2, and vs_1_1 expp splits x into
+    // 2^floor(x) and frac(x); later models splat the exponential.
+    for (uint32_t version : {0xfffe0101u, 0xfffe0200u}) {
+        const uint32_t len = version == 0xfffe0101u ? 0 : 0x02000000u;
+        auto bytes = words({version, len | d9sh::OP_EXPP, 0x800f0000, 0xa0e40000, len | 1,
+                            0xc00f0000, 0x80e40000, 0xffff});
+        const auto &program = d9sh::program_for(bytes);
+        CHECK(program.ok && program.code.size() == 2 && program.code[0].op == d9sh::OP_EXPP);
+        CHECK(d9wgsl::vertex_source(program, &source, &why));
+        CHECK(source.find("exp2(") != std::string::npos);
+        CHECK((source.find("exp2(floor(") != std::string::npos) == (len == 0));
+        CHECK(source.find(" exp(") == std::string::npos &&
+              source.find("(exp(") == std::string::npos);
+    }
+    // A vs_2_0 relative source names the component of a0 it adds: skinning
+    // reads c[a0.x], c[a0.y], c[a0.z] and c[a0.w] for its four bones.
+    {
+        auto bytes = words({0xfffe0200, 0x03000001, 0xc00f0000, 0xa0e42002, 0xb0550000, 0xffff});
+        const auto &program = d9sh::program_for(bytes);
+        CHECK(program.ok && program.relative && program.code.size() == 1);
+        CHECK(program.code.size() == 1 && program.code[0].src[0].rel &&
+              program.code[0].src[0].rel_comp == 1 && !program.code[0].src[0].rel_loop);
+        CHECK(d9wgsl::vertex_source(program, &source, &why));
+        CHECK(source.find("i32(a0.y)") != std::string::npos);
+        CHECK(source.find("i32(a0.x)") == std::string::npos);
+    }
     uint32_t base = 0;
     CHECK(!d9gpu::set_render_scale_base(1, base) && base == 0);
     CHECK(!d9gpu::set_render_scale_base(63, base) && base == 0);
@@ -322,6 +348,150 @@ static void instancing(uint32_t stream, uint32_t divisor) {
     for (uint32_t view : {target, dev, declaration, vb, ib, offsets_vb, colors_vb})
         call_method(view, 2);
 }
+// CreateDevice masks every FPU exception unless D3DCREATE_FPU_PRESERVE (2) is
+// passed, and leaves precision control as the guest set it.
+static void fpu_reset() {
+    const uint32_t p = sc(0);
+    std::memset(gm_ptr(p), 0, 56);
+    wr32(p, 8);
+    wr32(p + 4, 8);
+    wr32(p + 8, 21);
+    wr32(p + 32, 1);
+    for (uint32_t behavior : {0x40u, 0x42u}) {
+        g_cpu.fpu_cw = 0x0360; // exceptions unmasked, 64-bit precision
+        CHECK(call_method(factory, 16, {0, 1, 0x1234, behavior, p, sc(0x100)}) == 0);
+        CHECK(g_cpu.fpu_cw == (behavior & 2 ? 0x0360 : 0x037f));
+        call_method(rd32(sc(0x100)), 2);
+    }
+    g_cpu.fpu_cw = 0x037f;
+}
+
+// The getters read back what the setters recorded; a draw above
+// MaxPrimitiveCount is refused before any size arithmetic.
+static void getters_and_limits() {
+    const uint32_t dev = device();
+    CHECK(call_method(dev, 57, {27, 1}) == 0);
+    wr32(sc(0x300), 0xdeadbeef);
+    CHECK(call_method(dev, 58, {27, sc(0x300)}) == 0 && rd32(sc(0x300)) == 1);
+    CHECK(call_method(dev, 69, {1, 5, 2}) == 0);
+    CHECK(call_method(dev, 68, {1, 5, sc(0x300)}) == 0 && rd32(sc(0x300)) == 2);
+    CHECK(call_method(dev, 67, {0, 1, 2}) == 0);
+    CHECK(call_method(dev, 66, {0, 1, sc(0x300)}) == 0 && rd32(sc(0x300)) == 2);
+    CHECK(call_method(dev, 64, {0, sc(0x300)}) == 0 && rd32(sc(0x300)) == 0);
+    CHECK(call_method(dev, 83, {4, 0x80000001u, sc(0x400), 16}) == 0x8876086cu);
+    CHECK(call_method(dev, 81, {4, 0, 1048576}) == 0x8876086cu);
+    call_method(dev, 2);
+}
+
+// A texture level holds one texture reference while the game holds the level,
+// and goes with the texture; bound targets are held by the device.
+static void resource_lifetime() {
+    const uint32_t dev = device();
+    CHECK(call_method(dev, 23, {4, 4, 1, 1, 21, 0, sc(0x500), 0}) == 0);
+    const uint32_t tex = rd32(sc(0x500));
+    ComObj *t = com_this(tex);
+    const uint32_t tex_id = t->id, level_id = t->surfaces.at(0);
+    CHECK(call_method(tex, 18, {0, sc(0x504)}) == 0);
+    CHECK(call_method(tex, 18, {0, sc(0x508)}) == 0);
+    const uint32_t level = rd32(sc(0x504));
+    CHECK(level && level == rd32(sc(0x508)) && t->refs == 2);
+    call_method(level, 2);
+    CHECK(t->refs == 2);
+    // Bound as a render target, the level keeps its texture after the game's
+    // own references are gone.
+    CHECK(call_method(dev, 37, {0, level}) == 0);
+    call_method(level, 2);
+    call_method(tex, 2);
+    CHECK(com_get(tex_id) && com_get(level_id));
+    CHECK(call_method(dev, 38, {0, sc(0x50c)}) == 0 && rd32(sc(0x50c)) == level);
+    call_method(level, 2);
+    CHECK(call_method(dev, 18, {0, 0, 0, sc(0x510)}) == 0);
+    const uint32_t back = rd32(sc(0x510));
+    CHECK(call_method(dev, 37, {0, back}) == 0);
+    CHECK(!com_get(tex_id) && !com_get(level_id)); // the texture took its level with it
+    call_method(back, 2);
+
+    // Depth: SetDepthStencilSurface holds the surface; with none bound the
+    // getter answers D3DERR_NOTFOUND.
+    CHECK(call_method(dev, 29, {8, 8, 75, 0, 0, 0, sc(0x520), 0}) == 0);
+    const uint32_t z = rd32(sc(0x520));
+    const uint32_t z_id = com_this(z)->id;
+    CHECK(call_method(dev, 39, {z}) == 0);
+    call_method(z, 2);
+    CHECK(com_get(z_id));
+    CHECK(call_method(dev, 40, {sc(0x524)}) == 0 && rd32(sc(0x524)) == z);
+    call_method(z, 2);
+    CHECK(call_method(dev, 39, {0}) == 0 && !com_get(z_id));
+    CHECK(call_method(dev, 40, {sc(0x524)}) == 0x88760866u && rd32(sc(0x524)) == 0);
+    call_method(dev, 2);
+}
+
+// A dynamic buffer keeps its guest copy between locks (nothing copied in),
+// writes back only what changed inside the locked ranges, and drops nothing a
+// static buffer would keep.
+static void buffer_staging() {
+    const uint32_t dev = device();
+    CHECK(call_method(dev, 26, {64, 0x200, 0, 0, sc(0x800), 0}) == 0);
+    const uint32_t vb = rd32(sc(0x800));
+    ComObj *o = com_this(vb);
+    CHECK(call_method(vb, 11, {0, 0, sc(0x804), 0}) == 0);
+    const uint32_t first = rd32(sc(0x804));
+    std::memset(gm_ptr(first), 0x11, 64);
+    CHECK(call_method(vb, 12) == 0);
+    CHECK(o->stage == first && o->blob[63] == 0x11);
+    // Nested ranged locks: the union is written back; a byte outside it is not.
+    CHECK(call_method(vb, 11, {8, 8, sc(0x804), 0}) == 0 && rd32(sc(0x804)) == first + 8);
+    CHECK(call_method(vb, 11, {40, 8, sc(0x808), 0}) == 0 && rd32(sc(0x808)) == first + 40);
+    gm_ptr(first)[8] = 0x22;
+    gm_ptr(first)[47] = 0x33;
+    gm_ptr(first)[0] = 0x44; // outside every locked range: undefined, not kept
+    CHECK(call_method(vb, 12) == 0 && o->blob[8] == 0x11);
+    CHECK(call_method(vb, 12) == 0);
+    CHECK(o->blob[8] == 0x22 && o->blob[47] == 0x33 && o->blob[0] == 0x11);
+    // Released while locked.
+    CHECK(call_method(vb, 11, {0, 0, sc(0x804), 0}) == 0);
+    call_method(vb, 2);
+    // A static buffer drops its copy at the last Unlock.
+    CHECK(call_method(dev, 26, {64, 0, 0, 0, sc(0x800), 0}) == 0);
+    const uint32_t still = rd32(sc(0x800));
+    CHECK(call_method(still, 11, {0, 0, sc(0x804), 0}) == 0);
+    std::memset(gm_ptr(rd32(sc(0x804))), 0x55, 64);
+    CHECK(call_method(still, 12) == 0);
+    CHECK(com_this(still)->stage == 0 && com_this(still)->blob[0] == 0x55);
+    call_method(still, 2);
+    call_method(dev, 2);
+}
+
+// SetFVF binds a declaration, and a draw with no shaders bound is drawn with
+// generated fixed-function programs that every shader backend accepts.
+static void fixed_function() {
+    const uint32_t dev = device();
+    CHECK(call_method(dev, 89, {0x144}) == 0);
+    CHECK(call_method(dev, 90, {sc(0x300)}) == 0 && rd32(sc(0x300)) == 0x144);
+    CHECK(d9_pipeline(com_this(dev)->id).declaration != 0);
+    CHECK(call_method(dev, 89, {0x100}) != 0); // no position
+    CHECK(call_method(dev, 89, {0x44}) == 0);  // XYZRHW | DIFFUSE
+    const float quad[3][5] = {{0, 0, 0.5f, 1, 0}, {8, 0, 0.5f, 1, 0}, {0, 8, 0.5f, 1, 0}};
+    std::memcpy(gm_ptr(sc(0x600)), quad, sizeof quad);
+    for (int i = 0; i < 3; ++i)
+        wr32(sc(0x600) + 20 * i + 16, 0xff00ff00u);
+    const uint32_t before = gpu_draws, announced = shader_announcements;
+    gpu_capture = true;
+    CHECK(call_method(dev, 83, {4, 1, sc(0x600), 20}) == 0);
+    gpu_capture = false;
+    CHECK(gpu_draws == before + 1 && shader_announcements == announced + 2);
+    CHECK(captured.vs && captured.ps && captured.vconst_count && captured.pconst_count);
+    std::string source, why;
+    const auto &vs = d9sh::program_for_key(captured.vs_key, captured.vs, captured.vs_size);
+    const auto &ps = d9sh::program_for_key(captured.ps_key, captured.ps, captured.ps_size);
+    CHECK(vs.ok && !vs.pixel && ps.ok && ps.pixel);
+    CHECK(d9wgsl::vertex_source(vs, &source, &why));
+    CHECK(d9wgsl::pixel_source(ps, {}, &source, &why));
+    CHECK(d9msl::vertex_source(vs, &source, &why));
+    CHECK(d9glsl::vertex_source(vs, &source, &why));
+    call_method(dev, 2);
+}
+
 int main() {
     mem_init();
     imports_init();
@@ -336,6 +506,11 @@ int main() {
     lifetime();
     invalid_programs();
     shader_features();
+    fpu_reset();
+    getters_and_limits();
+    resource_lifetime();
+    buffer_staging();
+    fixed_function();
     for (uint32_t stream = 1; stream < 8; ++stream)
         for (uint32_t divisor : {1u, 2u})
             instancing(stream, divisor);

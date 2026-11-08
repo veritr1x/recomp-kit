@@ -1060,11 +1060,16 @@ void device_destroy(ComObj *dev) {
 // A texture owns one reference to each cached level. The first external
 // reference retains the texture; the last external release drops that hold.
 // This avoids both a permanent parent/child cycle and dangling containers.
+// Both versions: Direct3D 9 levels and cube faces follow the same rule. Only a
+// surface still listed by its texture counts, so the levels a dying texture
+// releases (d3d8_resource_destroy moves them out first) never reach back to it.
 void surface_references(ComObj *surface, int32_t before, int32_t after) {
-    if (surface->d3d_version != 8)
+    if (!((before == 1 && after == 2) || (before == 2 && after == 1)))
         return;
     ComObj *parent = com_get(surface->front_obj);
-    if (!parent || parent->kind != K_D3D9TEXTURE)
+    if (!parent || parent->kind != K_D3D9TEXTURE ||
+        std::find(parent->surfaces.begin(), parent->surfaces.end(), surface->id) ==
+            parent->surfaces.end())
         return;
     if (before == 1 && after == 2)
         com_addref(parent);

@@ -153,9 +153,10 @@ function(pop_host target)
   endif()
 endfunction()
 
-# The mixer, its output device and the synth: portable, over SDL audio.
-set(POP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/midi_synth.cpp
-                      ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
+# The mixer, its output device and the synth: portable, over SDL audio (in a browser, an
+# AudioWorklet: web_sink.cpp, empty elsewhere).
+set(POP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/web_sink.cpp
+                      ${HOST}/audio/midi_synth.cpp ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
 set(POP_CORE_LIBS recomp_platform recomp_runtime recomp_snapshot recomp_dx recomp_mods lua host_common gpu_backend)
 # The on-screen controls the presenter draws (controls_host.cpp is the app's own).
 set(POP_CONTROLS_SOURCES ${HOST}/controls/json.cpp ${HOST}/controls/layout.cpp
@@ -295,6 +296,7 @@ if(TARGET recomp_gen)
     configure_file(${POP_ROOT}/web/player/player.js ${POP_OUT}/player.js @ONLY)
     configure_file(${POP_ROOT}/web/player/style.css ${POP_OUT}/style.css COPYONLY)
     configure_file(${POP_ROOT}/web/player/env.mjs ${POP_OUT}/env.mjs COPYONLY)
+    configure_file(${POP_ROOT}/web/player/audio-worklet.js ${POP_OUT}/audio-worklet.js COPYONLY)
     configure_file(${POP_ROOT}/web/player/source.mjs ${POP_OUT}/source.mjs COPYONLY)
     configure_file(${POP_ROOT}/web/player/FETCH-NOTICE.txt ${POP_OUT}/FETCH-NOTICE.txt COPYONLY)
     target_link_options(recomp_app PRIVATE

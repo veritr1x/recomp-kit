@@ -368,6 +368,11 @@ struct FxParam {
     mutable int32_t sampler_tex_param = -2;
     mutable size_t sampler_tex_count = 0;
     mutable uint64_t sampler_tex_stamp = 0;
+    // Each element's whole 4x4 matrix as the game last set it with a SetMatrix
+    // call (already transposed for the Transpose ones), kept while no other
+    // write has changed the element. See bind_constants.
+    std::vector<float> mats;
+    std::vector<uint8_t> mat_set;
 };
 struct FxEffect;
 // The value of a shared parameter, held by the pool as D3DX does. An effect's
@@ -493,6 +498,7 @@ static void pull_param(FxEffect::PoolRef &r, FxParam &p) {
     r.pulled = r.slot->stamp;
     if (!p.value.empty())
         memcpy(p.value.data(), r.slot->value.data(), p.value.size());
+    p.mat_set.clear(); // the pool's value, not the matrices this effect was given
     // Each effect's copy holds its own reference: fx_destroy releases every
     // parameter's texture, so an unreferenced copy would over-release the
     // shared texture once per effect destroyed.
@@ -858,10 +864,18 @@ static uint32_t param_slots(const FxParam &p) {
     return p.t.numeric() ? (uint32_t)(p.value.size() / 4) : 0;
 }
 
+// Set while a SetMatrix call writes its elements, so those writes keep the
+// element's whole matrix (FxParam::mats) valid; any other write drops it.
+static bool g_putting_matrix = false;
+static void param_forget_matrices(FxParam &p) {
+    if (!g_putting_matrix)
+        p.mat_set.clear();
+}
 static void param_put_float(FxParam &p, uint32_t i, float f) {
     if (i >= param_slots(p))
         return;
     param_touched(p);
+    param_forget_matrices(p);
     if (p.t.type == FXT_FLOAT) {
         memcpy(&p.value[4 * i], &f, 4);
     } else {
@@ -873,6 +887,7 @@ static void param_put_int(FxParam &p, uint32_t i, int32_t n) {
     if (i >= param_slots(p))
         return;
     param_touched(p);
+    param_forget_matrices(p);
     if (p.t.type == FXT_FLOAT) {
         float f = (float)n;
         memcpy(&p.value[4 * i], &f, 4);
@@ -1037,6 +1052,7 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
                                uint32_t limit, D9Pipeline &pl, uint32_t *missing, uint64_t key,
                                uint64_t &serial) {
     uint32_t bound = 0;
+    bool wrote = false; // any register written by this call
     if (!key)
         key = d9sh::code_key(code.data(), code.size());
     // The program's record, from the last two bound before a lookup by key.
@@ -1095,6 +1111,7 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
         ++bound;
         if (intact && p->stamp <= since)
             continue; // the registers already hold this value
+        wrote = true;
         // Every draw rebinds these, so the element reads are hoisted out of
         // the loops: one type test and one bounds value per constant, not a
         // call per float.
@@ -1115,14 +1132,36 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
         };
         if (c.cls == FXC_MATRIX_ROWS || c.cls == FXC_MATRIX_COLUMNS) {
             uint32_t pr = p->t.rows ? p->t.rows : 1, pc = p->t.cols ? p->t.cols : 1;
+            // fxc can describe one constant two ways: a 3x4 effect parameter
+            // (row-major) and a 4x3 constant in the shader's table (column-
+            // major) are the same three registers per element, as skinning
+            // bones are. A matrix the game set with SetMatrix* is cut to the
+            // shader's shape from the whole 4x4 it gave; raw values (SetValue,
+            // SetFloatArray) are read transposed when the dimensions are the
+            // shader's swapped. Reading them in the shader's dimensions lost
+            // each register's fourth component, the bone's translation.
+            // Square matrices keep their layout.
+            const uint32_t cr = c.rows ? c.rows : 4, cc = c.cols ? c.cols : 4;
+            const bool flip = pr != pc && pr == cc && pc == cr;
             for (uint32_t r = 0; r < c.count && c.index + r < limit; ++r) {
                 uint32_t el = c.cls == FXC_MATRIX_COLUMNS ? r / (c.cols ? c.cols : 4)
                                                           : r / (c.rows ? c.rows : 4);
                 uint32_t line = c.cls == FXC_MATRIX_COLUMNS ? r % (c.cols ? c.cols : 4)
                                                             : r % (c.rows ? c.rows : 4);
+                if (el < p->mat_set.size() && p->mat_set[el]) {
+                    const float *m = &p->mats[16 * el];
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        uint32_t row = c.cls == FXC_MATRIX_COLUMNS ? k : line;
+                        uint32_t col = c.cls == FXC_MATRIX_COLUMNS ? line : k;
+                        reg[c.index + r][k] = row < cr && col < cc ? m[row * 4 + col] : 0.0f;
+                    }
+                    continue;
+                }
                 for (uint32_t k = 0; k < 4; ++k) {
                     uint32_t row = c.cls == FXC_MATRIX_COLUMNS ? k : line;
                     uint32_t col = c.cls == FXC_MATRIX_COLUMNS ? line : k;
+                    if (flip)
+                        std::swap(row, col);
                     reg[c.index + r][k] =
                         (row < pr && col < pc) ? get(el * pr * pc + row * pc + col) : 0.0f;
                 }
@@ -1137,7 +1176,12 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
                     reg[c.index + r][k] = k < per ? get(r * per + k) : 0.0f;
         }
     }
-    serial = d9_const_serial();
+    // A bind that wrote no register leaves the registers, and so their serial,
+    // as they were: a host matching draws by serial (HostD9Draw) then reuses
+    // its copy. Unknown (0) registers take a fresh serial so later binds can
+    // tell they are intact.
+    if (wrote || !serial)
+        serial = d9_const_serial();
     last.serial = serial;
     last.stamp = g_param_stamp;
     return bound;
@@ -1730,6 +1774,7 @@ void Fx_SetValue(X86 *c) {
     FX_PARAM_OR_FAIL();
     uint32_t data = arg(c, 2), bytes = arg(c, 3);
     param_touched(*p);
+    param_forget_matrices(*p);
     if (p->t.cls == FXC_OBJECT && p->t.type >= FXT_TEXTURE && p->t.type <= FXT_TEXTURECUBE) {
         // The parameter holds a reference, as with SetTexture: fx_destroy
         // releases it.
@@ -1867,7 +1912,20 @@ static void put_matrices(X86 *c, bool transpose, bool pointers, bool array) {
             continue;
         float m[16];
         read_guest_matrix(m_addr, m, transpose);
+        g_putting_matrix = true;
         param_put_matrix(*p, e, m);
+        g_putting_matrix = false;
+        // The whole matrix, for bind_constants to cut to the shader's shape:
+        // a 3x4 parameter keeps only part of it.
+        const size_t n = p->t.count() ? p->t.count() : 1;
+        if (p->mats.size() != 16 * n) {
+            p->mats.assign(16 * n, 0.0f);
+            p->mat_set.clear();
+        }
+        if (p->mat_set.size() != n)
+            p->mat_set.assign(n, 0);
+        memcpy(&p->mats[16 * e], m, sizeof m);
+        p->mat_set[e] = 1;
     }
     com_ret(c, D3D_OKX);
 }
@@ -1914,6 +1972,7 @@ void Fx_SetRawValue(X86 *c) {
     FX_PARAM_OR_FAIL();
     uint32_t data = arg(c, 2), off = arg(c, 3), bytes = arg(c, 4);
     param_touched(*p);
+    param_forget_matrices(*p);
     if (data && off < p->value.size())
         memcpy(p->value.data() + off, gm_ptr(data), std::min<size_t>(bytes, p->value.size() - off));
     com_ret(c, D3D_OKX);

@@ -1870,6 +1870,31 @@ def test_an_operand_redirect_rewrites_one_instruction():
         T.apply_operand_redirects([fn], {0x00401000: (0x00123456, 0x00a37f10)})
 
 
+def test_operand_redirect_widths_follow_the_pairs():
+    """table.c's widths list one byte size per redirect pair, in the order of
+    recomp_operand_redirect_pairs, and none when a width is unknown."""
+    listing = ("00401000  FLD double ptr [0x00897000]\n"
+               "00401006  MOV EAX,dword ptr [0x00897100]\n"
+               "0040100b  MOV AX,word ptr [0x00897200]\n"
+               "00401011  FLD tword ptr [0x00897300]\n"
+               "00401017  MOV AL,byte ptr [0x00897400]\n")
+    fn = T.Function(0x00401000, "f", 0x1c, T.parse_listing_text(listing))
+    redirects = {0x00401000: (0x00897000, 0x00a37900), 0x00401006: (0x00897100, 0x00a37800),
+                 0x0040100b: (0x00897200, 0x00a37a00), 0x00401011: (0x00897300, 0x00a37b00),
+                 0x00401017: (0x00897400, 0x00a37c00)}
+    T.OPERAND_REDIRECT_WIDTHS.clear()
+    try:
+        T.apply_operand_redirects([fn], redirects)
+        pairs = sorted(set(redirects.values()))
+        text = T.operand_redirect_widths(pairs)
+        assert "recomp_operand_redirect_widths[] = {8u, 4u, 2u, 10u, 1u};" in text
+        assert "recomp_operand_redirect_width_count = 5u;" in text
+        T.OPERAND_REDIRECT_WIDTHS[(0x00897100, 0x00a37800)] = 0
+        assert "recomp_operand_redirect_width_count = 0u;" in T.operand_redirect_widths(pairs)
+    finally:
+        T.OPERAND_REDIRECT_WIDTHS.clear()
+
+
 def test_an_instruction_patch_replaces_the_text_and_keeps_the_address():
     listing = ("00401000  CMP DL,byte ptr [EBP + 0x34]\n"
                "00401003  JNZ 0x00401010\n")

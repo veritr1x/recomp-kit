@@ -111,19 +111,33 @@ class Opts(object):
         self.x87_direct = direct
 
 
-def translate(case, cases, direct):
-    tr = T.Translator(M.NoImage(case), {c.addr for c in cases}, Opts(direct))
-    insns = T.parse_listing_text(case.listing())
-    fn = T.Function(case.addr, case.name, len(case.code), insns)
-    fn.measure(M.NoImage())
-    tr.prepare(fn)
-    return "\n".join(tr.translate(fn, case.entries))
+#: The x87 [translate.speedups] switches. This file compares whole states, so
+#: the write-back trimming (which by design leaves empty registers and inexact
+#: st_bits alone) is off on both sides; test_x87_carry.py compares the trimmed
+#: forms everywhere. carry=True also carries runs across labels.
+X87_SWITCHES = ("x87_trim_popped", "x87_skip_inexact_bits", "x87_batch_tags", "x87_part_dirty",
+                "x87_carry", "x87_st0_leaves")
 
 
-def build(clang, cases, direct):
+def translate(case, cases, direct, carry=False):
+    saved = dict(T.SPEEDUPS)
+    T.SPEEDUPS.update(dict.fromkeys(X87_SWITCHES, False), x87_carry=carry)
+    try:
+        tr = T.Translator(M.NoImage(case), {c.addr for c in cases}, Opts(direct))
+        insns = T.parse_listing_text(case.listing())
+        fn = T.Function(case.addr, case.name, len(case.code), insns)
+        fn.measure(M.NoImage())
+        tr.prepare(fn)
+        return "\n".join(tr.translate(fn, case.entries))
+    finally:
+        T.SPEEDUPS.clear()
+        T.SPEEDUPS.update(saved)
+
+
+def build(clang, cases, direct, carry=False):
     work = tempfile.mkdtemp(prefix="x87-cache-")
     with open(os.path.join(work, "synth.c"), "w") as fh:
-        fh.write('#include "x86.h"\n\n' + "\n".join(translate(c, cases, direct) for c in cases))
+        fh.write('#include "x86.h"\n\n' + "\n".join(translate(c, cases, direct, carry) for c in cases))
     with open(os.path.join(work, "table.c"), "w") as fh:
         fh.write('#include "x86.h"\n')
         for c in cases:
@@ -193,7 +207,8 @@ def engines():
         pytest.skip("the instruction harness builds as a POSIX shared library")
     rng = random.Random(0x87CAC4E)
     cases = [gen_case(rng, k) for k in range(CASES)]
-    return cases, build(clang, cases, True), build(clang, cases, False)
+    return (cases, build(clang, cases, True), build(clang, cases, False),
+            build(clang, cases, False, True))
 
 
 def field_bytes(state, name):
@@ -201,8 +216,9 @@ def field_bytes(state, name):
     return C.string_at(C.addressof(state) + f.offset, f.size)
 
 
-def test_cached_runs_leave_the_state_the_helpers_leave(engines):
-    cases, direct, cached = engines
+@pytest.mark.parametrize("which", [2, 3], ids=["cached", "carried"])
+def test_cached_runs_leave_the_state_the_helpers_leave(engines, which):
+    cases, direct, cached = engines[0], engines[1], engines[which]
     bad = []
     for case in cases:
         for s in range(STATES):
@@ -220,7 +236,7 @@ def test_cached_runs_leave_the_state_the_helpers_leave(engines):
 
 def test_the_cache_is_in_use(engines):
     """The comparison means something only if the cached side caches."""
-    cases, _direct, _cached = engines
+    cases = engines[0]
     cached = "\n".join(translate(c, cases, False) for c in cases[:20])
     direct = "\n".join(translate(c, cases, True) for c in cases[:20])
     assert cached.count("ft0_ = c->fpu_top;") > 20

@@ -286,8 +286,16 @@ struct Gen {
             return buf;
         case R_CONST:
             if (s.rel && !p.pixel) {
-                snprintf(buf, sizeof buf, "c[clamp(%s(a0.x) + %u, 0, %u)]", wgsl() ? "i32" : "int",
-                         s.index, glsl() || wgsl() ? const_limit - 1 : 255);
+                // a0 holds what mova rounded; the source names one component
+                // of it, or the loop counter aL.
+                char addr[32];
+                if (s.rel_loop)
+                    snprintf(addr, sizeof addr, "aL");
+                else
+                    snprintf(addr, sizeof addr, "%s(a0.%c)", wgsl() ? "i32" : "int",
+                             "xyzw"[s.rel_comp & 3]);
+                snprintf(buf, sizeof buf, "c[clamp(%s + %u, 0, %u)]", addr, s.index,
+                         glsl() || wgsl() ? const_limit - 1 : 255);
                 return buf;
             }
             snprintf(buf, sizeof buf, "c[%u]", s.index);
@@ -602,7 +610,15 @@ struct Gen {
             return;
         case OP_EXP:
         case OP_EXPP:
-            write(in.dst, F4 + "(exp((" + S(0) + ").x))");
+            // Assembly exponentials are base 2. vs_1_1 expp returns the
+            // integer and fractional split in x and y, not a splat.
+            if (in.op == OP_EXPP && !p.pixel && p.major == 1) {
+                const std::string x = "(" + S(0) + ").x";
+                write(in.dst, F4 + "(exp2(floor(" + x + ")), " + x + " - floor(" + x + "), exp2(" +
+                                  x + "), 1.0)");
+            } else {
+                write(in.dst, F4 + "(exp2((" + S(0) + ").x))");
+            }
             return;
         case OP_LOG:
         case OP_LOGP:

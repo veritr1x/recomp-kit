@@ -1223,10 +1223,41 @@ static void test_memory_shims_2(X86 *c) {
 
     uint32_t li = scratch_block(8);
     check(call_import(c, "KERNEL32.dll", "QueryPerformanceFrequency", {li}) == 1 &&
-              rd32(li) == 1000000,
-          "QueryPerformanceFrequency reports 1 MHz");
+              rd32(li) == 10000000,
+          "QueryPerformanceFrequency reports 10 MHz");
     check(call_import(c, "KERNEL32.dll", "QueryPerformanceCounter", {li}) == 1,
           "QueryPerformanceCounter");
+    {
+        // Back-to-back reads land in one millisecond, often in one microsecond;
+        // the count still rises, and a spin on it stays inside the millisecond
+        // GetTickCount reports rather than running ahead of it.
+        uint64_t prev = rd32(li) | ((uint64_t)rd32(li + 4) << 32);
+        bool rising = true, behind = true;
+        for (int i = 0; i < 50000; ++i) {
+            const uint32_t before = call_import(c, "KERNEL32.dll", "GetTickCount", {});
+            call_import(c, "KERNEL32.dll", "QueryPerformanceCounter", {li});
+            const uint64_t now = rd32(li) | ((uint64_t)rd32(li + 4) << 32);
+            const uint32_t after = call_import(c, "KERNEL32.dll", "GetTickCount", {});
+            if (i < 8)
+                rising = rising && now > prev;
+            behind = behind && now >= (uint64_t)before * 10000ull &&
+                     now < ((uint64_t)after + 1) * 10000ull;
+            prev = now;
+        }
+        check(rising, "QueryPerformanceCounter never repeats a value");
+        check(behind, "QueryPerformanceCounter stays on GetTickCount's millisecond");
+        // Pinned, its clock reads whole milliseconds, the same numbers on every
+        // run. (Read below the counter: the counter never goes back, and this
+        // suite's pin is older than the time it has already handed out.)
+        host_set_time_source_pinned(5000, 16);
+        const uint64_t pinned = host_micros();
+        uint64_t quiet = 0;
+        const bool quiet_ok = host_micros_quiet(&quiet);
+        host_clear_time_source();
+        check(pinned == 5000000ull && quiet_ok && quiet == pinned,
+              "a pinned clock's microseconds are its millisecond, %llu",
+              (unsigned long long)pinned);
+    }
 
     // The wide environment block must be UTF-16, not ANSI bytes.
     uint32_t wenv = call_import(c, "KERNEL32.dll", "GetEnvironmentStringsW", {});

@@ -106,6 +106,8 @@ struct Dst {
 struct Src {
     uint32_t type = 0, index = 0, swz = 0xe4, mod = 0; // 0xe4: xyzw
     bool rel = false;
+    uint8_t rel_comp = 0;  // which component of a0 a relative source adds
+    bool rel_loop = false; // relative to the loop counter aL instead of a0
 };
 struct Inst {
     uint32_t op = 0;

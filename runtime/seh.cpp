@@ -304,10 +304,19 @@ jmp_buf *recomp_seh_frame_adopt(X86 *c) {
 
 void recomp_seh_frame_leave(X86 *c) {
     recomp_seh_validate_chain(c, "leave", "");
+    // A leave runs where the guest restores FS:[0], which is usually before
+    // its epilogue moves ESP above the record it unlinked: the record is then
+    // still below ESP and was kept until a later, outer leave came by, with
+    // every record of the calls in between. Registrations sit on the stack
+    // newest-lowest, so a record below the restored head is off the chain and
+    // no dispatch can reach it; it goes now as well. Read without the
+    // chain_head check: a leave never aborted on a bad TEB and does not start.
+    const uint32_t head =
+        c->fs_base && gm_valid(c->fs_base, 4) ? rd32(c->fs_base) : 0u; // 0: retire by ESP only
     bool removed = false;
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
-        if (f->cpu == c && f->registration < c->r[R_ESP] &&
+        if (f->cpu == c && (f->registration < c->r[R_ESP] || f->registration < head) &&
             (f->callback_depth == recomp_callback_depth() || f->active_landing)) {
             LOGV("SEH leave: registration=%08x established=%08x EIP=%08x ESP=%08x", f->registration,
                  f->establishing_eip, c->eip, c->r[R_ESP]);

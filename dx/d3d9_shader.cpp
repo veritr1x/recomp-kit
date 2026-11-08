@@ -233,8 +233,13 @@ Program load(const std::vector<uint8_t> &code) {
         while (k < end && in.nsrc < 4) {
             bool extra = false;
             Src s = src_of(tok(k++), extra);
-            if (extra)
-                ++k;
+            if (extra) {
+                // 2.0+: a token naming the address register and the one
+                // component of it to add (skinning reads a0.x, .y, .z, .w).
+                const uint32_t r = tok(k++);
+                s.rel_comp = (uint8_t)((r >> 16) & 3);
+                s.rel_loop = (((r >> 28) & 7) | ((r & 0x1800) >> 8)) == R_LOOP;
+            }
             if (s.type == R_CONST) {
                 if (s.rel)
                     p.relative = true;

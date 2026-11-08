@@ -28,7 +28,15 @@ enum : uint32_t {
     CONSTS = 64u,    // incremental effect constant binding (dx/d3dx9.cpp bind_constants)
     MIRRORS = 128u,  // per-draw lookups (dx/d3d9.cpp resource mirrors, decoded programs)
     WEBGPU = 512u,   // the WebGPU renderer's skipped repeat bindings and reused uniform blocks
-    FREE_RUN = 2048u // guest threads running beside the baton holder (game.toml free_run)
+    FREE_RUN = 2048u,   // guest threads running beside the baton holder (game.toml free_run)
+    REPS = 4096u,       // bulk REP MOVS/STOS (runtime/x86.h)
+    LOCKS = 8192u,      // persistent vertex/index buffer lock staging (dx/d3d9.cpp)
+    CONSTBANK = 16384u, // shader constants copied into a draw only when they changed
+    PRESENT = 32768u,   // pipelined browser Present (host/gpu/d3d9_host.cpp)
+    SUBMIT = 65536u,    // buffer rewrites without a mid-frame WebGPU submit
+    GROUPS = 131072u,   // dropping only the bind groups of a retired texture
+    DIRECT = 262144u,   // direct COM/devirtualized calls from translated code
+    PACING = 524288u    // NFSMW frame pacing at Present (game mod)
 };
 
 inline std::atomic<int> old_phase{0};
@@ -52,7 +60,10 @@ inline uint32_t switches() {
             uint32_t bit;
         } names[] = {{"stride", STRIDE}, {"sampler", SAMPLER}, {"imports", IMPORTS},
                      {"preshader", PRESHADER}, {"consts", CONSTS}, {"mirrors", MIRRORS},
-                     {"webgpu", WEBGPU}, {"free", FREE_RUN}};
+                     {"webgpu", WEBGPU}, {"free", FREE_RUN},
+                     {"reps", REPS}, {"locks", LOCKS}, {"constbank", CONSTBANK},
+                     {"present", PRESENT}, {"submit", SUBMIT}, {"groups", GROUPS},
+                     {"direct", DIRECT}, {"pacing", PACING}};
         uint32_t bits = 0;
         for (const auto &n : names)
             if (strstr(e, n.name))

@@ -29,6 +29,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -269,6 +270,9 @@ struct ComObj {
     uint64_t d9_shader_key = 0;
     uint32_t d9_shader_bindings = 0;
     bool d9_shader_holds_device = false;
+    // Direct3D 9 device: its automatic depth buffer (CreateDevice/Reset with
+    // EnableAutoDepthStencil), which it holds apart from the bound one.
+    uint32_t d9_auto_depth = 0;
 
     // --- K_DDRAW
     uint32_t hwnd = 0;
@@ -298,6 +302,11 @@ struct ComObj {
     uint32_t ckey_dst_lo = 0, ckey_dst_hi = 0;
     bool has_ckey_src = false, has_ckey_dst = false;
     int32_t lock_count = 0;
+    // Direct3D 9 vertex/index buffers: the guest copy kept between locks (equal
+    // to `blob` whenever the buffer is unlocked, so Lock copies nothing in), and
+    // the union of the byte ranges handed out by the locks now open.
+    uint32_t stage = 0;
+    uint32_t lock_lo = 0, lock_hi = 0;
     // Once handed a writable Lock pointer, the guest may keep using it forever.
     bool retained_pointer = false;
     bool is_primary = false;
@@ -424,13 +433,15 @@ void com_reset();
 
 ComObj *com_new(ComKind kind);
 // Every object, by id - 1. Exposed so com_get inlines: every Direct3D call
-// looks objects up, many times.
-extern std::deque<ComObj> *g_com_objects;
+// looks objects up, many times. Each object is allocated on its own, so it
+// never moves; a destroyed one is freed later (com.cpp graveyard) and its slot
+// left null. Ids are never reused.
+extern std::deque<std::unique_ptr<ComObj>> *g_com_objects;
 inline ComObj *com_get(uint32_t id) {
     if (!id || !g_com_objects || id > g_com_objects->size())
         return nullptr;
-    ComObj &o = (*g_com_objects)[id - 1];
-    return o.alive ? &o : nullptr;
+    ComObj *o = (*g_com_objects)[id - 1].get();
+    return o && o->alive ? o : nullptr;
 }
 // The object a guest interface pointer refers to, or null when `addr` is not
 // one of ours. `want` may be IF_NONE to accept any interface.

@@ -19,10 +19,12 @@
 #include "d3d9_raster.h"
 #include "d3d9_shader.h"
 #include "d3d9_api.h"
+#include "d3d9_ffp.h"
 #include "d3d8_program.h"
 #include "host_d9.h"
 #include "../platform/ab_phase.h"
 #include <deque>
+#include <array>
 #include <unordered_map>
 #include <map>
 
@@ -59,17 +61,36 @@ static const uint8_t IID_IDirect3DDevice9_[16] =
 static const uint32_t D3D_OK9 = 0u;
 static const uint32_t D3DERR_NOTAVAILABLE = MAKE_D3DHRESULT(2154);
 static const uint32_t D3DERR_INVALIDCALL = MAKE_D3DHRESULT(2156);
+static const uint32_t D3DERR_NOTFOUND = MAKE_D3DHRESULT(2150);
+// The draw limits the caps report (GetDeviceCaps) and the four draw calls
+// enforce: one definition, so what the guest is told and what is enforced
+// cannot drift apart.
+static const uint32_t D9_MAX_PRIMITIVE_COUNT = 1048575;
+static const uint32_t D9_MAX_VERTEX_INDEX = 1048575;
 
 // Defined with the resources further down.
 struct ComObj;
 static ComObj *device_backbuffer(ComObj *dev);
 static ComObj *device_depthbuffer(ComObj *dev);
+static void bind_color_target(ComObj *dev, uint32_t index, ComObj *s);
+static void bind_depth_stencil(ComObj *dev, ComObj *s);
 static bool gpu_on();
 static HostD9Target gpu_target(ComObj *dev);
 static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]);
 static void gpu_target_drawn(ComObj *dev, bool color, bool depth);
 static void gpu_sync(ComObj *o);
 static std::unordered_map<uint32_t, uint32_t> &resource_usage();
+
+// What only the fixed-function pipeline reads (d3d9_ffp.h): the material, the
+// lights, the FVF and which transforms and stage states the game has set, per
+// device id. Kept beside D9Pipeline rather than in it.
+static std::unordered_map<uint32_t, d9ffp::FixedState> &fixed_states() {
+    static auto *m = new std::unordered_map<uint32_t, d9ffp::FixedState>();
+    return *m;
+}
+static d9ffp::FixedState &fixed_state(uint32_t device_id) {
+    return fixed_states()[device_id];
+}
 
 // Every resource inherits its device's API version. The storage, revision and
 // GPU contracts are shared, but each out-pointer names the matching vtable.
@@ -322,8 +343,8 @@ static void put_caps9(uint32_t p, bool version8 = false) {
     wr32(p + 164, 6);           // MaxUserClipPlanes
     wr32(p + 168, 4);           // MaxVertexBlendMatrices
     f(176, 8192.0f);            // MaxPointSize
-    wr32(p + 180, 1048575);     // MaxPrimitiveCount
-    wr32(p + 184, 1048575);     // MaxVertexIndex
+    wr32(p + 180, D9_MAX_PRIMITIVE_COUNT);
+    wr32(p + 184, D9_MAX_VERTEX_INDEX);
     wr32(p + 188, 16);          // MaxStreams
     wr32(p + 192, 255);         // MaxStreamStride
     wr32(p + 196, 0xfffe0300u); // VertexShaderVersion vs_3_0
@@ -392,6 +413,17 @@ void D9_CreateDevice(X86 *c) {
         return;
     }
     com_out_ptr(out, 0);
+    // Direct3D resets the calling thread's FPU at device creation unless the
+    // behaviour flags (arg 4) hold D3DCREATE_FPU_PRESERVE (2): every
+    // floating-point exception is masked. Games unmask exceptions before
+    // CreateDevice and rely on this (NFSMW at 006e69f0, right after
+    // Direct3DCreate9, then flags 0x40; NFS Carbon the same), and a CRT maths
+    // call with an invalid argument would otherwise trap. The real runtime
+    // also selects single precision here; that is left as the guest set it on
+    // purpose, because the translated x87 code was validated at the guest's
+    // own precision and rounding to single would change every result.
+    if (!(arg(c, 4) & 2u))
+        c->fpu_cw = uint16_t(c->fpu_cw | 0x3fu);
     ComObj *dev = com_new(K_D3D9DEVICE);
     if (!dev) {
         com_ret(c, E_OUTOFMEMORY);
@@ -402,6 +434,7 @@ void D9_CreateDevice(X86 *c) {
     for (uint32_t i = 0; i < 4; ++i)
         dev->d3d_creation[i] = arg(c, i + 1);
     d9_pipeline(dev->id) = D9Pipeline{};
+    fixed_states().erase(dev->id);
     const bool version8 = dev->d3d_version == 8;
     // D3DPRESENT_PARAMETERS: back buffer size and format first, the device
     // window at 28 and Windowed at 32.
@@ -427,7 +460,7 @@ void D9_CreateDevice(X86 *c) {
     {
         ComObj *bb = device_backbuffer(dev);
         D9Pipeline &pl = d9_pipeline(dev->id);
-        pl.color_target[0] = bb ? bb->id : 0;
+        bind_color_target(dev, 0, bb); // the device holds its bound target
         pl.scissor[2] = (int32_t)dev->width;
         pl.scissor[3] = (int32_t)dev->height;
         if (present && rd32(present + (version8 ? 32 : 36))) {
@@ -477,26 +510,15 @@ D9_STUB(UpdateTexture, 3)
 D9_STUB(GetRenderTargetData, 3)
 D9_STUB(GetFrontBufferData, 3)
 D9_STUB(ColorFill, 4)
-D9_STUB(GetRenderTarget, 3)
 D9_STUB(GetTransform, 3)
 D9_STUB(MultiplyTransform, 3)
-D9_STUB(SetMaterial, 2)
-D9_STUB(GetMaterial, 2)
-D9_STUB(SetLight, 3)
-D9_STUB(GetLight, 3)
-D9_STUB(LightEnable, 3)
-D9_STUB(GetLightEnable, 3)
 D9_STUB(SetClipPlane, 3)
 D9_STUB(GetClipPlane, 3)
-D9_STUB(GetRenderState, 3)
 D9_STUB(CreateStateBlock, 3)
 D9_STUB(BeginStateBlock, 1)
 D9_STUB(EndStateBlock, 2)
 D9_STUB(SetClipStatus, 2)
 D9_STUB(GetClipStatus, 2)
-D9_STUB(GetTexture, 3)
-D9_STUB(GetTextureStageState, 4)
-D9_STUB(GetSamplerState, 4)
 D9_STUB(ValidateDevice, 2)
 D9_STUB(SetPaletteEntries, 3)
 D9_STUB(GetPaletteEntries, 3)
@@ -509,8 +531,6 @@ D9_STUB(SetNPatchMode, 2)
 D9_STUB(GetNPatchMode, 1)
 D9_STUB(ProcessVertices, 6)
 D9_STUB(GetVertexDeclaration, 2)
-D9_STUB(SetFVF, 2)
-D9_STUB(GetFVF, 2)
 D9_STUB(GetVertexShaderConstantF, 4)
 D9_STUB(SetVertexShaderConstantI, 4)
 D9_STUB(GetVertexShaderConstantI, 4)
@@ -526,6 +546,242 @@ D9_STUB(GetPixelShaderConstantB, 4)
 D9_STUB(DrawRectPatch, 4)
 D9_STUB(DrawTriPatch, 4)
 D9_STUB(DeletePatch, 2)
+
+// ---- Fixed-function state (drawn by the programs of d3d9_ffp.h) -----------
+// (this, pMaterial): D3DMATERIAL9, 17 floats.
+void Dev_SetMaterial(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t p = arg(c, 1);
+    if (!dev || !p || !gm_fits(p, 68)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    memcpy(fixed_state(dev->id).material, gm_ptr(p), 68);
+    com_ret(c, D3D_OK9);
+}
+void Dev_GetMaterial(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t p = arg(c, 1);
+    if (!dev || !p || !gm_fits(p, 68)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    memcpy(gm_ptr(p), fixed_state(dev->id).material, 68);
+    com_ret(c, D3D_OK9);
+}
+// (this, Index, pLight): D3DLIGHT9, 104 bytes. Any index; only enabled lights shine.
+void Dev_SetLight(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t index = arg(c, 1), p = arg(c, 2);
+    if (!dev || !p || !gm_fits(p, 104)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    d9ffp::FixedState::Light &l = fixed_state(dev->id).lights[index];
+    l.type = rd32(p);
+    memcpy(l.f, gm_ptr(p), 104);
+    com_ret(c, D3D_OK9);
+}
+void Dev_GetLight(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t index = arg(c, 1), p = arg(c, 2);
+    if (!dev || !p || !gm_fits(p, 104)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    const auto &lights = fixed_state(dev->id).lights;
+    auto it = lights.find(index);
+    if (it == lights.end()) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    memcpy(gm_ptr(p), it->second.f, 104);
+    com_ret(c, D3D_OK9);
+}
+// (this, Index, Enable). Enabling a light never set makes Direct3D's default
+// one: white, directional, shining along +z. At most eight shine at once.
+void Dev_LightEnable(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t index = arg(c, 1);
+    const bool enable = arg(c, 2) != 0;
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    d9ffp::FixedState &fs = fixed_state(dev->id);
+    auto it = fs.lights.find(index);
+    if (it == fs.lights.end()) {
+        d9ffp::FixedState::Light l;
+        l.f[1] = l.f[2] = l.f[3] = 1.0f; // diffuse
+        l.f[18] = 1.0f;                  // direction
+        memcpy(&l.f[0], &l.type, 4);
+        it = fs.lights.emplace(index, l).first;
+    }
+    if (it->second.enabled == enable) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (enable) {
+        if (fs.active_light_count >= 8) {
+            log_once("d3d9.ffp.lights", "d3d9: a ninth light enabled at once is refused");
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        fs.active_lights[fs.active_light_count++] = index;
+    } else {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < fs.active_light_count; ++i)
+            if (fs.active_lights[i] != index)
+                fs.active_lights[n++] = fs.active_lights[i];
+        fs.active_light_count = n;
+    }
+    it->second.enabled = enable;
+    com_ret(c, D3D_OK9);
+}
+// (this, Index, pEnable): TRUE is any nonzero BOOL; Direct3D 9 writes 128.
+void Dev_GetLightEnable(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t index = arg(c, 1), out = arg(c, 2);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    const auto &lights = fixed_state(dev->id).lights;
+    auto it = lights.find(index);
+    if (it == lights.end()) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, it->second.enabled ? 128 : 0);
+    com_ret(c, D3D_OK9);
+}
+// (this, FVF): the declaration an FVF code describes, made once per code and
+// device and kept, bound in place of the game's declaration. It was a stub, so
+// an FVF draw had no declaration and was skipped.
+void Dev_SetFVF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t fvf = arg(c, 1);
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    static auto *made = new std::map<std::pair<uint32_t, uint32_t>, uint32_t>();
+    uint32_t &id = (*made)[{dev->id, fvf}];
+    ComObj *d = com_get(id);
+    // Ids start again after a reset (com_reset), so a remembered one must
+    // still be this device's declaration.
+    if (d && (d->kind != K_D3D9DECL || d->dev_d3d != dev->id))
+        d = nullptr;
+    if (!d) {
+        std::vector<uint8_t> elements;
+        if (!d9ffp::fvf_declaration(fvf, &elements)) {
+            if (fvf)
+                log_once("d3d9.fvf.noposition", "d3d9: SetFVF(0x%x) has no position; ignored",
+                         fvf);
+            com_ret(c, fvf ? D3DERR_INVALIDCALL : D3D_OK9);
+            return;
+        }
+        d = com_new(K_D3D9DECL);
+        if (!d) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        d->dev_d3d = dev->id;
+        d->blob = std::move(elements);
+        id = d->id;
+    }
+    dev->current_viewport = d->id; // the CPU renderer's declaration, as SetVertexDeclaration
+    d9_pipeline(dev->id).declaration = d->id;
+    fixed_state(dev->id).fvf = fvf;
+    com_ret(c, D3D_OK9);
+}
+void Dev_GetFVF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, fixed_state(dev->id).fvf);
+    com_ret(c, D3D_OK9);
+}
+
+// The getters read back what the setters recorded, as a pure device does.
+// The stubs returned D3D_OK without writing anything, so a game that saves a
+// state, changes it and restores it restored whatever its stack held.
+// (this, State, pValue)
+void Dev_GetRenderState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t state = arg(c, 1), out = arg(c, 2);
+    if (!dev || state >= 256 || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, d9_pipeline(dev->id).rs[state]);
+    com_ret(c, D3D_OK9);
+}
+// (this, Sampler, Type, pValue)
+void Dev_GetSamplerState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t sampler = arg(c, 1), type = arg(c, 2), out = arg(c, 3);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    // Only what SetSamplerState keeps (samplers 0-15, types below 14).
+    wr32(out, sampler < 16 && type < 14 ? d9_pipeline(dev->id).sampler_state[sampler][type] : 0);
+    com_ret(c, D3D_OK9);
+}
+// (this, Stage, Type, pValue)
+void Dev_GetTextureStageState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t stage = arg(c, 1), type = arg(c, 2), out = arg(c, 3);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, stage < 8 && type < 33 ? d9_pipeline(dev->id).tss[stage][type] : 0);
+    com_ret(c, D3D_OK9);
+}
+// (this, Stage, ppTexture): the bound texture with a reference for the
+// caller, or null.
+void Dev_GetTexture(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t stage = arg(c, 1), out = arg(c, 2);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *tex = stage < 16 ? com_get(d9_pipeline(dev->id).sampler_tex[stage]) : nullptr;
+    if (tex && tex->kind == K_D3D9TEXTURE) {
+        const uint32_t view = d9_api_view(tex, tex->caps ? IF_D3DCUBETEXTURE9 : IF_D3DTEXTURE9);
+        if (view) {
+            com_addref(tex);
+            wr32(out, view);
+        }
+    }
+    com_ret(c, D3D_OK9);
+}
+// (this, RenderTargetIndex, ppRenderTarget)
+void Dev_GetRenderTarget(X86 *c) {
+    ComObj *dev = this_device9(c);
+    const uint32_t index = arg(c, 1), out = arg(c, 2);
+    if (!dev || index > 3 || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *s = com_get(d9_pipeline(dev->id).color_target[index]);
+    const uint32_t view = s ? d9_api_view(s, IF_D3DSURFACE9) : 0;
+    if (!view) {
+        com_ret(c, D3DERR_NOTFOUND);
+        return;
+    }
+    com_addref(s);
+    wr32(out, view);
+    com_ret(c, D3D_OK9);
+}
 
 // (this, pRect)
 void Dev_GetCreationParameters(X86 *c) {
@@ -708,13 +964,13 @@ void Dev_Reset(X86 *c) {
         dev->d3d_format = rd32(present + 8) ? rd32(present + 8) : 22;
         dev->d3d_depth_format = rd32(present + 36);
     }
+    // Reset unbinds render targets 1-3 and puts the new back buffer on 0.
+    for (uint32_t i = 1; i < 4; ++i)
+        bind_color_target(dev, i, nullptr);
     device_forget_buffers(dev);
     ComObj *bb = device_backbuffer(dev);
-    dev->render_target = bb ? bb->id : 0;
     D9Pipeline &pl = d9_pipeline(dev->id);
-    pl.color_target[0] = dev->render_target;
-    for (int i = 1; i < 4; ++i)
-        pl.color_target[i] = 0;
+    bind_color_target(dev, 0, bb);
     pl.viewport_set = false;
     pl.scissor[0] = pl.scissor[1] = 0;
     pl.scissor[2] = (int32_t)dev->width;
@@ -724,7 +980,7 @@ void Dev_Reset(X86 *c) {
         pl.rs[7] = 1;
         pl.states_changed();
     } else
-        dev->zbuffer_obj = 0;
+        bind_depth_stencil(dev, nullptr);
     LOGW("d3d9: Reset to %ux%u", dev->width, dev->height);
     com_ret(c, D3D_OK9);
 }
@@ -885,18 +1141,62 @@ static void gpu_before_lock(ComObj *s);
 static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi);
 static void gpu_forget(ComObj *o);
 
-static uint32_t stage_lock(ComObj *o) {
+// A vertex or index buffer keeps its guest copy between locks (o->stage). It
+// is equal to the host bytes whenever the buffer is unlocked, so a Lock hands
+// it out without copying anything in, and Unlock compares only the bytes the
+// open locks covered. Staging the whole buffer on every lock (allocate, copy
+// in, compare, copy out, free) was paid once per draw for a dynamic buffer
+// locked to append a few vertices. Only a D3DUSAGE_DYNAMIC buffer keeps its
+// copy after the last Unlock: static geometry is written once, and a second
+// copy of every track buffer exhausted the guest heap in another port.
+static bool keeps_stage(const ComObj *o) {
+    return (o->kind == K_D3D9VB || o->kind == K_D3D9IB) && !recomp_ab::old(recomp_ab::LOCKS);
+}
+static void drop_stage(ComObj *o) {
+    if (o->stage) {
+        if (o->pixels == o->stage)
+            o->pixels = 0;
+        heap_free(o->stage);
+        o->stage = 0;
+    }
+}
+
+// [lo, hi) is the byte range the lock hands out; nested locks widen it.
+static uint32_t stage_lock(ComObj *o, uint32_t lo = 0, uint32_t hi = ~0u) {
     if (!o || o->blob.empty())
         return 0;
+    const uint32_t size = (uint32_t)o->blob.size();
+    hi = std::min(hi, size);
+    lo = std::min(lo, hi);
     if (o->lock_count == 0)
         gpu_before_lock(o);
     if (o->lock_count++ == 0) {
-        o->pixels = heap_alloc((uint32_t)o->blob.size(), false, 16);
-        if (!o->pixels) {
-            o->lock_count = 0;
-            return 0;
+        if (keeps_stage(o)) {
+            if (!o->stage) {
+                o->stage = heap_alloc(size, false, 16);
+                if (!o->stage) {
+                    o->lock_count = 0;
+                    return 0;
+                }
+                memcpy(gm_ptr(o->stage), o->blob.data(), size);
+            }
+            o->pixels = o->stage;
+        } else {
+            // A copy kept while the A/B switch selected the persistent path
+            // would go stale now that unlocks stop updating it.
+            drop_stage(o);
+            o->pixels = heap_alloc(size, false, 16);
+            if (!o->pixels) {
+                o->lock_count = 0;
+                return 0;
+            }
+            memcpy(gm_ptr(o->pixels), o->blob.data(), size);
         }
-        memcpy(gm_ptr(o->pixels), o->blob.data(), o->blob.size());
+        o->lock_lo = lo;
+        o->lock_hi = hi;
+    } else {
+        o->lock_lo = std::min(o->lock_lo, lo);
+        o->lock_hi = std::max(o->lock_hi, hi);
     }
     return o->pixels;
 }
@@ -933,12 +1233,21 @@ static void stage_unlock(ComObj *o) {
     if (--o->lock_count == 0 && o->pixels) {
         const uint8_t *staged = gm_ptr(o->pixels);
         uint32_t lo = 0, hi = (uint32_t)o->blob.size();
-        if ((o->kind == K_D3D9VB || o->kind == K_D3D9IB) && !recomp_ab::old(recomp_ab::MIRRORS)) {
+        const bool persistent = o->pixels == o->stage;
+        if (persistent) {
+            // Only the bytes the open locks covered can have changed (Direct3D
+            // leaves writes outside a locked range undefined); the comparison
+            // narrows that to what the game actually rewrote.
+            lo = std::min(o->lock_lo, hi);
+            hi = std::min(std::max(o->lock_hi, lo), hi);
+        }
+        if ((o->kind == K_D3D9VB || o->kind == K_D3D9IB) &&
+            (persistent || !recomp_ab::old(recomp_ab::MIRRORS))) {
             // Only the bytes the game changed go back and on to the GPU. A dynamic buffer is
             // locked to append a few vertices at a time, and sending all of it each time has the
             // browser's main thread write megabytes of unchanged geometry to the GPU a frame. The
-            // span is found by comparison rather than taken from the lock's range, so a write
-            // outside that range is still kept.
+            // span is found by comparison inside the locked ranges (the whole buffer on the
+            // earlier path of the LOCKS A/B switch, which also keeps a write outside them).
             lo = first_difference(staged, o->blob.data(), lo, hi);
             hi = end_of_difference(staged, o->blob.data(), lo, hi);
             if (hi > lo) { // whole 4-byte words: GPU buffer writes take nothing smaller
@@ -948,8 +1257,15 @@ static void stage_unlock(ComObj *o) {
         }
         if (hi > lo)
             memcpy(o->blob.data() + lo, staged + lo, hi - lo);
-        heap_free(o->pixels);
-        o->pixels = 0;
+        o->lock_lo = o->lock_hi = 0;
+        if (persistent) {
+            o->pixels = 0; // the copy stays in o->stage, equal to blob wherever locked
+            if (!(o->d3d_usage & 0x200u)) // D3DUSAGE_DYNAMIC
+                drop_stage(o);
+        } else {
+            heap_free(o->pixels);
+            o->pixels = 0;
+        }
         if (hi > lo) {
             d9_raster_invalidate(o->id);
             gpu_after_unlock(o, lo, hi);
@@ -958,12 +1274,17 @@ static void stage_unlock(ComObj *o) {
 }
 
 static void d3d9_resource_destroy(ComObj *o) {
-    if (o->d3d_version == 8)
-        d3d8_resource_destroy(o);
-    if (o->pixels)
+    // A 2D or cube texture takes its levels and faces with it, in either
+    // version (d3d8.cpp moves them out first, so a level's release cannot
+    // reach back to the texture). Version 9 used to leave them alive.
+    d3d8_resource_destroy(o);
+    // A buffer released while locked: its lock pointer may be the kept copy.
+    if (o->pixels && o->pixels != o->stage)
         heap_free(o->pixels);
     o->pixels = 0;
+    drop_stage(o);
     o->lock_count = 0;
+    o->lock_lo = o->lock_hi = 0;
     o->pixels_bytes = 0;
     std::vector<uint8_t>().swap(o->blob);
     d9_raster_invalidate(o->id);
@@ -1624,31 +1945,80 @@ void Dev_StretchRect(X86 *c) {
     d9_raster_invalidate(dst->id);
     com_ret(c, D3D_OK9);
 }
+// Bound surfaces are referenced as Direct3D 9 does it: SetRenderTarget and
+// SetDepthStencilSurface AddRef the new surface and release the old one, so a
+// target the game releases while it is bound stays valid until it is unbound.
+// Before, a binding took no reference: a depth surface the game released while
+// bound was destroyed at once, and Reset released the bound depth surface even
+// when it was the game's own. A version 8 device keeps its own references
+// (d3d8.cpp) and only records the binding here.
+static void bind_color_target(ComObj *dev, uint32_t index, ComObj *s) {
+    D9Pipeline &pl = d9_pipeline(dev->id);
+    const uint32_t id = s ? s->id : 0;
+    ComObj *old = com_get(pl.color_target[index]);
+    pl.color_target[index] = id;
+    if (index == 0)
+        dev->render_target = id;
+    if (dev->d3d_version == 8 || old == s)
+        return;
+    if (s)
+        com_addref(s);
+    if (old)
+        com_release(old);
+}
+static void bind_depth_stencil(ComObj *dev, ComObj *s) {
+    ComObj *old = com_get(dev->zbuffer_obj);
+    dev->zbuffer_obj = s ? s->id : 0;
+    if (dev->d3d_version == 8 || old == s)
+        return;
+    if (s)
+        com_addref(s);
+    if (old)
+        com_release(old);
+}
+
+// The device's automatic depth buffer, made on first use and bound. Version 9
+// keeps it apart from the binding, so Reset releases only this one and never a
+// depth surface the game made; version 8 tracks it in d3d8.cpp.
 static ComObj *device_depthbuffer(ComObj *dev) {
-    ComObj *s = com_get(dev->zbuffer_obj);
+    const bool version8 = dev->d3d_version == 8;
+    uint32_t &own = version8 ? dev->zbuffer_obj : dev->d9_auto_depth;
+    ComObj *s = com_get(own);
     if (!s) {
         s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480,
                          dev->d3d_depth_format);
-        dev->zbuffer_obj = s ? s->id : 0;
-        if (s)
-            s->samples = dev->samples;
-        if (s)
-            resource_usage()[s->id] = USAGE_DEPTHSTENCIL;
-        if (s)
-            s->d3d_usage = USAGE_DEPTHSTENCIL;
+        own = s ? s->id : 0; // the device's own reference, make_surface's
+        if (!s)
+            return nullptr;
+        s->samples = dev->samples;
+        resource_usage()[s->id] = USAGE_DEPTHSTENCIL;
+        s->d3d_usage = USAGE_DEPTHSTENCIL;
     }
+    if (!version8 && dev->zbuffer_obj != s->id)
+        bind_depth_stencil(dev, s);
     return s;
 }
 
-// Drops the device's own back and depth buffers; the game's references to them
-// keep the objects alive, and the device makes new ones on next use.
+// Drops the device's own back buffer, its depth binding and its automatic
+// depth buffer; the game's references keep those objects alive, and the device
+// makes new ones on next use.
 static void device_forget_buffers(ComObj *dev) {
-    for (uint32_t *field : {&dev->palette_obj, &dev->zbuffer_obj}) {
-        ComObj *s = com_get(*field);
-        if (s)
-            com_release(s);
-        *field = 0;
+    if (dev->d3d_version == 8) {
+        for (uint32_t *field : {&dev->palette_obj, &dev->zbuffer_obj}) {
+            ComObj *s = com_get(*field);
+            if (s)
+                com_release(s);
+            *field = 0;
+        }
+        return;
     }
+    if (ComObj *s = com_get(dev->palette_obj))
+        com_release(s);
+    dev->palette_obj = 0;
+    bind_depth_stencil(dev, nullptr);
+    if (ComObj *s = com_get(dev->d9_auto_depth))
+        com_release(s);
+    dev->d9_auto_depth = 0;
 }
 
 // (this, iSwapChain, iBackBuffer, Type, ppBackBuffer)
@@ -1671,12 +2041,21 @@ void Dev_GetBackBuffer(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
+// The bound depth-stencil surface (the automatic one until the game sets
+// another). With none bound Direct3D 9 answers D3DERR_NOTFOUND; making a new
+// device-sized buffer instead, which the game never released, leaked one per
+// call in NFS Carbon.
 void Dev_GetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    ComObj *s = dev ? device_depthbuffer(dev) : nullptr;
-    if (!s || !out) {
+    if (!dev || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *s = com_get(dev->zbuffer_obj);
+    if (!s) {
+        wr32(out, 0);
+        com_ret(c, D3DERR_NOTFOUND);
         return;
     }
     com_addref(s);
@@ -1703,9 +2082,8 @@ void Dev_SetRenderTarget(X86 *c) {
         return;
     }
     D9Pipeline &pl = d9_pipeline(dev->id);
-    pl.color_target[index] = (s && s->kind == K_D3D9SURFACE) ? s->id : 0;
+    bind_color_target(dev, index, (s && s->kind == K_D3D9SURFACE) ? s : nullptr);
     if (index == 0) {
-        dev->render_target = s->id;
         // Setting render target 0 resets the viewport and scissor to the target.
         pl.viewport_set = false;
         pl.scissor[0] = pl.scissor[1] = 0;
@@ -1719,7 +2097,7 @@ void Dev_SetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
     if (dev)
-        dev->zbuffer_obj = (s && s->kind == K_D3D9SURFACE) ? s->id : 0;
+        bind_depth_stencil(dev, (s && s->kind == K_D3D9SURFACE) ? s : nullptr);
     com_ret(c, D3D_OK9);
 }
 
@@ -1764,6 +2142,7 @@ void Dev_SetVertexDeclaration(X86 *c) {
     if (dev) {
         dev->current_viewport = (d && d->kind == K_D3D9DECL) ? d->id : 0;
         d9_pipeline(dev->id).declaration = dev->current_viewport;
+        fixed_state(dev->id).fvf = 0; // a declaration replaces the FVF
     }
     com_ret(c, D3D_OK9);
 }
@@ -1855,14 +2234,34 @@ void Dev_SetIndices(X86 *c) {
 }
 
 // (this, Stage, pTexture): the texture behind a sampler, for the renderer.
+// The textures each version 9 device holds a reference to, by stage (Dev_SetTexture).
+static std::unordered_map<uint32_t, std::array<uint32_t, 16>> &set_textures() {
+    static auto *m = new std::unordered_map<uint32_t, std::array<uint32_t, 16>>();
+    return *m;
+}
 void Dev_SetTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *tex = com_this(arg(c, 2));
     uint32_t stage = arg(c, 1);
     if (dev) {
         dev->texture_handle = tex ? tex->id : 0;
-        if (stage < 16)
+        if (stage < 16) {
             d9_pipeline(dev->id).sampler_tex[stage] = tex ? tex->id : 0;
+            // Direct3D 9 keeps a reference to each texture set on a stage, so one the
+            // game releases while it is still set stays alive until it is replaced.
+            // Kept apart from sampler_tex, which D3DX effects also write without
+            // references (a version 8 device keeps its own, d3d8.cpp D8_SetTexture).
+            if (dev->d3d_version != 8) {
+                uint32_t &held = set_textures()[dev->id][stage];
+                if (held != (tex ? tex->id : 0)) {
+                    if (tex)
+                        com_addref(tex);
+                    if (ComObj *old = com_get(held))
+                        com_release(old);
+                    held = tex ? tex->id : 0;
+                }
+            }
+        }
     }
     com_ret(c, D3D_OK9);
 }
@@ -1900,22 +2299,39 @@ static bool draw_worth_reporting() {
     return g_draws <= 8 || ((g_draws % 256) == 0 && log_level() >= 2);
 }
 
-static uint32_t primitive_vertices(uint32_t prim, uint32_t count) {
+// In 64 bits: a garbage primitive count must not wrap to a size that fits.
+static uint64_t primitive_vertices(uint32_t prim, uint32_t count) {
     switch (prim) {
     case 1:
         return count; // points
     case 2:
-        return count * 2; // lines
+        return uint64_t(count) * 2; // lines
     case 3:
-        return count + 1; // line strip
+        return uint64_t(count) + 1; // line strip
     case 4:
-        return count * 3; // triangles
+        return uint64_t(count) * 3; // triangles
     case 5:
     case 6:
-        return count + 2;
+        return uint64_t(count) + 2;
     default:
         return 0;
     }
+}
+
+// Direct3D 9 refuses a draw above the device's MaxPrimitiveCount, or one
+// naming more vertices than MaxVertexIndex allows, with D3DERR_INVALIDCALL.
+// Checked before any size arithmetic: in NFS Carbon a garbage count of
+// 0x80000000 + n once wrapped a 32-bit vertex size to one that fitted the
+// arena and grew the process by hundreds of gigabytes.
+static bool draw_refused(const char *what, uint32_t prim, uint32_t count, uint64_t vertices) {
+    if (count <= D9_MAX_PRIMITIVE_COUNT && vertices <= uint64_t(D9_MAX_VERTEX_INDEX) + 1)
+        return false;
+    static uint32_t refused = 0;
+    if (++refused <= 8 || (refused & (refused - 1)) == 0)
+        LOGW("d3d9: %s refused (D3DERR_INVALIDCALL): %u primitives of type %u, %llu vertices "
+             "(%u refused so far)",
+             what, count, prim, (unsigned long long)vertices, refused);
+    return true;
 }
 
 // The render target and depth buffer a draw or clear goes to, mirrored.
@@ -1970,13 +2386,150 @@ static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]) {
     vp[3] = rt ? (int32_t)rt->height : (int32_t)dev->height;
 }
 
+// ---- Draws with no shader bound --------------------------------------------
+// The fixed-function programs' constant registers for the draw being built.
+// The host reads a draw's constants while host_d9_draw runs, as it must for
+// the device's own registers, so one set serves every draw.
+static float g_ffp_vconst[d9ffp::VS_CONSTANTS][4], g_ffp_pconst[d9ffp::PS_CONSTANTS][4];
+
+// What each of the first eight samplers has bound, as the cascade declares it.
+static d9ffp::Textures ffp_textures(const D9Pipeline &pl) {
+    d9ffp::Textures t;
+    for (int s = 0; s < 8; ++s) {
+        ComObj *tex = com_get(pl.sampler_tex[s]);
+        if (!tex)
+            continue;
+        if (tex->kind == K_D3D9TEXTURE)
+            t.kind[s] = tex->caps ? d9sh::S_CUBE : d9sh::S_2D;
+        else if (tex->kind == K_D3D9SURFACE)
+            t.kind[s] = d9sh::S_2D;
+    }
+    return t;
+}
+// A generated program, told to the GPU host once, as CreateVertexShader and
+// CreatePixelShader tell it about the game's.
+static void ffp_announce(d9ffp::Program &p, bool pixel) {
+    if (p.announced || !host_d9_active())
+        return;
+    p.announced = true;
+    host_d9_shader_created(p.bytes.data(), (uint32_t)p.bytes.size(), p.key, pixel ? 1 : 0);
+}
+
+// A draw with no vertex or pixel shader bound, drawn with the fixed-function
+// programs its state describes (d3d9_ffp.h) for the half that has none. It
+// was skipped before: NFSMW's highlighted menu labels are drawn this way. Kept
+// apart from gpu_draw so a draw with both shaders pays nothing for it; the
+// rest follows gpu_draw, and the constants carry no serial (read every time).
+static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
+    D9Pipeline &pl = d9_pipeline(dev->id);
+    ComObj *decl = com_get(pl.declaration);
+    if (!decl || decl->kind != K_D3D9DECL) {
+        log_once("d3d9.gpu.nodecl.ffp",
+                 "d3d9: a fixed-function draw with no vertex declaration or FVF is skipped");
+        return;
+    }
+    const d9ffp::FixedState &fs = fixed_state(dev->id);
+    d.target = gpu_target(dev);
+    target_viewport(dev, d.target, d.viewport);
+    d.depth_range[0] = pl.viewport_z[0];
+    d.depth_range[1] = pl.viewport_z[1];
+    for (int i = 0; i < 4; ++i)
+        d.scissor[i] = pl.scissor[i];
+    if (!pl.vs.empty()) {
+        if (!pl.vs_key)
+            pl.vs_key = d9sh::code_key(pl.vs.data(), pl.vs.size());
+        const d9sh::Program &vs = d9sh::program_for_key(pl.vs_key, pl.vs.data(), pl.vs.size());
+        d.vs_key = pl.vs_key;
+        d.vs = pl.vs.data();
+        d.vs_size = (uint32_t)pl.vs.size();
+        d.vconst = &pl.vconst[0][0];
+        d.vconst_count = std::min<uint32_t>(vs.max_const, 256);
+    } else {
+        d9ffp::Program &ffp = d9ffp::vertex_program(
+            pl, fs, decl->blob.data(), (uint32_t)decl->blob.size(), d.viewport, d.depth_range,
+            !pl.ps.empty(), g_ffp_vconst);
+        ffp_announce(ffp, false);
+        d.vs_key = ffp.key;
+        d.vs = ffp.bytes.data();
+        d.vs_size = (uint32_t)ffp.bytes.size();
+        d.vconst = &g_ffp_vconst[0][0];
+        d.vconst_count = d9ffp::VS_CONSTANTS;
+    }
+    if (!pl.ps.empty()) {
+        if (!pl.ps_key)
+            pl.ps_key = d9sh::code_key(pl.ps.data(), pl.ps.size());
+        const d9sh::Program &ps = d9sh::program_for_key(pl.ps_key, pl.ps.data(), pl.ps.size());
+        d.ps_key = pl.ps_key;
+        d.ps = pl.ps.data();
+        d.ps_size = (uint32_t)pl.ps.size();
+        d.pconst = &pl.pconst[0][0];
+        d.pconst_count = std::min<uint32_t>(ps.max_const, 32);
+    } else {
+        d9ffp::Program &ffp = d9ffp::pixel_program(pl, fs, ffp_textures(pl), g_ffp_pconst);
+        ffp_announce(ffp, true);
+        d.ps_key = ffp.key;
+        d.ps = ffp.bytes.data();
+        d.ps_size = (uint32_t)ffp.bytes.size();
+        d.pconst = &g_ffp_pconst[0][0];
+        d.pconst_count = d9ffp::PS_CONSTANTS;
+    }
+    static uint64_t ffp_draws = 0;
+    if (++ffp_draws == 1 || (ffp_draws & (ffp_draws - 1)) == 0)
+        LOGW("d3d9: %llu draws through the fixed-function pipeline so far (this one: %s vertex, "
+             "%s pixel)",
+             (unsigned long long)ffp_draws, pl.vs.empty() ? "fixed" : "shader",
+             pl.ps.empty() ? "fixed" : "shader");
+    d.decl = decl->blob.data();
+    d.decl_size = (uint32_t)decl->blob.size();
+    d.decl_id = decl->id;
+    for (int i = 0; i < 8; ++i) {
+        d.stream[i].frequency = pl.stream[i].frequency;
+        if (d.stream[i].stride && !d.stream[i].buffer)
+            continue; // the draw's own inline vertices
+        ComObj *vb = com_get(pl.stream[i].vb);
+        if (!vb)
+            continue;
+        gpu_sync_buffer(vb);
+        d.stream[i].buffer = vb->id;
+        d.stream[i].offset = pl.stream[i].offset;
+        d.stream[i].stride = pl.stream[i].stride;
+    }
+    for (int s = 0; s < 16; ++s) {
+        ComObj *tex = com_get(pl.sampler_tex[s]);
+        if (!tex || (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9SURFACE))
+            continue;
+        gpu_sync(tex);
+        d.sampler_texture[s] = tex->id;
+    }
+    d.sampler_state = &pl.sampler_state[0][0];
+    d.render_state = pl.rs;
+    d.render_state_set = (const uint8_t *)pl.rs_set;
+    d.state_version = pl.state_version;
+    // A generated pixel program projects with texldp itself; only a game's
+    // ps_1_x reads the projected stages from the draw.
+    if (!pl.ps.empty())
+        for (int st = 0; st < 8; ++st)
+            if (pl.tss[st][24] & 0x100) // D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED
+                d.projected_mask |= 1u << st;
+    d.label = pl.label;
+    d.instance_count = (pl.stream[0].frequency & HOST_D9_STREAM_INDEXED)
+                           ? pl.stream[0].frequency & HOST_D9_STREAM_DIVIDER
+                           : 1;
+    host_d9_draw(&d);
+    bool color_write = !pl.rs_set[168] || (pl.rs[168] & 0xf) != 0;
+    bool z_write = (!pl.rs_set[14] || pl.rs[14]) && (!pl.rs_set[7] || pl.rs[7]);
+    gpu_target_drawn(dev, color_write, z_write);
+}
+
 // One draw, handed to the GPU renderer with everything the device has bound.
 static void gpu_draw(ComObj *dev, HostD9Draw &d) {
     D9Pipeline &pl = d9_pipeline(dev->id);
     if (pl.vs.empty() || pl.ps.empty()) {
-        log_once("d3d9.gpu.ffp",
-                 "d3d9: a draw with no shaders bound is skipped; the fixed-function "
-                 "pipeline is not rendered on the GPU yet");
+        if (dev->d3d_version != 8) {
+            gpu_draw_fixed(dev, d);
+            return;
+        }
+        log_once("d3d9.gpu.ffp", "d3d9: a version 8 draw with no programs bound is skipped");
         return;
     }
     d.target = gpu_target(dev);
@@ -2015,6 +2568,8 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
     d.vconst_count = std::min<uint32_t>(vs.max_const, 256);
     d.pconst = &pl.pconst[0][0];
     d.pconst_count = std::min<uint32_t>(ps.max_const, 32);
+    d.vconst_serial = pl.vconst_serial; // 0 (unknown) for writers that keep no serial
+    d.pconst_serial = pl.pconst_serial;
     ComObj *decl = com_get(pl.declaration);
     if (!decl || decl->kind != K_D3D9DECL) {
         log_once("d3d9.gpu.nodecl", "d3d9: a draw with no vertex declaration is skipped");
@@ -2076,6 +2631,10 @@ void Dev_DrawPrimitive(X86 *c) {
     if (draw_worth_reporting())
         LOGW("d3d9: draw %u: %s, %u primitives from vertex %u, from the bound stream", g_draws,
              prim_name(arg(c, 1)), arg(c, 3), arg(c, 2));
+    if (draw_refused("DrawPrimitive", arg(c, 1), arg(c, 3), 0)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     ComObj *dev = this_device9(c);
     if (dev && gpu_on()) {
         HostD9Draw d{};
@@ -2105,6 +2664,10 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     if (draw_worth_reporting())
         LOGW("d3d9: draw %u: %s, %u primitives, %u vertices from index %u, indexed", g_draws,
              prim_name(arg(c, 1)), arg(c, 6), arg(c, 4), arg(c, 5));
+    if (draw_refused("DrawIndexedPrimitive", arg(c, 1), arg(c, 6), arg(c, 4))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     d9_api_indexed_draw(this_device9(c), arg(c, 1), (int32_t)arg(c, 2), arg(c, 5), arg(c, 6));
     com_ret(c, D3D_OK9);
 }
@@ -2213,15 +2776,19 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         if (g_draws <= 8)
             describe_draw_inputs(c, arg(c, 3), arg(c, 4), arg(c, 2) + 2);
     }
+    if (draw_refused("DrawPrimitiveUP", arg(c, 1), arg(c, 2), 0)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     if (ComObj *dev = this_device9(c); dev && gpu_on()) {
         HostD9Draw d{};
         d.primitive = arg(c, 1);
         d.primitive_count = arg(c, 2);
-        uint32_t bytes = primitive_vertices(d.primitive, d.primitive_count) * arg(c, 4);
+        const uint64_t bytes = primitive_vertices(d.primitive, d.primitive_count) * arg(c, 4);
         if (bytes && gm_fits(arg(c, 3), bytes)) {
             d.stream[0].stride = arg(c, 4);
             d.inline_vertices = gm_ptr(arg(c, 3));
-            d.inline_bytes = bytes;
+            d.inline_bytes = (uint32_t)bytes;
             gpu_draw(dev, d);
         }
         com_ret(c, D3D_OK9);
@@ -2243,19 +2810,24 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
         LOGW("d3d9: draw %u: %s, %u primitives, %u vertices of %u bytes inline at %08x, "
              "indices at %08x",
              g_draws, prim_name(arg(c, 1)), arg(c, 4), arg(c, 3), arg(c, 8), arg(c, 7), arg(c, 5));
+    if (draw_refused("DrawIndexedPrimitiveUP", arg(c, 1), arg(c, 4),
+                     uint64_t(arg(c, 2)) + arg(c, 3))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     if (ComObj *dev = this_device9(c); dev && gpu_on()) {
         HostD9Draw d{};
         d.primitive = arg(c, 1);
         d.primitive_count = arg(c, 4);
-        uint32_t isize = arg(c, 6) == 102 ? 4 : 2;
-        uint32_t ibytes = primitive_vertices(d.primitive, d.primitive_count) * isize;
-        uint32_t vbytes = (arg(c, 2) + arg(c, 3)) * arg(c, 8);
+        const uint32_t isize = arg(c, 6) == 102 ? 4 : 2;
+        const uint64_t ibytes = primitive_vertices(d.primitive, d.primitive_count) * isize;
+        const uint64_t vbytes = (uint64_t(arg(c, 2)) + arg(c, 3)) * arg(c, 8);
         if (ibytes && vbytes && gm_fits(arg(c, 5), ibytes) && gm_fits(arg(c, 7), vbytes)) {
             d.stream[0].stride = arg(c, 8);
             d.inline_vertices = gm_ptr(arg(c, 7));
-            d.inline_bytes = vbytes;
+            d.inline_bytes = (uint32_t)vbytes;
             d.inline_indices = gm_ptr(arg(c, 5));
-            d.inline_index_bytes = ibytes;
+            d.inline_index_bytes = (uint32_t)ibytes;
             d.index_size = isize;
             gpu_draw(dev, d);
         }
@@ -2339,16 +2911,19 @@ void Res_GetDevice(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
-// Lock hands the guest the storage this resource was created with. Unlock is
-// a no-op: there is nothing to upload to yet.
+// Lock hands the guest the buffer's staged copy (stage_lock) at the offset
+// asked for; Unlock writes back what changed inside the locked range.
 static void buffer_lock(X86 *c) {
     ComObj *o = com_this_arg(c);
-    uint32_t offset = arg(c, 1), out = arg(c, 3);
+    uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3);
     if (!o || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t staged = offset < o->blob.size() ? stage_lock(o) : 0;
+    // SizeToLock 0 locks to the end of the buffer.
+    const uint32_t total = (uint32_t)o->blob.size();
+    const uint32_t hi = size && offset < total && size <= total - offset ? offset + size : total;
+    uint32_t staged = offset < total ? stage_lock(o, offset, hi) : 0;
     com_out_ptr(out, staged ? staged + offset : 0);
     com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
 }
@@ -2450,9 +3025,7 @@ void Tex_GetCubeMapSurface(X86 *c) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    if (tex->d3d_version != 8)
-        com_addref(tex);
-    com_addref(s);
+    com_addref(s); // takes the texture reference with the first outside one
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
 }
@@ -2508,11 +3081,12 @@ void Tex_GetSurfaceLevel(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    // A level is a view into the texture and references it, the same way a
-    // cube face does.
+    // A level is a view into the texture: while anything outside holds it, it
+    // holds one texture reference (surface_references in d3d8.cpp takes it
+    // with the first outside reference and gives it back with the last).
+    // Taking one per call, never given back, kept every texture whose level
+    // was ever asked for alive for the rest of the run.
     s->front_obj = tex->id;
-    if (tex->d3d_version != 8)
-        com_addref(tex);
     com_addref(s);
     uint32_t view_ = d9_api_view(s, IF_D3DSURFACE9);
     if (!view_) {
@@ -2735,9 +3309,27 @@ void d9_bind_shader(uint32_t device_id, bool pixel, D9ShaderBytes bytes, uint64_
 }
 
 void d3d9_device_destroy(ComObj *device) {
+    if (device->d3d_version != 8) {
+        // The bound targets, the depth binding, the automatic depth buffer and
+        // the back buffer are the device's references (d3d8.cpp drops a
+        // version 8 device's own).
+        for (uint32_t i = 0; i < 4; ++i)
+            bind_color_target(device, i, nullptr);
+        device_forget_buffers(device);
+        // And the textures set on its stages (Dev_SetTexture).
+        auto held = set_textures().find(device->id);
+        if (held != set_textures().end()) {
+            const std::array<uint32_t, 16> ids = held->second;
+            set_textures().erase(held);
+            for (uint32_t id : ids)
+                if (ComObj *t = com_get(id))
+                    com_release(t);
+        }
+    }
     d9_bind_shader(device->id, false, {}, 0);
     d9_bind_shader(device->id, true, {}, 0);
     d9_pipeline(device->id) = D9Pipeline{};
+    fixed_states().erase(device->id);
 }
 
 // (this, State, Value)
@@ -2784,11 +3376,13 @@ void Dev_SetTransform(X86 *c) {
     if (dev && m) {
         uint32_t slot =
             state < 256 ? state : (state >= 256 && state < 260 ? state - 256 + 24 : 0xffffffffu);
-        if (slot < 32)
+        if (slot < 32) {
             for (int i = 0; i < 16; ++i) {
                 uint32_t b = rd32(m + 4u * (uint32_t)i);
                 memcpy(&d9_pipeline(dev->id).transform[slot][i], &b, 4);
             }
+            fixed_state(dev->id).transform_set |= 1u << slot;
+        }
     }
     com_ret(c, D3D_OK9);
 }
@@ -2797,8 +3391,10 @@ void Dev_SetTransform(X86 *c) {
 void Dev_SetTextureStageState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t stage = arg(c, 1), type = arg(c, 2);
-    if (dev && stage < 8 && type < 33)
+    if (dev && stage < 8 && type < 33) {
         d9_pipeline(dev->id).tss[stage][type] = arg(c, 3);
+        fixed_state(dev->id).tss_set[stage] |= uint64_t(1) << type;
+    }
     com_ret(c, D3D_OK9);
 }
 
@@ -3055,6 +3651,7 @@ void d3d9_reset() {
     // here without invoking destructors against the remapped guest heap.
     for (auto &[id, pipeline] : pipeline_records())
         pipeline = D9Pipeline{};
+    fixed_states().clear();
 }
 
 void d3d9_register() {

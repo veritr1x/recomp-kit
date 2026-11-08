@@ -51,6 +51,51 @@ uint32_t host_millis() {
     }
     return (uint32_t)((now_us() - epoch) / 1000ull);
 }
+// A microsecond clock for QueryPerformanceCounter, on host_millis()'s time line
+// but finer: the wall clock under host_millis() has only milliseconds in a
+// browser, where os_monotonic_ns() is performance.now(). The offset from the
+// monotonic clock to that line is set by the first read and kept while the
+// result stays inside the millisecond host_millis() reports; it is reset only
+// when the two disagree (a host time source that steps, a new source, the wall
+// clock drifting from the monotonic one), so the count never runs ahead of
+// GetTickCount nor falls behind it. Atomic: a guest thread running free reads
+// it too (host_micros_quiet). A pinned clock has only milliseconds and stays
+// on them, so a pinned run reads the same numbers every time.
+namespace {
+constexpr int64_t k_no_micro_offset = INT64_MIN;
+std::atomic<int64_t> g_micro_offset{k_no_micro_offset};
+
+uint64_t micros_on(uint32_t ms) {
+    const uint64_t line = (uint64_t)ms * 1000ull;
+    if (host_time_source_is_pinned())
+        return line;
+    const int64_t mono = (int64_t)(os_monotonic_ns() / 1000ull);
+    const int64_t off = g_micro_offset.load(std::memory_order_relaxed);
+    if (off != k_no_micro_offset) {
+        const int64_t us = mono + off;
+        if (us >= (int64_t)line && us < (int64_t)line + 1000)
+            return (uint64_t)us;
+        // Back inside this millisecond, at whichever edge it left by.
+        const int64_t edge = us < (int64_t)line ? (int64_t)line : (int64_t)line + 999;
+        g_micro_offset.store(edge - mono, std::memory_order_relaxed);
+        return (uint64_t)edge;
+    }
+    g_micro_offset.store((int64_t)line - mono, std::memory_order_relaxed);
+    return line;
+}
+} // namespace
+
+uint64_t host_micros() {
+    return micros_on(host_millis());
+}
+bool host_micros_quiet(uint64_t *out) {
+    uint32_t ms;
+    if (!host_millis_quiet(&ms))
+        return false;
+    *out = micros_on(ms);
+    return true;
+}
+
 // A new source drops the quiet version of the old one: it may read another clock.
 void host_set_time_source(uint32_t (*fn)()) {
     g_time_source = fn;

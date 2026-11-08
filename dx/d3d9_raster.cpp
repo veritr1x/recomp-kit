@@ -304,7 +304,8 @@ struct Machine {
         case R_CONST: {
             int32_t idx = (int32_t)s.index;
             if (s.rel)
-                idx += (int32_t)std::floor(a0[0] + 0.5f);
+                // The CPU machine has no loops, so aL-relative reads use a0.
+                idx += (int32_t)std::floor(a0[s.rel_comp & 3] + 0.5f);
             raw = idx >= 0 ? constant((uint32_t)idx) : V4();
             break;
         }
@@ -517,10 +518,16 @@ struct Machine {
             }
             case OP_EXP:
             case OP_EXPP: {
+                // Base 2; vs_1_1 expp splits x into 2^floor(x) and frac(x).
                 V4 a = read(s[0]);
-                float d = std::exp(a[0]);
+                float d = std::exp2(a[0]);
                 for (int k = 0; k < 4; ++k)
                     o[k] = d;
+                if (in.op == OP_EXPP && !p->pixel && p->major == 1) {
+                    o[0] = std::exp2(std::floor(a[0]));
+                    o[1] = a[0] - std::floor(a[0]);
+                    o[3] = 1.0f;
+                }
                 break;
             }
             case OP_LOG:

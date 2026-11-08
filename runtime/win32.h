@@ -162,6 +162,10 @@ bool sched_is_guest_thread();
 // run_entry needs this: every other guest thread is registered by the
 // scheduler when it starts.
 void sched_set_guest_thread(bool yes);
+// SizeOfStackReserve from the image's optional header (runtime/loader.cpp): the
+// stack Windows gives a thread whose creator asks for less, or for 0. 0 before a
+// load.
+uint32_t loader_stack_reserve();
 // Import checkpoints retain a short time slice; translated back edges use
 // recomp_backedge_poll for immediate, budgeted handoffs.
 void sched_checkpoint();
@@ -324,6 +328,11 @@ void host_set_time_source(uint32_t (*fn)());
 // A pinned clock, and no time source at all, are quiet already.
 void host_set_quiet_time_source(uint32_t (*fn)());
 bool host_millis_quiet(uint32_t *out);
+// Microseconds on host_millis()'s time line, finer than it, for QueryPerformanceCounter;
+// never outside the millisecond host_millis() reports. Pinned, whole milliseconds. The
+// quiet form answers false exactly when host_millis_quiet does.
+uint64_t host_micros();
+bool host_micros_quiet(uint64_t *out);
 // What that clock IS, in the host's own words, for whatever has to record what
 // a run ran on. Installing a time source is not the same as pinning one - the
 // boot hosts install one that reads the real clock - so this cannot be derived

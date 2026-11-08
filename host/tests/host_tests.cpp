@@ -56,6 +56,7 @@
 
 #include "../gpu/fake/fake_device.h"
 #include "../gpu/gpu_factory.h"
+#include "../gpu/d3d9_backend.h"
 #include "../gpu/d3d9_warm.h"
 #include "../../dx/host_d9.h"
 #include "../../dx/d3d9_msl.h"
@@ -10173,6 +10174,112 @@ static void test_d3d9_gpu_renderer() {
     host_d9_texture_drop(DEPTH);
 }
 
+// What a draw handed the backend: its constant registers and label.
+struct D9SeenDraw {
+    std::vector<float> v, p;
+    std::string label;
+};
+// A backend that only keeps what draws hand it.
+struct D9CaptureBackend final : D9Backend {
+    std::vector<D9SeenDraw> *seen;
+    explicit D9CaptureBackend(std::vector<D9SeenDraw> *s) : seen(s) {}
+    const char *name() const override {
+        return "capture";
+    }
+    void define(const HostD9TextureDesc &) override {}
+    void drop(uint32_t) override {}
+    void upload(uint32_t, uint32_t, uint32_t, const uint8_t *, uint32_t) override {}
+    bool read(uint32_t, uint32_t, uint32_t, uint8_t *, uint32_t) override {
+        return false;
+    }
+    void buffer_upload(uint32_t, uint32_t, uint32_t, const uint8_t *, uint32_t) override {}
+    void buffer_drop(uint32_t) override {}
+    void draw(const HostD9Draw &d) override {
+        D9SeenDraw s;
+        if (d.vconst)
+            s.v.assign(d.vconst, d.vconst + d.vconst_count * 4);
+        if (d.pconst)
+            s.p.assign(d.pconst, d.pconst + d.pconst_count * 4);
+        s.label = d.label ? d.label : "";
+        seen->push_back(s);
+    }
+    void clear(const HostD9Target &, const int32_t[4], uint32_t, const int32_t *, uint32_t,
+               uint32_t, float, uint32_t) override {}
+    void stretch(HostD9Surface, const int32_t[4], HostD9Surface, const int32_t[4],
+                 uint32_t) override {}
+    void present(uint32_t, uint32_t, uint32_t) override {}
+    bool read_presented(uint8_t *, uint32_t, uint32_t *, uint32_t *) override {
+        return false;
+    }
+    void query_begin(uint32_t) override {}
+    void query_end(uint32_t) override {}
+    int query_result(uint32_t, uint32_t *) override {
+        return -1;
+    }
+    void query_drop(uint32_t) override {}
+    void probe_next(const char *) override {}
+};
+
+// A draw's constants reach the backend as they were when it was made, whether the queue
+// copied them or reused an earlier draw's copy (same serial, or same bytes), and its label
+// survives the state tables some draws append after their data.
+static void test_d3d9_constant_bank() {
+#ifndef __EMSCRIPTEN__ // the browser's queue drains only from its main loop
+    static std::vector<D9SeenDraw> seen;
+    seen.clear();
+    CHECK(host_d9_use_backend_for_test(new D9CaptureBackend(&seen)));
+    float v[256][4], p[32][4];
+    for (int i = 0; i < 256; ++i)
+        for (int k = 0; k < 4; ++k)
+            v[i][k] = float(i * 4 + k);
+    for (int i = 0; i < 32; ++i)
+        for (int k = 0; k < 4; ++k)
+            p[i][k] = 1000.0f + float(i * 4 + k);
+    static const uint32_t samplers[16 * 14] = {}, states[256] = {};
+    static const uint8_t set[256] = {};
+    std::vector<D9SeenDraw> want;
+    auto draw = [&](uint32_t vn, uint64_t vserial, uint32_t pn, uint64_t pserial, uint64_t state,
+                    const char *label) {
+        HostD9Draw d{};
+        d.vconst = &v[0][0];
+        d.vconst_count = vn;
+        d.vconst_serial = vserial;
+        d.pconst = &p[0][0];
+        d.pconst_count = pn;
+        d.pconst_serial = pserial;
+        d.sampler_state = samplers;
+        d.render_state = states;
+        d.render_state_set = set;
+        d.state_version = state;
+        d.label = label;
+        host_d9_draw(&d);
+        D9SeenDraw w;
+        w.v.assign(&v[0][0], &v[0][0] + vn * 4);
+        w.p.assign(&p[0][0], &p[0][0] + pn * 4);
+        w.label = label;
+        want.push_back(w);
+    };
+    draw(8, 10, 4, 20, 1, "copied");
+    draw(4, 10, 4, 20, 1, "same serials, fewer registers");
+    v[2][0] = -1.0f; // the game writes; a new serial
+    draw(8, 11, 4, 20, 2, "vertex constants changed");
+    draw(8, 0, 4, 0, 2, "no serials, same bytes");
+    v[7][3] = -2.0f;
+    p[1][1] = -3.0f;
+    draw(8, 0, 4, 0, 3, "no serials, new bytes");
+    draw(12, 12, 4, 21, 3, "more registers than the copy");
+    v[11][0] = -4.0f;
+    draw(10, 0, 2, 0, 4, "a prefix of a changed copy");
+    host_d9_use_backend_for_test(nullptr); // runs everything queued first
+    CHECK_EQ(seen.size(), want.size());
+    for (size_t i = 0; i < seen.size() && i < want.size(); ++i) {
+        CHECK(seen[i].v == want[i].v);
+        CHECK(seen[i].p == want[i].p);
+        CHECK(seen[i].label == want[i].label);
+    }
+#endif
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--keyboard-only")) {
         mem_init();
@@ -10378,6 +10485,7 @@ int main(int argc, char **argv) {
         {"every sound heard", test_audio_every_sound_started_is_heard},
         {"voice vs queued", test_audio_voice_remaining_versus_queued},
         {"primitive expansion", test_primitive_expansion},
+        {"d3d9 constant bank", test_d3d9_constant_bank},
         {"present counts", test_present_counts},
         {"stats line format", test_stats_line_format},
         {"await at least", test_script_await_at_least},

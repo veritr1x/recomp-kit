@@ -33,9 +33,13 @@ extern "C" {
 #if defined(__GNUC__) || defined(__clang__)
 #define RECOMP_HOT_INLINE static inline __attribute__((always_inline))
 #define RECOMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+/* The rarely taken half of a hot helper: kept out of line so the inlined fast
+ * path stays small in the generated code. */
+#define RECOMP_COLD_OUTLINE static inline __attribute__((noinline, cold))
 #else
 #define RECOMP_HOT_INLINE static inline
 #define RECOMP_UNLIKELY(x) (x)
+#define RECOMP_COLD_OUTLINE static inline
 #endif
 
 /* ---------------------------------------------------------------- memory */
@@ -192,11 +196,22 @@ static inline void recomp_dirty(uint32_t a, uint32_t n) {
     }
 }
 
-static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
-    if (g_watch_len != 0 && a < g_watch_base + g_watch_len && g_watch_base < a + n)
+/* What a store does while a watch is armed or a dirty range is open, kept out
+ * of line. Every guest store is inlined into the generated code, and with this
+ * inline each one carried two global loads and the dirty loop; the NFS Carbon
+ * kit measured one translated chunk at 1.28 MB of code that way and 0.79 MB
+ * with the hooks outlined, which is instruction cache on the busiest thread.
+ * The checks and their order are unchanged; `watch` is 0 for the stores that
+ * never reported to the watch (the x87 ones). */
+RECOMP_COLD_OUTLINE void recomp_store_hooks(uint32_t a, uint32_t n, uint64_t v, int watch) {
+    if (watch && g_watch_len != 0 && a < g_watch_base + g_watch_len && g_watch_base < a + n)
         recomp_watch_hit(a, n, v);
     if (g_dirty_count != 0)
         recomp_dirty(a, n);
+}
+static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
+    if (RECOMP_UNLIKELY((g_watch_len | g_dirty_count) != 0))
+        recomp_store_hooks(a, n, v, 1);
 }
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
@@ -234,14 +249,14 @@ RECOMP_HOT_INLINE double rdf64(uint32_t a) {
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
     RECOMP_NULL_GUARD(a, 1);
     memcpy(RECOMP_GUEST_BASE + a, &v, 4);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 4);
+    if (RECOMP_UNLIKELY(g_dirty_count != 0))
+        recomp_store_hooks(a, 4, 0, 0);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
     RECOMP_NULL_GUARD(a, 1);
     memcpy(RECOMP_GUEST_BASE + a, &v, 8);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 8);
+    if (RECOMP_UNLIKELY(g_dirty_count != 0))
+        recomp_store_hooks(a, 8, 0, 0);
 }
 
 /* Locked read-modify-writes: LOCK XADD, LOCK CMPXCHG, XCHG with a memory operand (which
@@ -352,8 +367,8 @@ static inline void wrbcd80(uint32_t a, double v) {
     if (!(fabs(r) < 1e18)) {
         static const uint8_t indefinite[10] = {0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff};
         memcpy(RECOMP_GUEST_BASE + a, indefinite, 10);
-        if (g_dirty_count != 0)
-            recomp_dirty(a, 10);
+        if (RECOMP_UNLIKELY(g_dirty_count != 0))
+            recomp_store_hooks(a, 10, 0, 0);
         return;
     }
     uint64_t m = (uint64_t)fabs(r);
@@ -367,8 +382,8 @@ static inline void wrbcd80(uint32_t a, double v) {
     if (r < 0 || (r == 0 && signbit(v)))
         out[9] = 0x80;
     memcpy(RECOMP_GUEST_BASE + a, out, 10);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 10);
+    if (RECOMP_UNLIKELY(g_dirty_count != 0))
+        recomp_store_hooks(a, 10, 0, 0);
 }
 
 /* ------------------------------------------------------------- cpu state */
@@ -1120,12 +1135,25 @@ static inline void x86_popad(X86 *c) {
 /* ---------------------------------------------------------- string ops
  * DF selects the step direction.  The REP forms use ECX as the counter.
  */
+/* REP MOVS/STOS of RECOMP_REP_BULK_MIN bytes or more as one host memmove or
+ * fill (runtime/memory.cpp). The element loop below pays a store's hooks and a
+ * loop iteration per element, and a game clears and copies kilobytes at a time
+ * this way. The bulk path leaves memory, the dirty ranges, ECX, ESI and EDI
+ * exactly as the loop would and returns 1; it returns 0, having changed
+ * nothing, whenever it cannot promise that (a watch is armed, a range leaves
+ * the arena or reaches the null page, or a MOVS overlap runs in the direction
+ * where the loop replicates a pattern rather than moving bytes), and the loop
+ * runs as before. `stos` is 1 for STOS, 0 for MOVS. */
+#define RECOMP_REP_BULK_MIN 32u
+int recomp_rep_bulk(X86 *c, uint32_t width, int stos);
 #define STRING_OPS(SUF, BITS, UT, RD, WR)                                                          \
     static inline void stos##SUF(X86 *c) {                                                         \
         WR(c->r[R_EDI], (UT)c->r[R_EAX]);                                                          \
         c->r[R_EDI] += c->eflags_df ? (uint32_t)-(BITS / 8) : (uint32_t)(BITS / 8);                \
     }                                                                                              \
     static inline void rep_stos##SUF(X86 *c) {                                                     \
+        if (c->r[R_ECX] >= RECOMP_REP_BULK_MIN / (BITS / 8) && recomp_rep_bulk(c, BITS / 8, 1))    \
+            return;                                                                                \
         while (c->r[R_ECX]) {                                                                      \
             stos##SUF(c);                                                                          \
             c->r[R_ECX]--;                                                                         \
@@ -1137,6 +1165,8 @@ static inline void x86_popad(X86 *c) {
         c->r[R_ESI] += c->eflags_df ? (uint32_t)-(BITS / 8) : (uint32_t)(BITS / 8);                \
     }                                                                                              \
     static inline void rep_movs##SUF(X86 *c) {                                                     \
+        if (c->r[R_ECX] >= RECOMP_REP_BULK_MIN / (BITS / 8) && recomp_rep_bulk(c, BITS / 8, 0))    \
+            return;                                                                                \
         while (c->r[R_ECX]) {                                                                      \
             movs##SUF(c);                                                                          \
             c->r[R_ECX]--;                                                                         \

@@ -46,6 +46,21 @@ EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 FUNCTION_ALIGNMENT = 16
 UNTRANSLATED_RANGES = ()
+#: Translator optimisations ([translate.speedups] in game.toml, tools/
+#: game_config.py TRANSLATE_SPEEDUPS): configure() sets them, tests set them
+#: directly, and --speedup overrides one for a regeneration.
+SPEEDUPS = dict(game_config.TRANSLATE_SPEEDUPS)
+#: [translate] st0_leaves: address -> recipe (ST0_RECIPES), used under the
+#: x87_st0_leaves speedup.
+ST0_LEAVES = {}
+#: [translate] icall_profile, read by configure(): CALL site -> the targets a
+#: run recorded there, used under the devirt speedup.
+ICALL_PROFILE = {}
+
+
+def speedup(name):
+    """Is translator optimisation `name` on? (game_config.TRANSLATE_SPEEDUPS)"""
+    return SPEEDUPS[name]
 
 
 def untranslated_policy(address):
@@ -55,6 +70,10 @@ def untranslated_policy(address):
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
 #: free address, and the words the loader seeds before the game runs.
 OPERAND_REDIRECTS = {}
+#: (from, to) -> the redirected operand's size in bytes, filled in by
+#: apply_operand_redirects for table.c's recomp_operand_redirect_widths (the
+#: loader seeds that many bytes of the new address from the old one).
+OPERAND_REDIRECT_WIDTHS = {}
 INSTRUCTION_PATCHES = {}
 PATCHES_APPLIED = set()
 DATA_SEEDS = []
@@ -127,6 +146,28 @@ def read_discovered(path):
     return found
 
 
+def read_icall_profile(path):
+    """A file runtime/icall_profile.h wrote: `site target count` per line, in
+    hexadecimal but for the count. Returns site -> [(target, count)], the most
+    frequent first. A missing file is an empty profile, so a game can name
+    the file before its first recording run."""
+    sites = defaultdict(dict)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.split("#")[0].strip()
+            if not line:
+                continue
+            try:
+                site, target, count = line.split()
+                site, target, count = int(site, 16), int(target, 16), int(count)
+            except ValueError:
+                raise TranslateError("%s: %r is not `site target count`" % (path, line))
+            sites[site][target] = sites[site].get(target, 0) + count
+    return {s: sorted(t.items(), key=lambda kv: (-kv[1], kv[0])) for s, t in sites.items()}
+
+
 def configure(cfg):
     """Point the translator at one game's listings, binary and audited reads."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
@@ -150,10 +191,16 @@ def configure(cfg):
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
+    OPERAND_REDIRECT_WIDTHS.clear()
     OPERAND_REDIRECTS = {int(r["at"]): (int(r["from"]), int(r["to"]))
                          for r in cfg["translate"].get("operand_redirects", ())}
     INSTRUCTION_PATCHES = {int(r["at"]): str(r["text"])
                            for r in cfg["translate"].get("instruction_patches", ())}
+    global SPEEDUPS, ST0_LEAVES, ICALL_PROFILE
+    SPEEDUPS = dict(cfg["translate"].get("speedups") or game_config.TRANSLATE_SPEEDUPS)
+    ST0_LEAVES = {int(e["at"]): e["recipe"] for e in cfg["translate"].get("st0_leaves", ())}
+    profile = cfg["translate"].get("icall_profile")
+    ICALL_PROFILE = read_icall_profile(os.path.join(str(cfg["dir"]), profile)) if profile else {}
     DATA_SEEDS = []
     for r in cfg["translate"].get("data_seeds", ()):
         if "float" in r:
@@ -408,11 +455,35 @@ def apply_operand_redirects(parsed, redirects):
             pattern = re.compile(r"\[0x0*%x\]" % old, re.IGNORECASE)
             ops = [pattern.sub("[0x%08x]" % new, o) for o in ins.ops]
             if ops != list(ins.ops):
+                width = None
+                for before, after in zip(ins.ops, ops):
+                    if before != after:
+                        m = MEM_RE.match(after.strip())
+                        width = PTR_SIZE.get(m.group(1)) if m and m.group(1) else None
+                # An unsized operand leaves the pair without a width, and then
+                # the table carries none (the loader keeps its old copy).
+                key = (old, new)
+                if width is not None:
+                    OPERAND_REDIRECT_WIDTHS[key] = max(OPERAND_REDIRECT_WIDTHS.get(key, 0), width // 8)
+                else:
+                    OPERAND_REDIRECT_WIDTHS.setdefault(key, 0)
                 ins.ops = ops
                 missing.pop(ins.addr, None)
     if missing:
         raise TranslateError("operand redirects matched nothing: " +
                              ", ".join("%08x" % a for a in sorted(missing)))
+
+
+def operand_redirect_widths(pairs):
+    """table.c's recomp_operand_redirect_widths: each redirected operand's
+    size in bytes, in the order of recomp_operand_redirect_pairs. The loader
+    uses them only when there is one per pair (runtime/loader.cpp)."""
+    widths = [OPERAND_REDIRECT_WIDTHS.get(q, 0) for q in pairs]
+    if not pairs or not all(widths):
+        widths = []
+    return ("const uint8_t recomp_operand_redirect_widths[] = {%s};\n"
+            "const uint32_t recomp_operand_redirect_width_count = %du;\n"
+            % (", ".join("%du" % w for w in widths) if widths else "0u", len(widths)))
 
 
 ALL_FLAGS = frozenset(("cf", "zf", "sf", "of", "pf", "af"))
@@ -1878,6 +1949,20 @@ def seh_restore_sites(fn):
     return result
 
 
+def seh_unproven_establishment(fn, sites):
+    """True when the body publishes a chain head through ESP (MOV FS:[0], ESP)
+    that seh_frame_sites did not accept. A restore in such a body is not a
+    retire: there is no proven frame to retire, and the same unproven base
+    would hide the registration."""
+    for i, ins in enumerate(fn.insns):
+        if ins.mnem != "MOV" or len(ins.ops) != 2 or "FS:" not in ins.ops[0]:
+            continue
+        src = parse_operand(ins.ops[1])
+        if src.kind == "reg" and src.size == 32 and src.reg == R_ESP and i not in sites:
+            return True
+    return False
+
+
 def seh_frame_sites(fn, image=None):
     """Map establishing MOV/helper CALL indices to their handler addresses."""
     sites = {}
@@ -2125,6 +2210,68 @@ class X87Fallback(Exception):
     written-back register file instead."""
 
 
+class X87Shape(object):
+    """What a carried label promises about the x87 stack (speedup x87_carry).
+
+    Every edge into the label leaves the stack this way: TOP is ft0_ + r and
+    the register file's TOP is ft0_ + flushed_r; each position in `live` is
+    in the canonical local X87Cache.canon_value(p) (and canon_bits(p) when it
+    has an exact integer), as (has_bits, dirty, known) - dirty: the register
+    file may not hold it yet; known: its exact-integer flag and tag follow
+    from the value as X87Cache documents. `popped` positions owe the register
+    file an empty tag, `f0` positions are known to hold st_exact == 0 there.
+    None stands for a label that keeps nothing: every edge writes back."""
+
+    __slots__ = ("r", "flushed_r", "live", "popped", "f0")
+
+    def __init__(self, r, flushed_r, live, popped, f0):
+        self.r, self.flushed_r = r, flushed_r
+        self.live = dict(live)
+        self.popped = frozenset(popped)
+        self.f0 = frozenset(f0)
+
+    def key(self):
+        return (self.r, self.flushed_r, tuple(sorted(self.live.items())), self.popped, self.f0)
+
+    def __eq__(self, other):
+        return isinstance(other, X87Shape) and self.key() == other.key()
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.key())
+
+    def __repr__(self):
+        return "X87Shape(r=%d, top=%d, live=%r, popped=%r)" % (
+            self.r, self.flushed_r, self.live, sorted(self.popped))
+
+    @staticmethod
+    def meet(a, b):
+        """The most a label can promise to both: None when either keeps nothing
+        or the stack depths differ."""
+        if a is None or b is None or a.r != b.r:
+            return None
+        live = {}
+        for p in set(a.live) & set(b.live):
+            ba, da, ka = a.live[p]
+            bb, db, kb = b.live[p]
+            if ka and kb:
+                if ba != bb:
+                    continue    # an exact integer on one side only: written back
+                live[p] = (ba, da or db, True)
+            else:
+                # Loaded from the register file on some side: every side
+                # writes its value back first, then the file is the truth.
+                live[p] = (False, False, False)
+        fr = a.flushed_r if a.flushed_r == b.flushed_r else a.r
+        return X87Shape(a.r, fr, live, a.popped & b.popped, a.f0 & b.f0)
+
+
+#: X87Carry.shape: a label nothing has reached yet in this pass.
+X87_TOP = "top"
+
+
 class X87Cache(object):
     """The x87 stack of one straight-line run, held in C locals.
 
@@ -2133,15 +2280,22 @@ class X87Cache(object):
     pushes take p below zero. Each value is a fresh local assigned once, so a
     copy or exchange moves names rather than data. At a boundary (a label, a
     branch, a call, an instruction that is not plain integer code, or an x87
-    instruction outside VIRTUAL) write_back() leaves st[], st_bits[],
-    st_exact[], the tag word and TOP exactly as the per-instruction helpers
-    would have.
+    instruction outside VIRTUAL) write_back() leaves st[], st_exact[], the
+    tag word and TOP as the per-instruction helpers would have, and st_bits[]
+    wherever st_exact[] is set (the runtime reads st_bits only under
+    st_exact; with x87_skip_inexact_bits off it is zeroed as before). A
+    register the run popped gets its empty tag; with x87_trim_popped off it
+    also gets the popped value and a zero st_exact, as the helpers leave it.
 
     A value loaded from the register file carries metadata the run does not
     know (an exact 64-bit integer, a tag FLDENV set), so moving one (FXCH,
     FLD ST(i), FST ST(i)) falls back. Values produced in the run have known
     metadata: no exact integer except FILD's, and a tag that follows from the
-    value."""
+    value.
+
+    Under x87_carry a run also survives labels and branches inside the body
+    (X87Carry): an edge copies the stack into the target label's canonical
+    locals (canon_value) and writes back only what the label does not keep."""
 
     VIRTUAL = frozenset((
         "FLD", "FLD1", "FLDZ", "FLDPI", "FLDLN2", "FLDL2E", "FLDLG2", "FLDL2T", "FILD",
@@ -2159,6 +2313,8 @@ class X87Cache(object):
         self.count = 0          # value locals declared in this function
         self.bits_count = 0     # exact-integer locals
         self.used = False       # ft0_ declared
+        self.canon = {}         # position -> canonical value local (x87_carry)
+        self.canon_b = {}       # position -> canonical exact-integer local
         self.reset()
 
     def reset(self):
@@ -2168,15 +2324,17 @@ class X87Cache(object):
         self.live = {}          # position -> (value, bits or None, dirty, known)
         self.popped = {}        # position -> entry popped since the last write-back
         self.touched = set()
+        self.f0 = set()         # positions whose st_exact the run left at zero
         self.pre = []
 
     def snapshot(self):
         return (self.active, self.r, self.flushed_r, dict(self.live), dict(self.popped),
-                set(self.touched), list(self.pre), self.count, self.bits_count, self.used)
+                set(self.touched), set(self.f0), list(self.pre), self.count, self.bits_count,
+                self.used, dict(self.canon), dict(self.canon_b))
 
     def restore(self, s):
-        (self.active, self.r, self.flushed_r, self.live, self.popped, self.touched,
-         self.pre, self.count, self.bits_count, self.used) = s
+        (self.active, self.r, self.flushed_r, self.live, self.popped, self.touched, self.f0,
+         self.pre, self.count, self.bits_count, self.used, self.canon, self.canon_b) = s
 
     def declarations(self):
         out = []
@@ -2211,6 +2369,11 @@ class X87Cache(object):
     def new(self):
         name = "fv%d_" % self.count
         self.count += 1
+        return name
+
+    def new_bits(self):
+        name = "fb%d_" % self.bits_count
+        self.bits_count += 1
         return name
 
     def entry(self, n):
@@ -2255,8 +2418,7 @@ class X87Cache(object):
 
     def push_int(self, v):
         name = self.new()
-        bits = "fb%d_" % self.bits_count
-        self.bits_count += 1
+        bits = self.new_bits()
         self._push((name, bits, True, True))
         return "%s = (uint64_t)(int64_t)(%s); %s = (double)(int64_t)%s;" % (bits, v, name, bits)
 
@@ -2297,40 +2459,273 @@ class X87Cache(object):
         return ("(uint16_t)((c->fpu_sw & (uint16_t)~0x3800u) | (uint16_t)(((ft0_ + %du) & 7u) << 11))"
                 % (self.r & 7))
 
+    # ---- storing -----------------------------------------------------------
+
+    def _store(self, stores, popped_stores, r_from, r_to, f0):
+        """The C that writes `stores` (position -> live entry, each dirty and
+        known) and `popped_stores` (position -> (entry or None, data_only)) to
+        the register file and moves its TOP from ft0_ + r_from to ft0_ + r_to.
+        A data_only popped store writes the value (when the popped value is
+        kept at all) and leaves the empty tag and st_exact to a later
+        write-back: the label it goes to still owes them. Returns the lines
+        and the positions known to hold st_exact == 0 afterwards."""
+        out = []
+        f0 = set(f0)
+        tags = []       # (position, tag expression)
+        empty = 0
+        skip_bits = speedup("x87_skip_inexact_bits")
+        part = speedup("x87_part_dirty")
+        for p in sorted(stores):
+            v, bits, _dirty, _known = stores[p]
+            P = self.phys(p)
+            line = "c->st[%s] = %s;" % (P, v)
+            if bits:
+                line += " c->st_bits[%s] = %s; c->st_exact[%s] = 1u;" % (P, bits, P)
+                f0.discard(p)
+            else:
+                if not skip_bits:
+                    line += " c->st_bits[%s] = 0;" % P
+                if not (part and p in f0):
+                    line += " c->st_exact[%s] = 0u;" % P
+                f0.add(p)
+            out.append(line)
+            tags.append((p, "ftag_classify(%s)" % v))
+        trim = speedup("x87_trim_popped")
+        for p in sorted(popped_stores):
+            e, data_only = popped_stores[p]
+            P = self.phys(p)
+            line = ""
+            if not trim and e is not None and e[2]:
+                line = "c->st[%s] = %s;" % (P, e[0])
+                if e[1] or not skip_bits:
+                    line += " c->st_bits[%s] = %s;" % (P, e[1] or "0")
+            if not data_only:
+                if not trim and not (part and p in f0):
+                    line += (" " if line else "") + "c->st_exact[%s] = 0u;" % P
+                if not trim:
+                    f0.add(p)
+                empty |= 3 << (2 * (p & 7))
+            if line:
+                out.append(line)
+        if tags and speedup("x87_batch_tags"):
+            # One read and one write of the tag word: the new tags and the
+            # empties composed relative to ft0_, then rotated into place.
+            mask = empty
+            for p, _t in tags:
+                mask |= 3 << (2 * (p & 7))
+            value = " | ".join(["%s << %du" % (t, 2 * (p & 7)) for p, t in tags]
+                               + (["0x%xu" % empty] if empty else []))
+            out.append("{ uint32_t ftm_ = 0x%xu << (2u * ft0_), ftv_ = (%s) << (2u * ft0_); "
+                       "c->fpu_tag = (uint16_t)((c->fpu_tag & ~(ftm_ | ftm_ >> 16)) "
+                       "| ((ftv_ | ftv_ >> 16) & 0xffffu)); }" % (mask, value))
+        else:
+            for p, t in tags:
+                out.append("ftag_put(c, %s, %s);" % (self.phys(p), t))
+            if empty:
+                # Rotate the empty tags into place by TOP: one update of the word.
+                out.append("{ uint32_t ftm_ = 0x%xu << (2u * ft0_); "
+                           "c->fpu_tag |= (uint16_t)(ftm_ | ftm_ >> 16); }" % empty)
+        if r_from != r_to:
+            out.append("c->fpu_top = (ft0_ + %du) & 7u;" % (r_to & 7))
+        return out, f0
+
     def write_back(self):
         """Store what the run changed; every value stays available, clean."""
-        out = []
-        for p in sorted(self.live):
-            v, bits, dirty, known = self.live[p]
-            if not dirty:
-                continue
-            P = self.phys(p)
-            out.append("c->st[%s] = %s; c->st_bits[%s] = %s; c->st_exact[%s] = %du; "
-                       "ftag_put(c, %s, ftag_classify(%s));"
-                       % (P, v, P, bits or "0", P, 1 if bits else 0, P, v))
+        stores = {p: e for p, e in self.live.items() if e[2]}
+        popped = {p: (e, False) for p, e in self.popped.items()}
+        out, self.f0 = self._store(stores, popped, self.flushed_r, self.r, self.f0)
+        for p in stores:
+            v, bits, _, _ = self.live[p]
             self.live[p] = (v, bits, False, True)
-        empty = 0
-        for p in sorted(self.popped):
-            e = self.popped[p]
-            P = self.phys(p)
-            if e is not None and e[2]:
-                out.append("c->st[%s] = %s; c->st_bits[%s] = %s;" % (P, e[0], P, e[1] or "0"))
-            out.append("c->st_exact[%s] = 0u;" % P)
-            empty |= 3 << (2 * (p & 7))
-        if empty:
-            # Rotate the empty tags into place by TOP: one update of the word.
-            out.append("{ uint32_t ftm_ = 0x%xu << (2u * ft0_); "
-                       "c->fpu_tag |= (uint16_t)(ftm_ | ftm_ >> 16); }" % empty)
         self.popped = {}
-        if self.r != self.flushed_r:
-            out.append("c->fpu_top = (ft0_ + %du) & 7u;" % (self.r & 7))
-            self.flushed_r = self.r
+        self.flushed_r = self.r
         return out
 
     def end(self):
         out = self.write_back() if self.active else []
         self.reset()
         return out
+
+    # ---- carrying across labels (x87_carry) --------------------------------
+
+    def canon_value(self, p):
+        if p not in self.canon:
+            self.canon[p] = self.new()
+        return self.canon[p]
+
+    def canon_bits(self, p):
+        if p not in self.canon_b:
+            self.canon_b[p] = self.new_bits()
+        return self.canon_b[p]
+
+    def edge_state(self):
+        """The run as an edge leaves it: None when nothing is held."""
+        if not self.active:
+            return None
+        return (self.r, self.flushed_r, dict(self.live), dict(self.popped), frozenset(self.f0))
+
+    @staticmethod
+    def shape_of(state):
+        """The X87Shape an edge in `state` could promise its label."""
+        if state is None:
+            return None
+        r, fr, live, popped, f0 = state
+        shape_live = {p: (e[1] is not None, e[2], e[3]) for p, e in live.items()}
+        # A dirty exact integer the label drops is stored with st_exact = 1:
+        # never promise a zero there.
+        f0 = set(f0) - {p for p, e in live.items() if e[2] and e[1] is not None}
+        return X87Shape(r, fr, shape_live, popped, f0)
+
+    def edge_code(self, state, shape):
+        """The C that takes an edge leaving `state` into a label promising
+        `shape`, without changing this run; None when it cannot (the label
+        promises more than this edge holds: the analysis has not settled)."""
+        if state is None:
+            return [] if shape is None else None
+        r, fr, live, popped, f0 = state
+        if shape is None:
+            stores = {p: e for p, e in live.items() if e[2]}
+            lines, _ = self._store(stores, {p: (e, False) for p, e in popped.items()}, fr, r, f0)
+            return lines
+        if shape.r != r or not shape.popped <= set(popped):
+            return None
+        if shape.flushed_r != fr and shape.flushed_r != r:
+            return None
+        if any(p not in live for p in shape.live):
+            return None
+        stores, copies = {}, []
+        for p, e in sorted(live.items()):
+            want = shape.live.get(p)
+            if want is not None and want[2]:
+                if not e[3] or (e[1] is not None) != want[0]:
+                    return None
+            if e[2] and (want is None or not want[1]):
+                stores[p] = e
+            if want is not None:
+                copies.append("%s = %s;" % (self.canon_value(p), e[0]))
+                if want[0]:
+                    copies.append("%s = %s;" % (self.canon_bits(p), e[1]))
+        pops = {p: (e, p in shape.popped) for p, e in popped.items()}
+        lines, after = self._store(stores, pops, fr, shape.flushed_r, f0)
+        if not shape.f0 <= after:
+            return None
+        return lines + copies
+
+    def enter(self, shape):
+        """Start the run a carried label promises, in fresh locals copied from
+        its canonical ones (so one edge's copies never read another's)."""
+        self.reset()
+        if shape is None:
+            return []
+        self.active = True
+        self.used = True
+        self.r, self.flushed_r = shape.r, shape.flushed_r
+        out = []
+        for p in sorted(shape.live):
+            has_bits, dirty, known = shape.live[p]
+            v = self.new()
+            out.append("%s = %s;" % (v, self.canon_value(p)))
+            bits = None
+            if has_bits:
+                bits = self.new_bits()
+                out.append("%s = %s;" % (bits, self.canon_bits(p)))
+            self.live[p] = (v, bits, dirty, known)
+        self.popped = {p: None for p in shape.popped}
+        self.touched = set(shape.live) | set(shape.popped)
+        self.f0 = set(shape.f0)
+        return out
+
+
+class X87Carry(object):
+    """The x87 shapes of one function's labels (speedup x87_carry).
+
+    translate() emits the body once per pass. Each edge into a label (a
+    fall-through, a direct Jcc or JMP, a listing-gap jump) records the shape
+    it could promise; at the end of a pass each label's shape becomes the
+    meet of the one it was emitted against and every edge's, which only ever
+    shrinks. When no label changes, every edge of that pass was emitted
+    against the shape its label kept, and that pass is the output. A label
+    anything else can reach (an entry, a table or computed jump, a pushed
+    continuation, an exception landing) keeps nothing, and a pass counts
+    every `goto L_x` it wrote: one this class did not issue demotes its
+    label."""
+
+    MAX_PASSES = 8
+    GOTO = re.compile(r"goto L_([0-9a-f]{8});")
+
+    def __init__(self, labels, opaque):
+        self.shape = {l: (None if l in opaque else X87_TOP) for l in labels}
+        self.begin_pass()
+
+    def begin_pass(self):
+        self.edges = defaultdict(list)    # label -> shapes its edges could promise
+        self.used = {}                    # label -> shape this pass emitted against
+        self.issued = defaultdict(int)    # label -> gotos this class wrote
+        self.broken = False
+
+    def label_shape(self, label):
+        """The shape a label keeps in this pass: what earlier passes settled,
+        else the meet of the edges seen so far (a first pass reaches a loop
+        head from above before its back edge)."""
+        if label in self.used:
+            return self.used[label]
+        s = self.shape.get(label)
+        if s is X87_TOP:
+            seen = self.edges.get(label)
+            s = None
+            if seen:
+                s = seen[0]
+                for o in seen[1:]:
+                    s = X87Shape.meet(s, o)
+        self.used[label] = s
+        return s
+
+    def edge(self, cache, label, count_goto=True):
+        """Lines for an edge from the run in `cache` to `label`; the goto (or
+        fall-through) is the caller's."""
+        state = cache.edge_state()
+        self.edges[label].append(X87Cache.shape_of(state))
+        if count_goto:
+            self.issued[label] += 1
+        # The first edge a pass sees decides an unsettled label for the rest
+        # of the pass; later edges that do not fit it unsettle the pass.
+        target = self.label_shape(label)
+        lines = cache.edge_code(state, target)
+        if lines is None:
+            self.broken = True
+            lines = cache.edge_code(state, None)
+        return lines
+
+    def finish_pass(self, lines):
+        """Fold this pass's edges into the label shapes. True when the pass
+        just emitted agrees with them, so it is the output to keep."""
+        counts = defaultdict(int)
+        for line in lines:
+            for m in self.GOTO.finditer(line):
+                counts[int(m.group(1), 16)] += 1
+        done = not self.broken
+        for label in list(self.shape):
+            used = self.used.get(label, self.shape[label])
+            if used is X87_TOP:
+                used = None
+            if self.shape[label] is None:
+                new = None
+            else:
+                new = self.shape[label]
+                for s in self.edges.get(label, ()):
+                    new = s if new is X87_TOP else X87Shape.meet(new, s)
+                if new is X87_TOP:
+                    new = None  # nothing reached it
+                if new is not None and counts[label] != self.issued[label]:
+                    new = None  # a goto this class did not issue
+            if new != used:
+                done = False
+            self.shape[label] = new
+        self.begin_pass()
+        return done
+
+    def kept(self):
+        return sum(1 for s in self.shape.values() if s is not None and s is not X87_TOP)
 
 
 class Translator(object):
@@ -3438,6 +3833,7 @@ class Translator(object):
         fn.pushed_continuations = self.live_continuations(fn)
         fn.seh_sites = seh_frame_sites(fn, self.image)
         fn.seh_restores = seh_restore_sites(fn)
+        fn.seh_unproven = seh_unproven_establishment(fn, fn.seh_sites)
         fn.msvc_sites, fn.msvc_landings = {}, set()
         recognized = False
         classifier = getattr(self.image, "msvc_func_info", None)
@@ -3574,41 +3970,32 @@ class Translator(object):
                 out.append("    " + self.goto_label(fn.addr))
         prologue = len(out)          # everything emitted so far is dispatch
         x87 = None if getattr(self.opts, "x87_direct", False) else X87Cache()
-        for i, ins in enumerate(fn.insns):
-            if i in dead:
-                continue
-            if ins.addr in labels:
-                for line in (x87.end() if x87 else []):
-                    out.append("    " + line)
-                out.append("L_%08x: ;" % ins.addr)
-            if x87:
-                body = self.emit_x87_run(fn, i, live_out[i], x87)
+        carry = None
+        if x87 is not None and speedup("x87_carry") and self.carry_candidate(fn, dead):
+            carry = X87Carry(labels, self.carry_opaque(fn, labels, entries, head, dead))
+            saved = (dict(self.stats), len(self.notes), len(self.unmodelled))
+            for _pass in range(X87Carry.MAX_PASSES):
+                x87 = X87Cache()
+                body = self.emit_body(fn, dead, labels, live_out, x87, carry)
+                if carry.finish_pass(body):
+                    break
+                self.stats.clear()
+                self.stats.update(saved[0])
+                del self.notes[saved[1]:]
+                del self.unmodelled[saved[2]:]
             else:
-                body = self.emit(fn, i, live_out[i])
-            for line in body:
-                out.append("    " + line)
-            # An INT3 the listing ran into is MSVC's padding between
-            # functions: the byte after it belongs to whatever comes next, so
-            # this body ends here rather than falling through into it.
-            if (not fn.contiguous[i] and ins.mnem not in TERMINATORS
-                    and ins.mnem != "INT3" and not self.never_returns(ins)):
-                t = fn.fallthrough[i]
-                self.stats["_listing_gap"] += 1
-                self.notes.append(
-                    "%08x: listing gap, %s falls through to %08x" % (ins.addr, ins.mnem, t))
-                for line in (x87.end() if x87 else []) + self.goto_target(fn, t, ins):
-                    out.append("    " + line)
-        # A function whose last listed instruction is not a terminator falls
-        # through into the next function.
-        last_i = max(i for i in range(len(fn.insns)) if i not in dead)
-        last = fn.insns[last_i]
-        if (last.mnem not in TERMINATORS and last.mnem != "INT3"
-                and not self.never_returns(last)):
-            t = fn.fallthrough[last_i] or fn.end
-            self.stats["_fallthrough_exit"] += 1
-            for line in (x87.end() if x87 else []):
-                out.append("    " + line)
-            out.append("    " + " ".join(self.goto_target(fn, t, last)))
+                # Not settled in MAX_PASSES: the body without carrying.
+                carry = None
+                self.stats["_x87_carry_unsettled"] += 1
+            if carry is not None:
+                self.stats["_x87_carry_functions"] += 1
+                self.stats["_x87_carry_labels"] += carry.kept()
+                self.stats["_x87_carry_passes"] += _pass + 1
+        if carry is None:
+            if x87 is not None:
+                x87 = X87Cache()
+            body = self.emit_body(fn, dead, labels, live_out, x87, None)
+        out.extend(body)
         # Invariant: the first thing fn_ADDR does is reach ADDR.  Checked
         # here rather than trusted, because getting it wrong corrupts the
         # guest stack silently and only shows up several calls away.  The
@@ -3636,6 +4023,122 @@ class Translator(object):
                 out.append("void fn_%08x(X86 *RECOMP_CTX c) { body_%08x(c, %s); }"
                            % (e, fn.addr, hexlit(e)))
         return out
+
+    def emit_body(self, fn, dead, labels, live_out, x87, carry):
+        """The instructions of a body, labels placed, as indented lines.
+
+        `x87` is the run cache (None under --x87-direct); `carry` holds the
+        label shapes under x87_carry, or is None to end every run at a label."""
+        out = []
+        fall = True     # the last line emitted can run on into the next one
+        for i, ins in enumerate(fn.insns):
+            if i in dead:
+                continue
+            if ins.addr in labels:
+                if carry is not None:
+                    lines = carry.edge(x87, ins.addr, count_goto=False) if fall else []
+                    shape = carry.label_shape(ins.addr)
+                    out.extend("    " + line for line in lines)
+                    out.append("L_%08x: ;" % ins.addr)
+                    out.extend("    " + line for line in x87.enter(shape))
+                else:
+                    for line in (x87.end() if x87 else []):
+                        out.append("    " + line)
+                    out.append("L_%08x: ;" % ins.addr)
+            body = None
+            if carry is not None:
+                body = self.emit_carry_branch(fn, i, ins, x87, carry)
+            if body is None:
+                if x87:
+                    body = self.emit_x87_run(fn, i, live_out[i], x87)
+                else:
+                    body = self.emit(fn, i, live_out[i])
+            for line in body:
+                out.append("    " + line)
+            fall = ins.mnem not in TERMINATORS and not self.never_returns(ins)
+            # An INT3 the listing ran into is MSVC padding between
+            # functions: the byte after it belongs to whatever comes next, so
+            # this body ends here rather than falling through into it.
+            if (not fn.contiguous[i] and ins.mnem not in TERMINATORS
+                    and ins.mnem != "INT3" and not self.never_returns(ins)):
+                t = fn.fallthrough[i]
+                self.stats["_listing_gap"] += 1
+                self.notes.append(
+                    "%08x: listing gap, %s falls through to %08x" % (ins.addr, ins.mnem, t))
+                for line in self.transfer(fn, t, ins, x87, carry):
+                    out.append("    " + line)
+                fall = False
+        # A function whose last listed instruction is not a terminator falls
+        # through into the next function.
+        last_i = max(i for i in range(len(fn.insns)) if i not in dead)
+        last = fn.insns[last_i]
+        if (last.mnem not in TERMINATORS and last.mnem != "INT3"
+                and not self.never_returns(last)):
+            t = fn.fallthrough[last_i] or fn.end
+            self.stats["_fallthrough_exit"] += 1
+            out.extend("    " + line for line in self.transfer(fn, t, last, x87, carry))
+        return out
+
+    def transfer(self, fn, t, ins, x87, carry):
+        """A jump to t that is no instruction of its own (a listing gap, the
+        fall-through out of the last instruction): the run written back, or
+        carried into the label of t, then goto_target on one line."""
+        inner = self.goto_target(fn, t, ins)
+        if carry is None:
+            return (x87.end() if x87 else []) + [" ".join(inner)]
+        if t in fn.index and not untranslated_policy(t):
+            lines = carry.edge(x87, t)
+        else:
+            lines = x87.edge_code(x87.edge_state(), None)
+        x87.reset()
+        return lines + [" ".join(inner)]
+
+    def emit_carry_branch(self, fn, i, ins, x87, carry):
+        """A direct Jcc or JMP under x87_carry. The taken path carries the run
+        into its label (or writes it back for a jump out of the body); a Jcc
+        fall-through keeps the run as it is. None for any other instruction."""
+        m = ins.mnem
+        if m not in JCC and m != "JMP":
+            return None
+        t = self.branch_target(ins)
+        if t is None or untranslated_policy(t) or ins.addr in VISUAL_ANIMATION_READS:
+            return None
+        inner = self.goto_target(fn, t, ins)
+        if t in fn.index:
+            fix = carry.edge(x87, t)
+        else:
+            fix = x87.edge_code(x87.edge_state(), None)
+        self.stats[m] += 1
+        if m == "JMP":
+            x87.reset()
+            return self.frame(ins, fix + inner)
+        return self.frame(ins, ["if (%s) {" % JCC[m][0]] + ["    " + l for l in fix + inner] + ["}"])
+
+    def carry_candidate(self, fn, dead):
+        """Worth the passes of x87_carry: a cached x87 instruction and a
+        branch, both in the live body."""
+        live = [ins for k, ins in enumerate(fn.insns) if k not in dead]
+        return (any(ins.mnem in X87Cache.VIRTUAL for ins in live)
+                and any(ins.mnem in JCC or ins.mnem == "JMP" for ins in live))
+
+    def carry_opaque(self, fn, labels, entries, head, dead):
+        """Labels something other than a direct branch or a fall-through can
+        reach; they keep no x87 run. (X87Carry also demotes any label whose
+        gotos it did not issue itself.)"""
+        opaque = set(entries) | set(fn.pushed_continuations) | (fn.msvc_landings & fn.addrs)
+        if head:
+            opaque.add(fn.addr)
+        for i, ins in enumerate(fn.insns):
+            if i in dead:
+                continue
+            t = self.push_ret_target(fn, i)
+            if t is not None:
+                opaque.add(t)
+            opaque.update(self.jumptables.get((fn.addr, ins.addr), ()))
+            if (ins.mnem == "JMP" and self.branch_target(ins) is None
+                    and not self.jumptables.get((fn.addr, ins.addr))):
+                return set(labels)  # a computed jump may enter anywhere
+        return opaque
 
     # ---- helpers used by emit -------------------------------------------
 
@@ -3740,6 +4243,9 @@ class Translator(object):
         """emit(), holding the x87 stack of a straight-line run in locals."""
         ins = fn.insns[i]
         m = ins.mnem
+        leaf = self.emit_st0_leaf(fn, i, ins, cache)
+        if leaf is not None:
+            return leaf
         if m in X87Cache.VIRTUAL and ins.addr not in VISUAL_ANIMATION_READS:
             saved = cache.snapshot()
             try:
@@ -3766,6 +4272,48 @@ class Translator(object):
                 or any(t in text for t in self.X87_RUN_BREAKS)):
             return cache.end() + body
         return body
+
+    def emit_st0_leaf(self, fn, i, ins, cache):
+        """A literal CALL to a [translate] st0_leaves address under the speedup
+        x87_st0_leaves: ST(0) from the run, with its exact-integer metadata,
+        straight to the recipe in runtime/x87_leaves.h, and popped in the run.
+        None for any other instruction (or when it cannot apply)."""
+        if ins.mnem != "CALL" or not speedup("x87_st0_leaves") or RESUMABLE_STACKS:
+            return None
+        if not ins.ops or not ins.ops[0].startswith("0x"):
+            return None
+        t = int(ins.ops[0], 16)
+        recipe = ST0_LEAVES.get(t)
+        if recipe is None or untranslated_policy(t) or t in self.noreturn_callees:
+            return None
+        nxt = fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end)
+        saved = cache.snapshot()
+        try:
+            cache.begin()
+            v, bits, _dirty, known = cache.entry(0)
+            P = cache.phys(cache.r)
+            if known:
+                exact, bitv = ("1", bits) if bits else ("0", "0")
+            else:
+                # Loaded from the register file this run: clean, so the file
+                # still holds its metadata.
+                exact, bitv = "c->st_exact[%s]" % P, "c->st_bits[%s]" % P
+            body = cache.take_pre()
+            body.append("recomp_x87_%s(c, %s, %s, %s);" % (recipe, v, exact, bitv))
+            body.append("c->eip = %s;" % hexlit(nxt))
+            # The leaf pushes a copy above ST(0) and pops both: the register
+            # above ends empty too.
+            above = cache.r - 1
+            cache.drop()
+            if above not in cache.popped:
+                cache.touch(above)
+                cache.popped[above] = None
+        except X87Fallback:
+            cache.restore(saved)
+            return None
+        self.stats["CALL"] += 1
+        self.stats["_x87_st0_leaf"] += 1
+        return self.frame(ins, body)
 
     STRING_MNEM = frozenset(("STOSB", "STOSW", "STOSD", "MOVSB", "MOVSW", "MOVSD",
                              "LODSB", "LODSW", "LODSD", "SCASB", "SCASW", "SCASD",
@@ -3813,7 +4361,15 @@ class Translator(object):
                 L.append("default: recomp_jump(c, target_); return; } } }")
             elif i in fn.msvc_restores:
                 L.append("recomp_msvc_frame_leave(c);")
-            if (fn.seh_sites and (seh_chain_operand(dst) or i in fn.seh_sites)
+            # seh_separate_restores: the epilogue's restore retires the frame
+            # also in a body that only restores, its prologue recovered as
+            # another block; without it that frame stayed in the list, and
+            # every dispatch walked it. Not where the body publishes a chain
+            # head through ESP that seh_frame_sites did not accept: there is
+            # no proven frame for the restore to retire.
+            restoring = (speedup("seh_separate_restores") and i in fn.seh_restores
+                         and not getattr(fn, "seh_unproven", False))
+            if ((restoring or (fn.seh_sites and (seh_chain_operand(dst) or i in fn.seh_sites)))
                     and src.kind == "reg" and src.size == 32):
                 L.append("c->eip = %s;" % hexlit(ins.addr))
                 if i in fn.seh_sites:
@@ -4224,7 +4780,7 @@ class Translator(object):
                 return L
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
-            L.append("recomp_call(c, t_);")
+            L.extend(self.indirect_call(ins))
             if RESUMABLE_STACKS:
                 L.append("if (c->eip != %s) return;" % hexlit(nxt))
             self.stats["_call_indirect"] += 1
@@ -4495,6 +5051,48 @@ class Translator(object):
         raise TranslateError("unhandled mnemonic %s" % m)
 
     # ---- control-flow helpers -------------------------------------------
+
+    #: At most this many recorded targets make a CALL site a devirtualized one.
+    DEVIRT_MAX_TARGETS = 4
+
+    def indirect_call(self, ins):
+        """The call of an indirect CALL whose target is in t_ and whose return
+        address is pushed.
+
+        devirt: the translated functions a run recorded at this site
+        (ICALL_PROFILE), up to DEVIRT_MAX_TARGETS, are called directly through
+        CALL_FN - hooks, profiling and overrides as for a literal CALL - and
+        anything else takes the generic path. icall_shim_inline: the generic
+        path calls an import shim itself rather than through recomp_call,
+        exactly as recomp_call would (no translated function or module lies in
+        the shim range) unless the frame watch, which recomp_call reports to,
+        is on. icall_profile_record: the site reports each target it calls
+        (runtime/icall_profile.h)."""
+        L = []
+        if speedup("icall_profile_record"):
+            L.append("recomp_icall_note(%s, t_);" % hexlit(ins.addr))
+        generic = "recomp_call(c, t_);"
+        if speedup("icall_shim_inline"):
+            generic = ("if (t_ - GUEST_SHIM_BASE < GUEST_SHIM_END - GUEST_SHIM_BASE "
+                       "&& !recomp_frame_watch) recomp_shim_call(c, t_); else recomp_call(c, t_);")
+        targets = []
+        if speedup("devirt"):
+            # Translated functions only, most frequent first. A shim's address
+            # depends on allocation order and changes between runs, and the
+            # generic path below already calls a shim cheaply; a site that
+            # reached more translated functions than the limit stays generic.
+            targets = [t for t, _n in ICALL_PROFILE.get(ins.addr, ()) if t in self.func_addrs]
+            if len(targets) > self.DEVIRT_MAX_TARGETS:
+                targets = []
+        if not targets:
+            L.append(generic)
+            return L
+        self.stats["_call_devirt"] += 1
+        self.stats["_call_devirt_targets"] += len(targets)
+        for k, t in enumerate(targets):
+            L.append("%sif (t_ == %s) { CALL_FN(%08x); }" % ("else " if k else "", hexlit(t), t))
+        L.append("else { %s }" % generic)
+        return L
 
     def reject_offimage_call(self, t):
         """A direct CALL whose literal target is not in the image at all.
@@ -5028,6 +5626,29 @@ class Translator(object):
 
 # --------------------------------------------------------------- driver ----
 
+SHIM_FIRST_CALL = """
+    /* An import shim first (speedup shim_first): two compares where the
+     * lookups below would each miss, since no translated function or module
+     * lies in the shim range. Every COM method call comes this way. */
+    if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
+        recomp_shim_call(c, target);
+        return;
+    }"""
+SHIM_FIRST_JUMP = """
+    if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) { /* see recomp_call_inner */
+        recomp_shim_call(c, target);
+        return;
+    }"""
+
+
+def shim_first_dispatch(text):
+    """table.c's dispatch, with the shim range tested first under shim_first.
+    The later test stays: it is where the range is reached without it."""
+    on = speedup("shim_first")
+    return (text.replace("@SHIM_FIRST_CALL@", SHIM_FIRST_CALL if on else "")
+                .replace("@SHIM_FIRST_JUMP@", SHIM_FIRST_JUMP if on else ""))
+
+
 def tail_fn(fn):
     """The jump macro for code in fn: a forced tail call needs the caller's signature."""
     return "TAIL_FN2" if getattr(fn, "multi", False) else "TAIL_FN"
@@ -5150,6 +5771,11 @@ def main():
                          "game (tools/lazy_static.py).")
     ap.add_argument("--module", default=None, metavar="KEY",
                     help="translate the auxiliary module [modules.aux.KEY] instead of the executable")
+    ap.add_argument("--speedup", action="append", default=[], metavar="NAME=0|1",
+                    help="override one [translate.speedups] switch for this run (repeatable; "
+                         "tools/game_config.py TRANSLATE_SPEEDUPS names them)")
+    ap.add_argument("--st0-leaf", action="append", default=[], metavar="ADDR=RECIPE",
+                    help="add a [translate] st0_leaves entry for this run (repeatable)")
     args = ap.parse_args()
     try:
         trace_addresses = {int(a.strip(),16) for a in os.environ.get("RECOMP_TRACE_DISCOVERY", "").split(",")
@@ -5162,6 +5788,13 @@ def main():
             print("discovery %08x: %s" % (address, decision), file=sys.stderr)
     cfg = game_config.load(args.game)
     configure(cfg)
+    SPEEDUPS.update(game_config.parse_speedup_overrides(args.speedup, "--speedup"))
+    for item in args.st0_leaf:
+        addr, _, recipe = item.partition("=")
+        if recipe not in game_config.ST0_LEAF_RECIPES:
+            raise TranslateError("--st0-leaf %s: recipe must be one of %s"
+                                 % (item, ", ".join(game_config.ST0_LEAF_RECIPES)))
+        ST0_LEAVES[int(addr, 16)] = recipe
     if args.module:
         configure_module(cfg, args.module)
     if args.as_module:
@@ -6951,6 +7584,10 @@ def main():
         fh.write("/* generated by tools/recomp/translate.py -- do not edit */\n")
         fh.write("#ifndef RECOMP_FUNCS_H\n#define RECOMP_FUNCS_H\n")
         fh.write('#include "x86.h"\n#include "intrinsics.h"\n#include "seh.h"\n#include "msvc_eh.h"\n')
+        if speedup("x87_st0_leaves") and ST0_LEAVES:
+            fh.write('#include "x87_leaves.h"\n')
+        if speedup("icall_profile_record"):
+            fh.write('#include "icall_profile.h"\n')
         fh.write("/* Task 8 replacements: define FN_<addr> to a native function in a\n"
                  " * header named by RECOMP_OVERRIDE_HEADER and every direct call site,\n"
                  " * tail call and jump-table case for that address is redirected. */\n")
@@ -7099,11 +7736,15 @@ def main():
         # Redirected operands read a new address; the loader seeds it with the
         # original value so the game behaves unchanged until something writes
         # it. Only the image carries these: an auxiliary module has no config.
+        if AUX_MODULE is None and speedup("icall_profile_record"):
+            fh.write("RecompIcallSlot recomp_icall_slots[RECOMP_ICALL_SLOTS];\n"
+                     "uint32_t recomp_icall_armed;\n")
         if AUX_MODULE is None:
             pairs = sorted(set(OPERAND_REDIRECTS.values()))
             fh.write("const uint32_t recomp_operand_redirect_pairs[] = {%s};\n" %
                      (", ".join("0x%08xu, 0x%08xu" % q for q in pairs) if pairs else "0u, 0u"))
             fh.write("const uint32_t recomp_operand_redirect_count = %du;\n" % len(pairs))
+            fh.write(operand_redirect_widths(pairs))
             fh.write("const uint32_t recomp_data_seed_pairs[] = {%s};\n" %
                      (", ".join("0x%08xu, 0x%08xu" % q for q in DATA_SEEDS) if DATA_SEEDS else "0u, 0u"))
             fh.write("const uint32_t recomp_data_seed_count = %du;\n\n" % len(DATA_SEEDS))
@@ -7172,7 +7813,7 @@ def main():
             if not bits:
                 fh.write("    0,\n")
             fh.write("};\n\n")
-            fh.write("""int recomp_is_call_return(uint32_t target)
+            fh.write(shim_first_dispatch("""int recomp_is_call_return(uint32_t target)
 {
     uint32_t o = target - recomp_call_return_lo;
     return o < recomp_call_return_span && ((recomp_call_return_bits[o >> 3] >> (o & 7u)) & 1u);
@@ -7249,7 +7890,7 @@ void recomp_call(X86 *c, uint32_t target)
         recomp_frame_changed(c, target, ebp_, c->r[5]);
 }
 static void recomp_call_inner(X86 *c, uint32_t target)
-{
+{@SHIM_FIRST_CALL@
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
@@ -7276,7 +7917,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
  * entry and every decoded jump-table target. */
 void recomp_jump(X86 *c, uint32_t target)
 {
-    if (recomp_seh_pending_target()) recomp_seh_intercept(c, target);
+    if (recomp_seh_pending_target()) recomp_seh_intercept(c, target);@SHIM_FIRST_JUMP@
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
@@ -7313,7 +7954,7 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
             target, c->eip);
     abort();
 }
-""")
+"""))
     chunks.append(os.path.join(args.out, "table.c"))
 
     # ---- symbols.json -----------------------------------------------------
@@ -7438,6 +8079,7 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
                 "failures": [["%08x" % a, w] for a, w in failures],
                 "unmodelled": [["%08x" % a, w] for a, w in tr.unmodelled],
                 "mnemonics": dict(tr.stats),
+                "speedups": dict(SPEEDUPS),
                 "notes": tr.notes[:200],
             }, fh, indent=1)
     return 1 if failures else 0

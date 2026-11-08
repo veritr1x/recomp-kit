@@ -32,7 +32,11 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include "../platform/ab_phase.h"
 #include "../platform/os.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 
 // Packed into one atomic so a producer never combines dimensions from two
 // renderer restarts. Already sealed frames retain their own target and layout.
@@ -582,15 +586,25 @@ struct Service : std::enable_shared_from_this<Service> {
             return -1;
         };
         int slot = free_slot();
+        // In a browser the page's main thread both stages frames here and frees the targets
+        // (GPU completions and presents arrive only once it returns to the event loop), so a
+        // wait there can only time out: it froze the page, audio included, for 250 ms. It
+        // drops the frame at once instead; the display keeps the newest frame it has. The
+        // earlier phase of an in-run A/B (PRESENT) waits as before.
+        bool can_wait = true;
+#ifdef __EMSCRIPTEN__
+        can_wait = !emscripten_is_main_runtime_thread() || recomp_ab::old(recomp_ab::PRESENT);
+#endif
         if (slot < 0) {
             ++waits;
             wake.notify_one();
             // Keep a stalled GPU/worker from trapping the guest forever. This
             // is a fault deadline, not the normal frame pacing mechanism.
-            completed.wait_for(lock, std::chrono::milliseconds(250), [&] {
-                slot = free_slot();
-                return stop || slot >= 0;
-            });
+            if (can_wait)
+                completed.wait_for(lock, std::chrono::milliseconds(250), [&] {
+                    slot = free_slot();
+                    return stop || slot >= 0;
+                });
             if (stop)
                 return {};
         }
@@ -598,8 +612,12 @@ struct Service : std::enable_shared_from_this<Service> {
             // Latch the drop until seal: later draws/CPU staging in this same
             // guest frame must neither retry acquisition nor count it twice.
             ++drops;
-            fault(1, "target pool stalled for 250ms; guest frame dropped, check "
-                     "worker/GPU/presentation progress");
+            if (can_wait)
+                fault(1, "target pool stalled for 250ms; guest frame dropped, check "
+                         "worker/GPU/presentation progress");
+            else
+                fault(1, "target pool full on the page thread; guest frame dropped without "
+                         "waiting");
             writing = std::make_shared<Frame>();
             writing->dropped = true;
             return {};

@@ -3,6 +3,7 @@
 This module is the only place that knows the schema. Python 3.9 has no
 tomllib, so the pinned tomli is the fallback."""
 
+import os
 from pathlib import Path
 import re
 
@@ -57,6 +58,79 @@ BUTTON_TARGET_RE = re.compile(
 HEAP_END = 0x0e000000        # runtime/x86.h GUEST_HEAP_END; the mods' heap starts there
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
 AUX_REQUIRED_KEYS = ("name", "path", "sha256", "base", "size")
+
+#: [translate.speedups]: translator optimisations, each switchable so a game
+#: can A/B one by regenerating (tools/recomp/translate.py SPEEDUPS). The ones
+#: that leave every observable state as before are on by default; the x87
+#: carry, the ST(0) leaf handover and devirtualization start off until a game
+#: has run with them. RECOMP_TRANSLATE_SPEEDUPS="name=0,name=1" and
+#: translate.py --speedup name=0|1 override this table for one regeneration.
+TRANSLATE_SPEEDUPS = {
+    # recomp_call/recomp_jump test the import shim range before the lookups.
+    "shim_first": True,
+    # An indirect CALL tests the shim range itself and calls the shim without
+    # passing through recomp_call (frame watch still takes the old path).
+    "icall_shim_inline": True,
+    # x87 write-back: a popped register gets only its empty tag; an inexact
+    # value leaves st_bits alone (only read under st_exact); the tag word is
+    # read and written once per write-back; st_exact is not rewritten where
+    # the run already left a zero.
+    "x87_trim_popped": True,
+    "x87_skip_inexact_bits": True,
+    "x87_batch_tags": True,
+    "x87_part_dirty": True,
+    # Carry the x87 stack in locals across labels and branches in a function.
+    "x87_carry": False,
+    # Hand ST(0) straight to the leaves named in [translate] st0_leaves.
+    "x87_st0_leaves": False,
+    # Indirect call sites call the targets a profile recorded directly
+    # ([translate] icall_profile), and record targets when icall_profile_record.
+    "devirt": False,
+    "icall_profile_record": False,
+    # An epilogue's MOV FS:[0] restore emits the unlink also for a body whose
+    # establishment was recovered separately (seh_unproven_establishment).
+    "seh_separate_restores": False,
+}
+#: Recipes a [translate] st0_leaves entry may name (translate.py ST0_RECIPES).
+ST0_LEAF_RECIPES = ("ftol2",)
+
+
+def translate_speedups(table, source, environ=None):
+    """[translate.speedups] merged over the defaults, then RECOMP_TRANSLATE_SPEEDUPS."""
+    if table is None:
+        table = {}
+    if not isinstance(table, dict):
+        raise ValueError("%s: [translate] speedups must be a table" % source)
+    out = dict(TRANSLATE_SPEEDUPS)
+    for key, value in table.items():
+        if key not in TRANSLATE_SPEEDUPS:
+            raise ValueError("%s: [translate.speedups] has no switch %r (known: %s)"
+                             % (source, key, ", ".join(sorted(TRANSLATE_SPEEDUPS))))
+        if not isinstance(value, bool):
+            raise ValueError("%s: [translate.speedups] %s must be a boolean" % (source, key))
+        out[key] = value
+    text = (environ if environ is not None else os.environ).get(
+        "RECOMP_TRANSLATE_SPEEDUPS", "")
+    for key, value in parse_speedup_overrides(text, "RECOMP_TRANSLATE_SPEEDUPS").items():
+        out[key] = value
+    return out
+
+
+def parse_speedup_overrides(text, what):
+    """"a=1,b=0" (or a list of "a=1") as {name: bool}; unknown names are errors."""
+    items = text if isinstance(text, (list, tuple)) else [t for t in text.split(",")]
+    out = {}
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip().lower()
+        if key not in TRANSLATE_SPEEDUPS or not sep or value not in ("0", "1", "on", "off", "true", "false"):
+            raise ValueError("%s: %r is not name=0|1 for a known speedup (known: %s)"
+                             % (what, item, ", ".join(sorted(TRANSLATE_SPEEDUPS))))
+        out[key] = value in ("1", "on", "true")
+    return out
 
 
 def windows_version(value):
@@ -224,6 +298,20 @@ def load(game_dir):
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)
+    translate["speedups"] = translate_speedups(translate.get("speedups"), source)
+    # [translate] st0_leaves = [{ at = 0x..., recipe = "ftol2" }]: leaf functions
+    # whose x87 argument arrives in ST(0) and that the cached x87 stack can call
+    # without writing itself back (speedup x87_st0_leaves).
+    leaves = translate.setdefault("st0_leaves", [])
+    if (not isinstance(leaves, list)
+            or any(not isinstance(e, dict) or set(e) != {"at", "recipe"}
+                   or type(e["at"]) is not int or not 0 < e["at"] <= 0xffffffff
+                   or e["recipe"] not in ST0_LEAF_RECIPES for e in leaves)):
+        raise ValueError("%s: [translate] st0_leaves must be a list of { at, recipe } with recipe one of %s"
+                         % (source, ", ".join(ST0_LEAF_RECIPES)))
+    profile = translate.get("icall_profile")
+    if profile is not None and not isinstance(profile, str):
+        raise ValueError("%s: [translate] icall_profile must be a path" % source)
     tracks = cfg.setdefault("media", {}).setdefault("cd_tracks", [])
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
