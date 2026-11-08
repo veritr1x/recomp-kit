@@ -1,5 +1,5 @@
-import { queryEnvironment, executablePath } from "./env.mjs";
-import { selectSource } from "./source.mjs";
+import { queryEnvironment, executablePath } from "./env.mjs?v=__RECOMP_BUILD__";
+import { selectSource } from "./source.mjs?v=__RECOMP_BUILD__";
 "use strict";
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("canvas");
@@ -78,6 +78,9 @@ async function start() {
     canvas,
     preinitializedWebGPUDevice: device,
     noInitialRun: true,
+    // The build stamp keeps a cached module, Wasm or data file from an older
+    // build out of this one (tools/web_launcher.py fills it in when staging).
+    locateFile: (path, prefix) => `${prefix}${path}?v=__RECOMP_BUILD__`,
     print: (t) => record(t, false),
     printErr: (t) => record(t, true),
     setStatus: (t) => status(t ? t : ""),
@@ -115,7 +118,7 @@ async function start() {
   };
   window.Module = Module;
   const script = document.createElement("script");
-  script.src = "@APP@.js";
+  script.src = "@APP@.js?v=__RECOMP_BUILD__";
   script.onerror = () => status("The game's web build is missing.", true);
   document.body.append(script);
 }

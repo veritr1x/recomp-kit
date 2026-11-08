@@ -1,4 +1,4 @@
-import { executablePath } from "./env.mjs";
+import { executablePath } from "./env.mjs?v=__RECOMP_BUILD__";
 
 // Both entry points resolve relative to games.json, so a site may live under
 // a URL prefix. Runtime paths and profile locations never come from a URL.

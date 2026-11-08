@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The web player requests its page, modules, Wasm and data with a build stamp
+  (`?v=<digest>`) that `web_launcher.py` fills in when it stages a build. A
+  browser or proxy cache can no longer pair an updated game's Wasm with an
+  older cached `.js`, which failed with "ASM_CONSTS[...] is not a function"
+  until the browser's cache was cleared.
 - A D3DX effect parameter write that leaves the value byte-identical keeps its
   stamp: the shader constants are not rebuilt, the preshader does not rerun and
   a shared parameter is not copied to its pool again. Each bound shader looks

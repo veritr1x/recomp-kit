@@ -16,6 +16,7 @@ COOP/COEP headers (the game needs a secure, cross-origin isolated context);
 
 import argparse
 import functools
+import hashlib
 import http.server
 import json
 import os
@@ -91,6 +92,8 @@ def stage_streams(game_dirs, games, ids, out):
     (Path(out) / "games.json").write_text(json.dumps(games, indent=2) + "\n", encoding="utf-8")
 
 
+# The placeholder the player files carry where staging puts the build stamp.
+BUILD_STAMP = "__RECOMP_BUILD__"
 WEB_BUILD_SUFFIXES = (".js", ".mjs", ".css", ".wasm", ".data")
 
 
@@ -99,9 +102,26 @@ def copy_web_build(game_id, build, out):
     if not (build / "index.html").is_file():
         raise ValueError("no web build in %s (index.html is missing)" % build)
     dest.mkdir(parents=True, exist_ok=True)
-    for f in build.iterdir():
-        if f.is_file() and (f.name in ("index.html", "FETCH-NOTICE.txt") or f.suffix in WEB_BUILD_SUFFIXES):
+    files = sorted(f for f in build.iterdir()
+                   if f.is_file() and (f.name in ("index.html", "FETCH-NOTICE.txt") or f.suffix in WEB_BUILD_SUFFIXES))
+    # The player asks for each file with ?v=<stamp>, a digest of the whole
+    # build, so a browser or proxy cache never pairs one build's module with
+    # another's Wasm (a stale SpeedRecomp.js fails with "ASM_CONSTS[...] is
+    # not a function").
+    digest = hashlib.sha256()
+    for f in files:
+        digest.update(f.name.encode() + b"\0")
+        with f.open("rb") as data:
+            for chunk in iter(lambda: data.read(1 << 20), b""):
+                digest.update(chunk)
+    stamp = digest.hexdigest()[:16]
+    for f in files:
+        if f.name == "index.html" or f.suffix == ".mjs" or f.name == "player.js":
+            text = f.read_text(encoding="utf-8").replace(BUILD_STAMP, stamp)
+            (dest / f.name).write_bytes(text.encode("utf-8"))
+        else:
             shutil.copy2(f, dest / f.name)
+    return stamp
 
 
 def is_stream_data(url_path):

@@ -57,6 +57,14 @@ class WebLauncherTests(unittest.TestCase):
             web_launcher.copy_web_build("stub", build, tmp / "site")
             copied = sorted(f.name for f in (tmp / "site/stub").iterdir())
             self.assertEqual(copied, ["App.data", "App.js", "App.wasm", "FETCH-NOTICE.txt", "env.mjs", "index.html", "player.js", "source.mjs", "style.css"])
+            # Each staging stamps the player's URLs with a digest of the build.
+            (build / "player.js").write_text('import "./env.mjs?v=__RECOMP_BUILD__";')
+            first = web_launcher.copy_web_build("stub", build, tmp / "site")
+            self.assertEqual((tmp / "site/stub/player.js").read_text(), f'import "./env.mjs?v={first}";')
+            self.assertEqual((tmp / "site/stub/App.wasm").read_text(), "App.wasm")
+            (build / "App.wasm").write_text("App.wasm, rebuilt")
+            self.assertNotEqual(web_launcher.copy_web_build("stub", build, tmp / "site"), first)
+
     def test_https_server(self):
         openssl = shutil.which("openssl")
         if not openssl:

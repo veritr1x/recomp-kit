@@ -33,7 +33,7 @@ def test_pages_enforce_strict_csp():
             assert not any(key.startswith("on") or key == "style" for key in attrs)
             if tag == "script":
                 assert attrs.get("src")
-                assert (path.parent / attrs["src"]).is_file()
+                assert (path.parent / attrs["src"].split("?")[0]).is_file()
         assert not re.search(r"<script[^>]*>\s*[^<\s]",html)
 
 
