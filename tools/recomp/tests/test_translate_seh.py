@@ -445,3 +445,18 @@ def test_a_handler_that_is_no_delphi_stub_yields_no_landings():
         img.seh_landings(handler)
     with pytest.raises(T.TranslateError):
         img.seh_landings(outside)
+
+
+
+@pytest.mark.parametrize("prologue", [
+    [T.SEH_FRAME_MARK],
+    ["uint32_t ft0_;", "double fv0_;", T.SEH_FRAME_MARK],     # x87 locals first
+    [T.SEH_FRAME_MARK, "uint32_t ft0_;", "double fv0_, fv1_;"],
+    [],
+])
+def test_entry_check_looks_past_host_only_prologue_lines(prologue):
+    """Neither the SEH frame mark nor an x87 run's declarations execute a
+    guest instruction, in whichever order they are emitted."""
+    body = ["    " + line for line in prologue] + ["", "L_00401000: ;", "    c->r[0] = 0u;"]
+    assert T.first_guest_line(body) == "L_00401000: ;"
+    assert T.first_guest_line(["    " + line for line in prologue]) is None

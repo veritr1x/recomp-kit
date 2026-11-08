@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep the web build's static guest arena to guests of up to 384 MB. A larger
+  arena (Cult's 1.86 GB, Siege's 1 GB) did not fit the 512 MB initial memory
+  and failed to link; those games reserve the arena at run time again, as they
+  did before the static arena.
+- The translator's entry check looks past an x87 run's local declarations and
+  the SEH frame mark in either order. A function with both was rejected as not
+  beginning at its own address (16 in Siege of Avalon).
+
 - Type the character a key produces with Shift and Caps Lock applied, so
   WM_CHAR carries capitals and shifted symbols (a name box received only
   lowercase before).

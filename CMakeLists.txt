@@ -107,8 +107,15 @@ add_compile_definitions(GUEST_LAYOUT_END=${RECOMP_LAYOUT_END})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 # The web build's guest arena is a static array at a fixed address; translated
 # code then reaches guest memory without loading a base pointer (runtime/x86.h).
-if(EMSCRIPTEN)
+# The static arena must fit the module's 512 MB initial memory with the rest
+# of its data, so only an arena up to 384 MB is static; a larger guest
+# (auxiliary modules mapped high) reserves its arena at run time instead.
+string(REGEX REPLACE "[uU]$" "" recomp_guest_size_value "${RECOMP_GUEST_SIZE}")
+math(EXPR recomp_guest_size_value "${recomp_guest_size_value}")
+if(EMSCRIPTEN AND recomp_guest_size_value LESS_EQUAL 402653184)
   add_compile_definitions(RECOMP_STATIC_GUEST_ARENA=1)
+endif()
+if(EMSCRIPTEN)
   # Wasm SIMD (every current browser has it) lets the compiler vectorize the
   # host's copies and the translation's straight-line float code.
   add_compile_options(-msimd128)

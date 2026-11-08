@@ -2098,6 +2098,20 @@ class X87Direct(object):
 X87_DIRECT = X87Direct()
 #: A line X87Cache.declarations() emits at the top of a body.
 X87_DECLARATION = re.compile(r"(uint32_t ft0_|double fv\d+_(, fv\d+_)*|uint64_t fb\d+_(, fb\d+_)*);$")
+SEH_FRAME_MARK = "uint64_t seh_mark_ = recomp_seh_frame_mark(c);"
+
+
+def first_guest_line(lines):
+    """The first emitted line of a function body that can execute guest code.
+
+    Host-only SEH ownership bookkeeping and the declarations of an x87 run's
+    locals (X87Cache) do neither; the declarations come ahead of the mark
+    when a function has both. None when nothing else is left."""
+    for line in lines:
+        text = line.strip()
+        if text and text != SEH_FRAME_MARK and not X87_DECLARATION.match(text):
+            return text
+    return None
 
 
 class X87Fallback(Exception):
@@ -6813,17 +6827,9 @@ def main():
             continue                      # a one-line call into the runtime
         if body and body[0].startswith("static void body_"):
             continue                      # multi-entry form, dispatched below
-        lines = [l for l in body[1:] if l.strip()]
-        # Host-only ownership bookkeeping does not execute a guest instruction
-        # or modify its CPU. The first guest operation must still reach ADDR.
-        if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":
-            lines = lines[1:]
-        # Nor do the declarations of an x87 run's locals (X87Cache).
-        while lines and X87_DECLARATION.match(lines[0].strip()):
-            lines = lines[1:]
-        if not lines:
+        first = first_guest_line(body[1:])
+        if first is None:
             continue
-        first = lines[0].strip()
         if (first.startswith("L_%08x:" % fn.addr)
                 or first == "goto L_%08x;" % fn.addr
                 or ("/* %08x " % fn.addr) in first):
