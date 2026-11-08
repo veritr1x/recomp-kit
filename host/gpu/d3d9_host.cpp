@@ -18,6 +18,23 @@
 #include "../../platform/ab_phase.h"
 #include "../../platform/os.h"
 #include "../d3d_render.h"
+#include "gpu.h"
+
+// host/present_thread.cpp; absent from builds without the presenter (weak).
+__attribute__((weak)) void *host_present_stage_defer();
+__attribute__((weak)) bool host_present_stage_into(void *handle, gpu::Texture src, int w, int h,
+                                                   int guest_w, int guest_h, gpu::CommandBuffer cb);
+
+namespace {
+// The presenter frame the Op::Present being executed stages into (main thread only):
+// set around the backend's present and taken by it (host_d9_take_stage).
+void *g_stage = nullptr;
+} // namespace
+void *host_d9_take_stage() {
+    void *h = g_stage;
+    g_stage = nullptr;
+    return h;
+}
 
 #include <algorithm>
 #include <atomic>
@@ -131,6 +148,7 @@ struct Command {
     int32_t r0[4] = {}, r1[4] = {};
     float z = 0;
     std::function<void()> *call = nullptr; // Op::Call: run on the render thread
+    void *stage = nullptr; // Op::Present: the presenter frame it stages (host_present_stage_defer)
 };
 
 // A batch's payload: appended to for every draw (its constants and state
@@ -181,11 +199,13 @@ struct Batch {
         size_t at = 0;
         uint32_t count = 0; // registers copied; 0: none
     } vconst, pconst;
+    bool ends_present = false; // its last command is a pipelined Op::Present
     void clear() {
         commands.clear();
         bytes.clear();
         state_version = 0;
         vconst = pconst = Consts{};
+        ends_present = false;
     }
     size_t put(const void *p, size_t n) {
         return n ? bytes.append(p, n) : bytes.size();
@@ -202,9 +222,9 @@ class RenderThread {
         pumped_ = true; // the browser's main loop drains the queue
 #endif
         // Presents the pumped queue may hold before the next one waits: 2, or
-        // RECOMP_D3D9_FRAMES_AHEAD (1-4).
+        // RECOMP_D3D9_FRAMES_AHEAD (0-4; 0 waits for every frame's present).
         if (const char *ahead = recomp_env("D3D9_FRAMES_AHEAD"); ahead && *ahead)
-            frames_ahead_ = (uint32_t)std::clamp(atoi(ahead), 1, 4);
+            frames_ahead_ = (uint32_t)std::clamp(atoi(ahead), 0, 4);
         if (threaded_ && !pumped_)
             worker_ = std::thread([this] { run(); });
     }
@@ -256,7 +276,12 @@ class RenderThread {
         c.a = backbuffer;
         c.b = w;
         c.c = h;
+        // The game seals this frame as soon as Present returns, before the main thread has
+        // staged its image: mark it as waiting so the presenter shows no frame without its
+        // picture (the screen flashed black, or showed an older image).
+        c.stage = host_present_stage_defer ? host_present_stage_defer() : nullptr;
         filling_->commands.push_back(c);
+        filling_->ends_present = true;
         hand_over();
     }
     // The game's side of a present, either way: RECOMP_D3D9_STATS reports where the game
@@ -346,6 +371,12 @@ class RenderThread {
             pump();
         }
     }
+    // Drains again from a later turn of the event loop, `ms` from now.
+    void resume_pump(int ms) {
+        if (pump_asked_.exchange(true))
+            return;
+        emscripten_async_call([](void *s) { ((RenderThread *)s)->asked_pump(); }, this, ms);
+    }
     void asked_pump() {
         pump_asked_.store(false);
         if (main_depth_) {
@@ -368,15 +399,30 @@ class RenderThread {
         } leave{main_depth_};
 #endif
         std::unique_lock<std::mutex> lock(m_);
+        bool presented = false;
         while (!queue_.empty()) {
+#ifdef __EMSCRIPTEN__
+            // At most one pipelined frame a turn: presenter targets come back with GPU
+            // completions, which arrive only between turns of this thread's event loop, and
+            // staging queued frames back to back starved the pool (the presenter dropped
+            // about half of them). The rest waits for the next turn (resume_pump()).
+            if (queue_.front()->ends_present && presented) {
+                lock.unlock();
+                resume_pump(0);
+                lock.lock();
+                break;
+            }
+#endif
             std::unique_ptr<Batch> b = std::move(queue_.front());
             queue_.pop_front();
             busy_ = true;
             lock.unlock();
+            const bool was_present = b->ends_present;
             execute(*b);
             b->clear();
             lock.lock();
             busy_ = false;
+            presented = presented || was_present;
             if (spare_.size() < 8)
                 spare_.push_back(std::move(b));
         }
@@ -506,7 +552,11 @@ class RenderThread {
                 ending_.erase(cmd.a);
                 break;
             case Op::Present: {
+                g_stage = cmd.stage;
                 r_->present(cmd.a, cmd.b, cmd.c);
+                // A backend that staged nothing (no back buffer yet) drops the frame.
+                if (void *left = host_d9_take_stage(); left && host_present_stage_into)
+                    host_present_stage_into(left, {}, 0, 0, 0, 0, {});
                 std::lock_guard<std::mutex> lock(m_);
                 ++presents_done_;
                 idle_cv_.notify_all();
@@ -529,6 +579,9 @@ class RenderThread {
     // through its frame - on every GetData. Results are published here as the
     // backend learns them instead, each tagged with the Issue(END) it answers,
     // and GetData reads the table: an answer to an older Issue is not ready.
+    uint32_t frames_ahead() const {
+        return frames_ahead_;
+    }
     bool pumped() const {
         return pumped_;
     }
@@ -831,7 +884,7 @@ void host_d9_present(uint32_t backbuffer, uint32_t width, uint32_t height) {
     // The earlier phase of an in-run A/B (PRESENT), and every host whose render thread is
     // its own, wait for this frame's present. A sync after pipelined presents waits for
     // them too, so switching phase mid-run keeps the order.
-    if (t->pumped() && !recomp_ab::old(recomp_ab::PRESENT))
+    if (t->pumped() && t->frames_ahead() && !recomp_ab::old(recomp_ab::PRESENT))
         t->present_pipelined(backbuffer, width, height);
     else
         t->sync([&] { backend()->present(backbuffer, width, height); });

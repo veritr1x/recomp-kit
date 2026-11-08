@@ -342,6 +342,11 @@ HostSceneTarget host_present_acquire_target(int guest_w, int guest_h, int scene_
 void host_present_set_input(const CompositorInput *input);
 // A real device is presenting (not the fake one, not stopped).
 bool host_present_gpu_ready();
+// Pipelined Present (host/gpu/d3d9_host.cpp): defer the frame being written's image to the
+// browser's main thread, and stage it there.
+void *host_present_stage_defer();
+bool host_present_stage_into(void *handle, gpu::Texture src, int w, int h, int guest_w,
+                             int guest_h, gpu::CommandBuffer cb);
 // host/gpu2d.cpp: finish and drop the Direct3D 11 path's GPU work; the
 // presenter calls it before it stops.
 void host_gpu2d_release_device();

@@ -57,6 +57,10 @@ struct Frame {
     bool had_draws = false, supplied = false, gpu = false, shown = false;
     bool released = false, dropped = false, success = true, repeat = false, staged_pixels = false;
     bool completion_fallback = false;
+    // Sealed before its image is staged: a pipelined Present stages it later from the
+    // browser's main thread (host_present_stage_defer / host_present_stage_into). The
+    // worker composes no frame until this clears.
+    bool stage_pending = false;
     double presented_ts = 0, gpu_ts = 0, submitted_ts = 0, sealed_ts = 0, gpu_ms = 0;
     double acknowledgement_deadline = 0;
     unsigned pending_prefixes = 0;

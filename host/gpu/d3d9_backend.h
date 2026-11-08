@@ -75,3 +75,8 @@ bool host_d9_web_start(gpu::Device *device);
 void host_d9_pump(void);
 void host_d9_frame(bool inside);
 #endif
+
+// The presenter frame a pipelined Present stages into, for the backend's present(): null
+// when the frame is staged the usual way (host_present_stage_texture). Taking it is the
+// backend's promise to call host_present_stage_into with it.
+void *host_d9_take_stage();

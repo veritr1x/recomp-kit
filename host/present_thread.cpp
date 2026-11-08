@@ -204,6 +204,14 @@ struct Service : std::enable_shared_from_this<Service> {
     // Up to three display submissions, two mailbox frames, a writer and history.
     // Offscreen and the single-flight control still use only four targets.
     std::array<std::shared_ptr<Target>, 7> targets;
+    // A target the next frame can be staged into: one no frame in flight still holds.
+    // Called with `mutex` held.
+    int free_target_slot() const {
+        for (size_t i = 0; i < (flight_limit == 1 ? 4 : flight_limit + 4); ++i)
+            if (!targets[i] || targets[i].use_count() == 1)
+                return int(i);
+        return -1;
+    }
     size_t flight_limit = 1;
     std::shared_ptr<Frame> writing;
     std::deque<std::shared_ptr<Frame>> flights;
@@ -502,7 +510,8 @@ struct Service : std::enable_shared_from_this<Service> {
             f->input.guest_h = guest_h;
         }
         f->input.ui = &f->ui;
-        if (!f->target->scene.w || (!fake && !f->supplied && !f->target->pixels)) {
+        if (!f->target->scene.w ||
+            (!fake && !f->supplied && !f->target->pixels && !f->stage_pending)) {
             drop(f);
             return;
         }
@@ -579,12 +588,7 @@ struct Service : std::enable_shared_from_this<Service> {
             rh = gh;
         }
         requested_w = rw;
-        auto free_slot = [&]() -> int {
-            for (size_t i = 0; i < (flight_limit == 1 ? 4 : flight_limit + 4); ++i)
-                if (!targets[i] || targets[i].use_count() == 1)
-                    return int(i);
-            return -1;
-        };
+        auto free_slot = [&]() -> int { return free_target_slot(); };
         int slot = free_slot();
         // In a browser the page's main thread both stages frames here and frees the targets
         // (GPU completions and presents arrive only once it returns to the event loop), so a
@@ -782,11 +786,24 @@ struct Service : std::enable_shared_from_this<Service> {
                     f = *requested;
                     mailbox.erase(requested);
                 } else {
-                    f = mailbox.back();
-                    mailbox.pop_back();
+                    // The newest frame whose image has been staged. A frame sealed by a
+                    // pipelined Present waits for its stage; composing it first showed
+                    // whatever its target held before, or nothing.
+                    auto ready = std::find_if(mailbox.rbegin(), mailbox.rend(),
+                                              [](const auto &v) { return !v->stage_pending; });
+                    if (ready == mailbox.rend()) {
+                        // Nothing to compose until a stage lands: not ready (window_ready),
+                        // so the worker does not spin; host_present_stage_into wakes it.
+                        seal_pending = false;
+                        return;
+                    }
+                    auto at = std::next(ready).base();
+                    f = *at;
+                    mailbox.erase(at);
                 }
                 for (auto it = mailbox.begin(); it != mailbox.end();) {
-                    if ((*it)->capture) {
+                    // Captures, and frames newer than this one still waiting for their image.
+                    if ((*it)->capture || (*it)->stage_pending) {
                         ++it;
                         continue;
                     }
@@ -1383,6 +1400,72 @@ bool host_present_stage_texture(gpu::Texture src, int w, int h, int guest_w, int
     s->writing->staged_pixels = true;
     s->device->blit(cb, src, {0, 0, w, h}, t.pixels, 0, 0);
     return true;
+}
+// A pipelined Present (host/gpu/d3d9_host.cpp): the game thread seals each frame as it
+// presents, but the browser's main thread stages that frame's image only later. Called on
+// the game thread before the seal, this marks the frame being written as waiting for its
+// image and returns a handle to that frame; host_present_stage_into stages into it from
+// the main thread. Null when there is nothing to defer into.
+namespace {
+struct StageHandle {
+    std::shared_ptr<Service> service;
+    std::shared_ptr<Frame> frame;
+};
+} // namespace
+void *host_present_stage_defer() {
+    auto s = active.load();
+    if (!s || s->fake)
+        return nullptr;
+    std::lock_guard lock(s->mutex);
+    if (s->stop || !s->writing || !s->writing->target || s->writing->dropped)
+        return nullptr;
+    s->writing->stage_pending = true;
+    s->writing->staged_pixels = true; // as a stage before the seal would have set it
+    return new StageHandle{s, s->writing};
+}
+// Stages `src` into the deferred frame (or, with `src` null, gives up on it: the frame is
+// dropped) and lets the worker compose it. Main thread; `cb` is committed by the caller.
+bool host_present_stage_into(void *handle, gpu::Texture src, int w, int h, int guest_w,
+                             int guest_h, gpu::CommandBuffer cb) {
+    std::unique_ptr<StageHandle> sh(static_cast<StageHandle *>(handle));
+    if (!sh)
+        return false;
+    Service &s = *sh->service;
+    Frame &f = *sh->frame;
+    bool ok = false;
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.stop && src && cb && w > 0 && h > 0 && f.target && !f.released) {
+            const auto format = s.device->describe(src).format;
+            auto &t = *f.target;
+            t.device = s.device;
+            if (!t.pixels || t.pixels_w != w || t.pixels_h != h || t.pixels_format != format) {
+                if (t.pixels)
+                    s.device->destroy(t.pixels);
+                t.pixels = s.texture(w, h, format);
+                t.pixels_format = format;
+                t.pixels_w = w;
+                t.pixels_h = h;
+            }
+            if (t.pixels) {
+                if (guest_w > 0 && guest_h > 0) {
+                    s.guest_w = guest_w;
+                    s.guest_h = guest_h;
+                }
+                // The seal took the target's texture, which may not have existed yet.
+                if (f.input.legacy)
+                    f.input.legacy_frame = t.pixels;
+                s.device->blit(cb, src, {0, 0, w, h}, t.pixels, 0, 0);
+                ok = true;
+            }
+        }
+        if (!ok)
+            f.dropped = true;
+        f.stage_pending = false;
+        s.seal_pending = true;
+    }
+    s.wake.notify_one();
+    return ok;
 }
 // The drawable the presenter composes into, in pixels. False before one exists.
 bool host_present_drawable(int *w, int *h) {

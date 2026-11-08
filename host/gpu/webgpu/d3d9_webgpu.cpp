@@ -1111,8 +1111,13 @@ class WebGpuRenderer final : public D9Backend {
                 t->imported = dev_->import_texture(t->texture, v, gd);
             }
             gpu::CommandBuffer cb = dev_->begin();
-            if (host_present_stage_texture(t->imported, (int)t->width, (int)t->height, (int)w,
-                                           (int)h, cb))
+            if (void *stage = host_d9_take_stage())
+                // A pipelined Present: into the frame the game sealed for it, which the
+                // presenter composes once this copy is on the queue.
+                host_present_stage_into(stage, t->imported, (int)t->width, (int)t->height,
+                                        (int)w, (int)h, cb);
+            else if (host_present_stage_texture(t->imported, (int)t->width, (int)t->height,
+                                                (int)w, (int)h, cb))
                 host_present_track_command(cb);
             dev_->commit(cb);
         }

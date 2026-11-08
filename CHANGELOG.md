@@ -111,8 +111,16 @@
   takes the earlier behaviour during the A/B's earlier phase:
   - Present no longer waits for the page's main thread to encode and present
     the frame. It queues the present and waits only while 2 presents are
-    still queued (`RECOMP_D3D9_FRAMES_AHEAD`, 1-4); reads, query results in
-    step and device switches still wait for everything (`present`).
+    still queued (`RECOMP_D3D9_FRAMES_AHEAD`, 0-4); reads, query results in
+    step and device switches still wait for everything (`present`). The game
+    seals each frame as Present returns, so the frame is marked as waiting
+    for its image (`host_present_stage_defer`); the main thread stages into
+    that frame (`host_present_stage_into`), and the presenter composes no
+    frame before its image is on the queue. It stages at most one frame per
+    turn of its event loop. Without these the presenter showed frames whose
+    image had not arrived and dropped about half of them: NFSMW's screen
+    flashed black. NFSMW menu, in-run A/B: 5.0-6.3 ms a frame against
+    6.1-7.0 ms.
   - A full presenter target pool on the page's main thread drops the frame at
     once instead of freezing the page for 250 ms (`present`).
   - A draw's shader constants are copied into the render queue only when they
