@@ -736,7 +736,19 @@ class WebGpuRenderer final : public D9Backend {
             offsets[3] = (uint32_t)at;
             memcpy(uniform_bytes_.data() + at, &pparams, sizeof pparams);
             uint64_t base = 0;
-            ubuf = ring_write(uniform_bytes_.data(), span, &base);
+            // The game sets the same constants for run after run of draws;
+            // the previous draw's copy, still in this pass's ring, serves.
+            if (es_.uniforms_valid && last_uniforms_.size() == span &&
+                memcmp(last_uniforms_.data(), uniform_bytes_.data(), span) == 0) {
+                ubuf = es_.uniform_buffer;
+                base = es_.uniform_base;
+            } else {
+                ubuf = ring_write(uniform_bytes_.data(), span, &base);
+                last_uniforms_ = uniform_bytes_;
+                es_.uniforms_valid = true;
+                es_.uniform_buffer = ubuf;
+                es_.uniform_base = base;
+            }
             for (uint32_t &o : offsets)
                 o += (uint32_t)base;
         }
@@ -769,7 +781,11 @@ class WebGpuRenderer final : public D9Backend {
             skip("no bind group");
             return;
         }
-        wgpuRenderPassEncoderSetBindGroup(pass_, 0, group, 4, offsets);
+        if (group != es_.group || memcmp(offsets, es_.group_offsets, sizeof offsets) != 0) {
+            wgpuRenderPassEncoderSetBindGroup(pass_, 0, group, 4, offsets);
+            es_.group = group;
+            memcpy(es_.group_offsets, offsets, sizeof offsets);
+        }
 
         for (uint32_t i = 0; i < 8; ++i) {
             if (!(vl.streams >> i & 1))
@@ -791,10 +807,10 @@ class WebGpuRenderer final : public D9Backend {
             } else {
                 vb = zero_;
             }
-            wgpuRenderPassEncoderSetVertexBuffer(pass_, vl.slot_of[i], vb, off, WGPU_WHOLE_SIZE);
+            set_vertex_buffer(vl.slot_of[i], vb, off);
         }
         if (vl.zero)
-            wgpuRenderPassEncoderSetVertexBuffer(pass_, vl.zero_slot, zero_, 0, WGPU_WHOLE_SIZE);
+            set_vertex_buffer(vl.zero_slot, zero_, 0);
         encode_primitives(d);
         ++draws_;
     }
@@ -2093,16 +2109,14 @@ class WebGpuRenderer final : public D9Backend {
                 if ((uint64_t)(d.start + count) * isize > b->second.shadow.size())
                     return;
                 b->second.used = serial_;
-                wgpuRenderPassEncoderSetIndexBuffer(pass_, b->second.buffer, itype, 0,
-                                                    WGPU_WHOLE_SIZE);
+                set_index_buffer(b->second.buffer, itype, 0, WGPU_WHOLE_SIZE);
                 wgpuRenderPassEncoderDrawIndexed(pass_, count, instances, d.start, d.base_vertex,
                                                  0);
             } else {
                 uint64_t off = 0;
                 WGPUBuffer b = ring_write(d.inline_indices, (uint64_t)count * isize, &off,
                                           WGPUBufferUsage_Vertex);
-                wgpuRenderPassEncoderSetIndexBuffer(pass_, b, itype, off,
-                                                    round_up((uint64_t)count * isize, 4));
+                set_index_buffer(b, itype, off, round_up((uint64_t)count * isize, 4));
                 wgpuRenderPassEncoderDrawIndexed(pass_, count, instances, 0, 0, 0);
             }
             return;
@@ -2133,7 +2147,7 @@ class WebGpuRenderer final : public D9Backend {
         }
         uint64_t off = 0;
         WGPUBuffer b = ring_write(fan_.data(), fan_.size() * 4, &off, WGPUBufferUsage_Vertex);
-        wgpuRenderPassEncoderSetIndexBuffer(pass_, b, WGPUIndexFormat_Uint32, off, fan_.size() * 4);
+        set_index_buffer(b, WGPUIndexFormat_Uint32, off, fan_.size() * 4);
         wgpuRenderPassEncoderDrawIndexed(pass_, count * 3, instances, 0, 0, 0);
     }
 
@@ -2194,13 +2208,47 @@ class WebGpuRenderer final : public D9Backend {
         report_draws_ = draws_;
     }
 
+    // What the open pass has bound, so a draw that binds the same thing again
+    // makes no call: each one is a call out to the browser's main thread, and
+    // a race frame makes thousands. Reset whenever a pass begins or a utility
+    // draw binds its own state.
     struct EncoderState {
         WGPURenderPipeline pipeline = nullptr;
         uint32_t stencil_ref = 0xffffffffu;
         bool viewport_valid = false, scissor_valid = false;
         float viewport[6] = {};
         uint32_t scissor[4] = {};
+        WGPUBindGroup group = nullptr;
+        uint32_t group_offsets[4] = {};
+        bool uniforms_valid = false; // last_uniforms_ is in this pass's ring at uniform_base
+        WGPUBuffer uniform_buffer = nullptr;
+        uint64_t uniform_base = 0;
+        WGPUBuffer vb[16] = {};
+        uint64_t vb_offset[16] = {};
+        WGPUBuffer ib = nullptr;
+        WGPUIndexFormat ib_format = WGPUIndexFormat_Undefined;
+        uint64_t ib_offset = 0, ib_size = 0;
     };
+    std::vector<uint8_t> last_uniforms_;
+
+    void set_vertex_buffer(uint32_t slot, WGPUBuffer b, uint64_t offset) {
+        if (slot < 16 && es_.vb[slot] == b && es_.vb_offset[slot] == offset)
+            return;
+        wgpuRenderPassEncoderSetVertexBuffer(pass_, slot, b, offset, WGPU_WHOLE_SIZE);
+        if (slot < 16) {
+            es_.vb[slot] = b;
+            es_.vb_offset[slot] = offset;
+        }
+    }
+    void set_index_buffer(WGPUBuffer b, WGPUIndexFormat format, uint64_t offset, uint64_t size) {
+        if (es_.ib == b && es_.ib_format == format && es_.ib_offset == offset && es_.ib_size == size)
+            return;
+        wgpuRenderPassEncoderSetIndexBuffer(pass_, b, format, offset, size);
+        es_.ib = b;
+        es_.ib_format = format;
+        es_.ib_offset = offset;
+        es_.ib_size = size;
+    }
 
     WebGpuDevice *dev_;
     WGPUDevice device_;

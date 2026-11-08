@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The Direct3D 9 WebGPU renderer binds only what changed within a render
+  pass: a draw with the same vertex buffers, index buffer or bind group and
+  offsets as the one before makes no call for them, and identical shader
+  constants reuse the previous draw's copy in the uniform ring. Each of those
+  calls crosses into the browser's main thread; in a Need for Speed: Most
+  Wanted race the main thread's busy time per frame fell from about 14 ms to
+  about 5 ms, and the browser presents at 120 Hz again in heavy views.
 - The web player requests its page, modules, Wasm and data with a build stamp
   (`?v=<digest>`) that `web_launcher.py` fills in when it stages a build. A
   browser or proxy cache can no longer pair an updated game's Wasm with an
