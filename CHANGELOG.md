@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A D3DX effect parameter write that leaves the value byte-identical keeps its
+  stamp: the shader constants are not rebuilt, the preshader does not rerun and
+  a shared parameter is not copied to its pool again. Each bound shader looks
+  up its constant table once instead of three times. In Need for Speed: Most
+  Wanted this cut Direct3D's share of the game thread from 25% to 20%.
 - Keep the web build's static guest arena to guests of up to 384 MB. A larger
   arena (Cult's 1.86 GB, Siege's 1 GB) did not fit the 512 MB initial memory
   and failed to link; those games reserve the arena at run time again, as they

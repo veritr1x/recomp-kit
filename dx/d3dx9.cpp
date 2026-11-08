@@ -358,6 +358,7 @@ struct FxParam {
     std::vector<uint32_t> annotations; // indices into FxEffect::annotations
     bool shared = false;               // D3DX_PARAMETER_SHARED: one value across the effect pool
     uint64_t stamp = 0;                // g_param_stamp at the last write
+    uint64_t synced = 0;               // stamp when a shared value last matched its pool
     // A sampler's texture parameter, resolved once from its texture state's
     // object name (fixed when the effect is parsed): -2 unresolved, -1 none.
     mutable int32_t sampler_tex_param = -2;
@@ -411,6 +412,11 @@ struct FxEffect {
     // stamp already holds its value.
     struct ConstBind {
         uint64_t serial = 0, stamp = 0;
+        // The program's constant table and its parameter indices, found on
+        // the first bind: both live in node-based maps, so the references
+        // stay valid, and every later bind is one lookup instead of three.
+        const std::vector<struct CtabConst> *table = nullptr;
+        std::vector<int32_t> *resolved = nullptr;
     };
     std::unordered_map<uint64_t, ConstBind> const_binds;
     // Shared parameters: for each parameter index, the same parameter in the
@@ -949,8 +955,12 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
     FxEffect::ConstBind &last = fx.const_binds[key];
     const bool intact = last.serial != 0 && last.serial == serial;
     const uint64_t since = intact ? last.stamp : 0;
-    const std::vector<CtabConst> &table = ctab_of(code, key);
-    std::vector<int32_t> &resolved = fx.ctab_params[key];
+    if (!last.table) {
+        last.table = &ctab_of(code, key);
+        last.resolved = &fx.ctab_params[key];
+    }
+    const std::vector<CtabConst> &table = *last.table;
+    std::vector<int32_t> &resolved = *last.resolved;
     if (resolved.size() != table.size()) {
         resolved.resize(table.size());
         for (size_t i = 0; i < table.size(); ++i)
@@ -1942,7 +1952,7 @@ static void share_parameter(uint32_t from_effect, uint32_t index) {
     if (src == effects().end() || !src->second.pool || index >= src->second.params.size())
         return;
     FxEffect &fx = src->second;
-    const FxParam &value = fx.params[index];
+    FxParam &value = fx.params[index];
     if (!value.shared)
         return;
     if (fx.peers_generation != g_effect_generation) {
@@ -1974,7 +1984,9 @@ static void share_parameter(uint32_t from_effect, uint32_t index) {
             memcpy(other->value.data(), value.value.data(), n);
         other->texture = value.texture;
         param_touched(*other);
+        other->synced = other->stamp;
     }
+    value.synced = value.stamp;
 }
 // A new effect starts from the pool's current value of each shared parameter.
 static void join_pool(uint32_t effect_id) {
@@ -1998,18 +2010,39 @@ static void join_pool(uint32_t effect_id) {
     }
 }
 // Wraps a setter: after it runs, a shared parameter's new value reaches the pool.
+// The game rewrites the same values (shared states such as COLORWRITEMODE,
+// per-draw constants) far more often than it changes them. A write that leaves
+// a parameter's bytes and texture as they were keeps its old stamp, so the
+// constants and preshaders computed from it are not redone, and a shared one
+// does not walk the pool when it was in sync with the pool before the write.
 template <void (*F)(X86 *)> void shared_setter(X86 *c) {
     ComObj *o = com_this_arg(c);
     uint32_t id = o ? o->id : 0;
     uint32_t handle = arg(c, 1);
-    int64_t index = -1;
-    if (FxEffect *fx = this_fx(c))
-        if (FxParam *p = param_of(*fx, handle);
-            p && p->shared && p >= fx->params.data() && p < fx->params.data() + fx->params.size())
-            index = p - fx->params.data();
+    FxEffect *fx = this_fx(c);
+    FxParam *p = fx ? param_of(*fx, handle) : nullptr;
+    if (!p || p < fx->params.data() || p >= fx->params.data() + fx->params.size()) {
+        F(c);
+        return;
+    }
+    const uint32_t index = (uint32_t)(p - fx->params.data());
+    uint8_t before[64];
+    const size_t n = p->value.size();
+    const bool small = n <= sizeof before;
+    const uint64_t stamp = p->stamp;
+    const bool in_sync = p->shared && p->synced != 0 && p->synced == stamp;
+    const uint32_t texture = p->texture;
+    if (small && n)
+        memcpy(before, p->value.data(), n);
     F(c);
-    if (index >= 0)
-        share_parameter(id, (uint32_t)index);
+    p = &fx->params[index]; // effects live in map nodes; their parameters keep their size
+    if (small && stamp && p->texture == texture && (n == 0 || memcmp(before, p->value.data(), n) == 0)) {
+        p->stamp = stamp;
+        if (!p->shared || in_sync)
+            return;
+    }
+    if (p->shared)
+        share_parameter(id, index);
 }
 
 static const ComMethod g_effect_pool[] = {
