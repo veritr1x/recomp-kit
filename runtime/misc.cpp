@@ -26,8 +26,11 @@
 // Clock
 // ---------------------------------------------------------------------------
 namespace {
-uint64_t g_epoch_us = 0;
+// Atomic: set by the first read, and a guest thread running free reads it as well
+// (host_millis_quiet).
+std::atomic<uint64_t> g_epoch_us{0};
 uint32_t (*g_time_source)() = nullptr;
+uint32_t (*g_quiet_time_source)() = nullptr;
 // Not owned and not copied: every caller passes a string literal, and this is
 // read from a run record writer that may run at exit, by which time anything
 // with a lifetime would be a question.
@@ -41,12 +44,20 @@ uint64_t now_us() {
 uint32_t host_millis() {
     if (g_time_source)
         return g_time_source();
-    if (!g_epoch_us)
-        g_epoch_us = now_us();
-    return (uint32_t)((now_us() - g_epoch_us) / 1000ull);
+    uint64_t epoch = g_epoch_us.load(std::memory_order_relaxed);
+    if (!epoch) {
+        epoch = now_us();
+        g_epoch_us.store(epoch, std::memory_order_relaxed);
+    }
+    return (uint32_t)((now_us() - epoch) / 1000ull);
 }
+// A new source drops the quiet version of the old one: it may read another clock.
 void host_set_time_source(uint32_t (*fn)()) {
     g_time_source = fn;
+    g_quiet_time_source = nullptr;
+}
+void host_set_quiet_time_source(uint32_t (*fn)()) {
+    g_quiet_time_source = fn;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +102,7 @@ void host_clear_time_source() {
     g_pin_on.store(false, std::memory_order_release);
     g_pin_step = 0;
     g_time_source = nullptr;
+    g_quiet_time_source = nullptr;
     g_clock_desc = nullptr; // back to "monotonic"
 }
 
@@ -188,6 +200,27 @@ void host_note_cadence(const char *kind) {
         fflush(g_cadence); // a killed run keeps its trace
         return;
     }
+}
+
+// The clock for a thread without the baton (win32.h). The cadence trace records every
+// clock read, taking its lock and the clock's side effects, so a traced run reads on the
+// baton, as it always has.
+bool host_millis_quiet(uint32_t *out) {
+    if (g_cadence)
+        return false;
+    if (host_time_source_is_pinned()) {
+        *out = host_pinned_clock_value();
+        return true;
+    }
+    if (uint32_t (*quiet)() = g_quiet_time_source) {
+        *out = quiet();
+        return true;
+    }
+    const uint64_t epoch = g_epoch_us.load(std::memory_order_relaxed);
+    if (g_time_source || !epoch)
+        return false; // no quiet version of this host's clock, or none read yet
+    *out = (uint32_t)((now_us() - epoch) / 1000ull);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1267,14 @@ namespace {
 void m_timeGetTime(X86 *c) {
     host_note_cadence("timeGetTime");
     set_eax(c, host_millis());
+}
+// Baton-free (imports.h ImportFreeShim): the same clock, read with no side effect.
+bool mf_timeGetTime(X86 *c) {
+    uint32_t now;
+    if (!host_millis_quiet(&now))
+        return false;
+    set_eax(c, now);
+    return true;
 }
 
 void m_timeSetEvent(X86 *c) {
@@ -2464,3 +2505,10 @@ const ImportShim g_misc_shims[] = {
     {"weanetr.dll", "?SendChat@MLDPlay@@QAEHKPAGKPAK@Z", 4, nullptr},
 };
 const size_t g_misc_shim_count = sizeof(g_misc_shims) / sizeof(g_misc_shims[0]);
+
+// Baton-free versions (imports.h ImportFreeShim): a clock read with no side effect.
+const ImportFreeShim g_misc_free_shims[] = {
+    {"WINMM.dll", "timeGetTime", mf_timeGetTime},
+    {"_INMM.dll", "timeGetTime", mf_timeGetTime},
+};
+const size_t g_misc_free_shim_count = sizeof(g_misc_free_shims) / sizeof(g_misc_free_shims[0]);

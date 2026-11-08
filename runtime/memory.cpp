@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -155,6 +156,10 @@ static const size_t kLogOnceKeys = 4096;
 bool log_once(const char *key, const char *fmt, ...) {
     static std::set<std::string> seen;
     static bool capped = false;
+    // A guest thread running free (win32.h free run) reaches some shims that report through
+    // this, beside the baton holder. Only the set is guarded; the report is written after.
+    static std::mutex seen_m;
+    std::unique_lock<std::mutex> held(seen_m);
     if (seen.size() >= kLogOnceKeys) {
         if (!capped) {
             capped = true;
@@ -168,6 +173,7 @@ bool log_once(const char *key, const char *fmt, ...) {
     }
     if (!seen.insert(key).second)
         return false;
+    held.unlock();
     if (log_level() < 1)
         return true;
     va_list ap;

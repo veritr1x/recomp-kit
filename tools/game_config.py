@@ -227,7 +227,16 @@ def load(game_dir):
     tracks = cfg.setdefault("media", {}).setdefault("cd_tracks", [])
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
-    cfg.setdefault("hooks", {})
+    hooks = cfg.setdefault("hooks", {})
+    # [hooks] free_run: translated functions whose guest code runs without the scheduler's
+    # baton (runtime/win32.h sched_free_run_enter); rendered as RECOMP_HOOK_FREE_RUN.
+    free_run = hooks.get("free_run")
+    if free_run is not None:
+        if (not isinstance(free_run, list)
+                or any(type(v) is not int or not 0 < v <= 0xffffffff for v in free_run)):
+            raise ValueError("%s: [hooks] free_run must be a list of nonzero 32-bit function addresses" % source)
+        if len(set(free_run)) != len(free_run):
+            raise ValueError("%s: [hooks] free_run must not name a function twice" % source)
     cfg.setdefault("bundle", {}).setdefault("exclude", [])
     touch = cfg.setdefault("touch", {})
     touch.setdefault("keypad", "auto")

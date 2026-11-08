@@ -13,6 +13,7 @@
 #pragma once
 #include "guest.h"
 #include <stdio.h>
+#include <mutex>
 
 // argc_stdcall sentinels.
 static const uint8_t ARGC_CDECL = 0xff;   // caller cleans the stack: pop only the return address
@@ -28,6 +29,28 @@ struct ImportShim {
 // Registers a shim table. Later registrations override earlier ones for the
 // same (dll, name); a null fn never overrides a non-null one.
 void imports_register(const ImportShim *shims, size_t count);
+
+// A version of a shim that a guest thread running free (win32.h free run) may call without
+// the baton. It touches only the calling thread's own state, host atomics, or a clock read
+// with no side effect, and returns false, having changed nothing, when this call needs the
+// baton after all (a host that cannot read its clock quietly, a buffer it does not know);
+// the call is then made through the ordinary shim, holding the baton. It applies to the
+// shim registered for (dll, name) when this is called: a later registration that replaces
+// that shim drops it.
+struct ImportFreeShim {
+    const char *dll;
+    const char *name;
+    bool (*fn)(X86 *);
+};
+void imports_register_baton_free(const ImportFreeShim *shims, size_t count);
+// The same for an import with no shim table entry (a COM method: dx/com.cpp allocates its
+// trampoline with the method's function): `fn` stands for `shim`.
+void imports_register_baton_free_method(const char *dll, const char *name, bool (*fn)(X86 *),
+                                        void (*shim)(X86 *));
+// Every import of `dll` (case-insensitive) runs holding `m` as well as the baton, so that its
+// baton-free shims, which hold only `m`, never meet another of its shims halfway. A shim that
+// yields the baton or calls guest code must not belong to such a DLL.
+void imports_serialize_dll(const char *dll, std::recursive_mutex *m);
 // True if a shim table registered an entry for this DLL (case-insensitive).
 bool imports_has_dll(const char *dll_lower);
 
@@ -148,6 +171,10 @@ extern const ImportShim g_misc_shims[];
 extern const size_t g_misc_shim_count;
 extern const ImportShim g_gdi32_shims[];
 extern const size_t g_gdi32_shim_count;
+extern const ImportFreeShim g_kernel32_free_shims[];
+extern const size_t g_kernel32_free_shim_count;
+extern const ImportFreeShim g_misc_free_shims[];
+extern const size_t g_misc_free_shim_count;
 
 // Per-import call counts, for the runtime tests and end-of-run diagnostics.
 void imports_dump_stats(FILE *out);

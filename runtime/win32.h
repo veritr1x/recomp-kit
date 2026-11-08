@@ -260,6 +260,42 @@ bool sched_guest_threads_stopped_locked();
 // well, because the main guest thread is not "spawned" and so does not appear
 // in sched_guest_threads_stopped().
 bool sched_guest_entry_begun_locked();
+// ---------------------------------------------------------------------------
+// Free run (game.toml [hooks] free_run): a guest thread inside one of the listed
+// functions runs its guest code WITHOUT the baton, beside whichever thread holds it.
+// For self-contained work that another thread would otherwise wait for - a sound
+// mixer's per-block DSP - and that the original ran on its own core. The game's own
+// locks protect what it shares: critical sections and Interlocked* are host atomics
+// (critsec.h, x86.h recomp_lock_*), and so are LOCK XADD, LOCK CMPXCHG and XCHG with
+// memory in translated code.
+//
+// enter: called by the baton holder at the function's entry (`esp` is its ESP there).
+// It gives the baton away and returns true, or returns false and keeps it (one guest
+// thread, an atomic stretch, a pinned clock, RECOMP_FREE_RUN=0, the in-run A/B's
+// earlier phase). Only guest code may run while free: imports_dispatch takes the baton
+// back for a shim (except a baton-free one, imports_register_baton_free) and runs free
+// again afterwards while the stack is still inside the function (below its entry ESP);
+// a mod hook is dispatched holding the baton, and so is a guest exception.
+// leave: waits for the baton again; idempotent.
+// ---------------------------------------------------------------------------
+bool sched_free_run_enter(uint32_t esp);
+// Returns the function's entry ESP when this thread was running free, else 0.
+uint32_t sched_free_run_leave();
+bool sched_free_running();
+// RECOMP_SCHED=parallel (TEST ONLY, off by default): every guest thread except the main
+// one runs free for its whole body (free run with no end), taking the baton only for
+// imports, mod hooks and guest exceptions; the main thread is unchanged. rejoin puts such
+// a thread back into free run after anything that left it holding the baton - but only
+// when no shim or mod callback is on its host stack (sched_nest_enter), since that code
+// expects the baton when the guest code it called returns. A no-op otherwise.
+bool sched_parallel();
+void sched_parallel_rejoin();
+// Brackets host code that runs holding the baton and may call guest code back (an
+// import's shim, a mod hook's dispatch): while one is open on this thread, rejoin does
+// nothing. `esp` is the guest ESP at entry; a guest exception landing above it closes it
+// (sched_atomic_unwind_to_esp), as a longjmp skips the matching leave.
+void sched_nest_enter(uint32_t esp);
+void sched_nest_leave();
 #ifdef POPM_TESTING
 // Forgets that, for a process that tears one guest down and starts another.
 // Compiled ONLY into a test binary: it resets a safety latch, and a latch that
@@ -281,6 +317,13 @@ void sched_run_checkpoint();
 // ---------------------------------------------------------------------------
 uint32_t host_millis();
 void host_set_time_source(uint32_t (*fn)());
+// The same clock read with no side effect, for a guest thread running without the baton
+// (imports_register_baton_free): a host's time source may also service the host, which
+// only the baton holder may do. A host that installs a time source installs this as
+// well; while it has not, host_millis_quiet answers false and the read takes the baton.
+// A pinned clock, and no time source at all, are quiet already.
+void host_set_quiet_time_source(uint32_t (*fn)());
+bool host_millis_quiet(uint32_t *out);
 // What that clock IS, in the host's own words, for whatever has to record what
 // a run ran on. Installing a time source is not the same as pinning one - the
 // boot hosts install one that reads the real clock - so this cannot be derived

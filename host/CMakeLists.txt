@@ -186,6 +186,8 @@ if(RECOMP_D9_VULKAN)
 endif()
 if(EMSCRIPTEN)
   list(APPEND POP_PRESENT_SOURCES ${HOST}/gpu/webgpu/d3d9_webgpu.cpp)
+  # d3d9_webgpu.cpp's setBindGroup: every target with the renderer links it.
+  set(POP_WEBGPU_JS ${POP_ROOT}/web/player/webgpu-bind-group.js)
 endif()
 if(APPLE)
   list(APPEND POP_PRESENT_SOURCES ${HOST}/gpu/metal/d3d9_metal.mm)
@@ -224,6 +226,10 @@ if(TARGET recomp_gen)
     LIBS ${POP_CORE_LIBS}
     FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})
   pop_link_sdl(pop_smoke)
+  if(EMSCRIPTEN)
+    target_link_options(pop_smoke PRIVATE "SHELL:--js-library ${POP_WEBGPU_JS}")
+    set_property(TARGET pop_smoke APPEND PROPERTY LINK_DEPENDS ${POP_WEBGPU_JS})
+  endif()
   # Each target is optional on its own: a game can ship core mods without a
   # smoke probe, and depending on one that does not exist fails generation.
   if(TARGET core_mods)
@@ -304,8 +310,11 @@ if(TARGET recomp_gen)
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0
       -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS
       --js-library ${POP_ROOT}/web/player/fetch-backend.js
+      # SHELL: keeps the flag with its file; CMake removes repeated options.
+      "SHELL:--js-library ${POP_WEBGPU_JS}"
       --preload-file ${web_resources}@/app/resources)
-    set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/player/fetch-backend.js)
+    set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/player/fetch-backend.js
+                                                                ${POP_WEBGPU_JS})
     # Function names in the Wasm make browser stacks of a hung or slow guest
     # readable. Opt in at configure time; they add a few MiB to the download.
     if(RECOMP_WEB_PROFILING_FUNCS OR "$ENV{RECOMP_WEB_PROFILING_FUNCS}")
@@ -360,6 +369,10 @@ pop_host(host_tests UI_LAYER
   FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})
 pop_link_sdl(host_tests)
 pop_test_binary(host_tests)
+if(EMSCRIPTEN)
+  target_link_options(host_tests PRIVATE "SHELL:--js-library ${POP_WEBGPU_JS}")
+  set_property(TARGET host_tests APPEND PROPERTY LINK_DEPENDS ${POP_WEBGPU_JS})
+endif()
 add_test(NAME host_tests COMMAND host_tests WORKING_DIRECTORY ${POP_ROOT})
 add_test(NAME host_keyboard_tests COMMAND host_tests --keyboard-only WORKING_DIRECTORY ${POP_ROOT})
 set_tests_properties(host_keyboard_tests PROPERTIES LABELS nogame TIMEOUT 30)

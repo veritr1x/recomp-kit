@@ -489,6 +489,9 @@ bool boot_load(const BootOptions &opts) {
         if (*trace)
             host_set_cadence_trace(trace);
     host_set_time_source(boot_time_source);
+    // The clock a thread running free reads (timeGetTime, QueryPerformanceCounter) without
+    // the baton: no cadence trace, no frame pacing, just the time.
+    host_set_quiet_time_source(boot_guest_millis);
     host_set_message_waiter(boot_message_waiter);
     // The runtime calls this on the run thread whenever the guest is about to
     // block, so a host that has an event loop gets to run it instead of the

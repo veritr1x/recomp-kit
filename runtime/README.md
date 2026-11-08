@@ -252,6 +252,12 @@ paths resolve against the guest current directory, which starts at
 | `RECOMP_CREATETHREAD=skip` | record `CreateThread` without running the thread body |
 | `RECOMP_CREATETHREAD=sync` | run a thread body to completion inside `CreateThread` (pre-scheduler behaviour, for bisection) |
 | `RECOMP_IMPORT_STATS=1` | at exit, classify every import as called / not reached / logging-only |
+| `RECOMP_FREE_RUN=0` | run the `game.toml` `[hooks] free_run` functions holding the baton, as every other function (`win32.h` free run) |
+| `RECOMP_FREE_RUN=1` | use the game's `free_run` list on a native host too (the browser build uses it by default) |
+| `RECOMP_FREE_RUN=<hex>[,<hex>...]` | run these functions free instead of the game's list, to try one without editing `game.toml` |
+| `RECOMP_FREE_RUN_STATS=1` | every 5 s, log how long threads back from free run waited for the baton, and the imports and hooked functions that took it from a free thread |
+| `RECOMP_SCHED=parallel` | TEST ONLY: every guest thread but the main one runs free for its whole body |
+| `RECOMP_CRITSEC_SPIN=0` | TEST ONLY: a contended critical section blocks at once instead of spinning up to 100 us while a thread runs free |
 
 ## Tests
 

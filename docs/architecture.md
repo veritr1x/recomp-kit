@@ -74,6 +74,24 @@ Each has a register file and stack, but **one guest thread holds the execution
 baton at a time**. A blocking import yields it. Host workers never mutate guest
 memory concurrently with that thread.
 
+Free run is the one exception (`runtime/win32.h` `sched_free_run_enter`). A
+guest thread inside a function listed in `game.toml` `[hooks] free_run` runs
+that function's guest code without the baton, beside the holder; the browser
+build enables it, elsewhere `RECOMP_FREE_RUN=1` does, and `RECOMP_FREE_RUN=0`
+turns it off. Such a thread never touches scheduler or shim state: an import
+takes the baton back for its shim and runs free again afterwards while the
+stack is inside the function, unless the shim has a baton-free version
+(`imports_register_baton_free`: critical sections, TLS, Interlocked*, the
+quiet clock, Sleep and DirectSound buffer GetCurrentPosition/Lock/Unlock). Mod
+hooks and guest exceptions are dispatched holding the baton. What the game
+shares between threads is guarded by its own locks, which are host atomics
+here: critical sections take their owner word with a compare-exchange
+(`runtime/critsec.h`), and LOCK XADD, LOCK CMPXCHG, XCHG with memory and the
+Interlocked* imports are host atomics (`runtime/x86.h` `recomp_lock_*`). While
+a thread runs free and nothing else can run, the baton belongs to nobody; the
+first thread able to run takes it. `RECOMP_SCHED=parallel` (test only) runs
+every worker free for its whole body.
+
 The presentation worker consumes completed immutable frames. GPU resources and
 texture revisions remain alive until commands that reference them complete.
 Audio queues use their own clock and synchronization. Window events publish

@@ -15,6 +15,7 @@
 #include "d3d9_backend.h"
 
 #include "../../dx/d3d9_shader.h"
+#include "../../platform/ab_phase.h"
 #include "../../platform/os.h"
 #include "../d3d_render.h"
 
@@ -708,6 +709,7 @@ void host_d9_stretch(HostD9Surface src, const int32_t src_rect[4], HostD9Surface
     t->submitted();
 }
 void host_d9_present(uint32_t backbuffer, uint32_t width, uint32_t height) {
+    recomp_ab::tick(); // TEST ONLY phase of an in-run A/B; nothing unless RECOMP_AB_PERIOD is set
     if (RenderThread *t = render_thread())
         t->sync([&] { backend()->present(backbuffer, width, height); });
 }

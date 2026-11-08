@@ -402,6 +402,10 @@ struct ComObj {
     int32_t cc_sharpness = 5;
     int32_t cc_gamma = 1;
     int32_t cc_colorenable = 1;
+    // Direct3D 9 GPU path: this resource's mirror record (d3d9.cpp GpuMirror), cached so a draw
+    // does not look it up by id for every texture, target and buffer. Cleared before the mirror
+    // is erased.
+    void *gpu_mirror = nullptr;
 };
 
 // One vtable slot.

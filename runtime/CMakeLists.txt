@@ -51,6 +51,17 @@ add_test(NAME interp_tests COMMAND interp_tests WORKING_DIRECTORY ${POP_ROOT})
 # forever: a regression in them is a hang, not a failure, and a hung run
 # reports nothing at all. The suite takes under a second.
 set_tests_properties(interp_tests PROPERTIES LABELS nogame TIMEOUT 120)
+
+# The locked read-modify-writes (x86.h recomp_lock_*) and critical-section ownership
+# (critsec.h) on their own, under real thread contention. Header-only: no runtime is linked.
+add_executable(lock_tests tests/lock_tests.cpp)
+target_include_directories(lock_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(lock_tests PRIVATE recomp_platform)
+target_compile_options(lock_tests PRIVATE ${POP_WARN_HOST})
+pop_optimize(lock_tests 2)
+pop_test_binary(lock_tests)
+add_test(NAME lock_tests COMMAND lock_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(lock_tests PROPERTIES LABELS nogame TIMEOUT 120)
 endif()
 
 # Linked by the hosts, the fixture and the mod tests, not by the unit tests.

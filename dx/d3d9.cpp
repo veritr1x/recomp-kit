@@ -21,6 +21,7 @@
 #include "d3d9_api.h"
 #include "d3d8_program.h"
 #include "host_d9.h"
+#include "../platform/ab_phase.h"
 #include <deque>
 #include <unordered_map>
 #include <map>
@@ -900,15 +901,59 @@ static uint32_t stage_lock(ComObj *o) {
     return o->pixels;
 }
 
+// The first and one past the last byte where a and b differ in [lo, hi), eight bytes a step.
+static uint32_t first_difference(const uint8_t *a, const uint8_t *b, uint32_t lo, uint32_t hi) {
+    for (; lo + 8 <= hi; lo += 8) {
+        uint64_t x, y;
+        memcpy(&x, a + lo, 8);
+        memcpy(&y, b + lo, 8);
+        if (x != y)
+            break;
+    }
+    while (lo < hi && a[lo] == b[lo])
+        ++lo;
+    return lo;
+}
+static uint32_t end_of_difference(const uint8_t *a, const uint8_t *b, uint32_t lo, uint32_t hi) {
+    for (; hi >= lo + 8; hi -= 8) {
+        uint64_t x, y;
+        memcpy(&x, a + hi - 8, 8);
+        memcpy(&y, b + hi - 8, 8);
+        if (x != y)
+            break;
+    }
+    while (hi > lo && a[hi - 1] == b[hi - 1])
+        --hi;
+    return hi;
+}
+
 static void stage_unlock(ComObj *o) {
     if (!o || o->lock_count <= 0)
         return;
     if (--o->lock_count == 0 && o->pixels) {
-        memcpy(o->blob.data(), gm_ptr(o->pixels), o->blob.size());
+        const uint8_t *staged = gm_ptr(o->pixels);
+        uint32_t lo = 0, hi = (uint32_t)o->blob.size();
+        if ((o->kind == K_D3D9VB || o->kind == K_D3D9IB) && !recomp_ab::old(recomp_ab::MIRRORS)) {
+            // Only the bytes the game changed go back and on to the GPU. A dynamic buffer is
+            // locked to append a few vertices at a time, and sending all of it each time has the
+            // browser's main thread write megabytes of unchanged geometry to the GPU a frame. The
+            // span is found by comparison rather than taken from the lock's range, so a write
+            // outside that range is still kept.
+            lo = first_difference(staged, o->blob.data(), lo, hi);
+            hi = end_of_difference(staged, o->blob.data(), lo, hi);
+            if (hi > lo) { // whole 4-byte words: GPU buffer writes take nothing smaller
+                lo &= ~3u;
+                hi = std::min<uint32_t>((hi + 3) & ~3u, (uint32_t)o->blob.size());
+            }
+        }
+        if (hi > lo)
+            memcpy(o->blob.data() + lo, staged + lo, hi - lo);
         heap_free(o->pixels);
         o->pixels = 0;
-        d9_raster_invalidate(o->id);
-        gpu_after_unlock(o, 0, (uint32_t)o->blob.size());
+        if (hi > lo) {
+            d9_raster_invalidate(o->id);
+            gpu_after_unlock(o, lo, hi);
+        }
     }
 }
 
@@ -1093,6 +1138,16 @@ static GpuMirrorTable &gpu_mirrors() {
     static auto *m = new GpuMirrorTable();
     return *m;
 }
+// A resource's mirror without indexing the table: the deque never moves a mirror, and gpu_forget
+// clears the cached pointer before it erases. RECOMP_AB_SWITCHES=mirrors (test only) takes the
+// table every time.
+static GpuMirror &mirror_of(ComObj *o) {
+    if (o->gpu_mirror && !recomp_ab::old(recomp_ab::MIRRORS))
+        return *static_cast<GpuMirror *>(o->gpu_mirror);
+    GpuMirror &m = gpu_mirrors()[o->id];
+    o->gpu_mirror = &m;
+    return m;
+}
 // D3DUSAGE of every texture and surface, by id.
 static std::unordered_map<uint32_t, uint32_t> &resource_usage() {
     static auto *m = new std::unordered_map<uint32_t, uint32_t>();
@@ -1152,7 +1207,7 @@ static ComObj *slot_surface(ComObj *o, uint32_t slot) {
 
 // Creates the mirror of a texture or stand-alone surface on first use.
 static GpuMirror &gpu_define(ComObj *o) {
-    GpuMirror &m = gpu_mirrors()[o->id];
+    GpuMirror &m = mirror_of(o);
     if (m.defined)
         return m;
     HostD9TextureDesc d{};
@@ -1223,7 +1278,11 @@ static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi) {
     if (!o)
         return;
     if (o->kind == K_D3D9VB || o->kind == K_D3D9IB) {
-        GpuMirror &m = gpu_mirrors()[o->id];
+        GpuMirror &m = mirror_of(o);
+        if (!m.defined) { // never uploaded: its first upload carries all of it
+            lo = 0;
+            hi = (uint32_t)o->blob.size();
+        }
         if (m.dirty_hi <= m.dirty_lo) {
             m.dirty_lo = lo;
             m.dirty_hi = hi;
@@ -1259,7 +1318,7 @@ static void gpu_drawn_into(ComObj *s) {
 static void gpu_sync_buffer(ComObj *b) {
     if (!b)
         return;
-    GpuMirror &m = gpu_mirrors()[b->id];
+    GpuMirror &m = mirror_of(b);
     if (!m.defined) {
         m.defined = true;
         m.dirty_lo = 0;
@@ -1273,6 +1332,7 @@ static void gpu_sync_buffer(ComObj *b) {
     m.dirty_lo = m.dirty_hi = 0;
 }
 static void gpu_forget(ComObj *o) {
+    o->gpu_mirror = nullptr;
     if (GpuMirror *it = gpu_mirrors().find(o->id)) {
         if (o->kind == K_D3D9VB || o->kind == K_D3D9IB)
             host_d9_buffer_drop(o->id);
@@ -1929,8 +1989,22 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
         pl.vs_key = d9sh::code_key(pl.vs.data(), pl.vs.size());
     if (!pl.ps_key)
         pl.ps_key = d9sh::code_key(pl.ps.data(), pl.ps.size());
-    const d9sh::Program &vs = d9sh::program_for_key(pl.vs_key, pl.vs.data(), pl.vs.size());
-    const d9sh::Program &ps = d9sh::program_for_key(pl.ps_key, pl.ps.data(), pl.ps.size());
+    // The decoded programs of the last keys asked for: program_for_key takes a lock and a hash
+    // lookup, and consecutive draws mostly keep their shaders. Its cache never erases, so the
+    // pointers stay valid.
+    thread_local uint64_t last_vs_key = 0, last_ps_key = 0;
+    thread_local const d9sh::Program *last_vs = nullptr, *last_ps = nullptr;
+    const bool lookup_always = recomp_ab::old(recomp_ab::MIRRORS);
+    if (!last_vs || last_vs_key != pl.vs_key || lookup_always) {
+        last_vs = &d9sh::program_for_key(pl.vs_key, pl.vs.data(), pl.vs.size());
+        last_vs_key = pl.vs_key;
+    }
+    if (!last_ps || last_ps_key != pl.ps_key || lookup_always) {
+        last_ps = &d9sh::program_for_key(pl.ps_key, pl.ps.data(), pl.ps.size());
+        last_ps_key = pl.ps_key;
+    }
+    const d9sh::Program &vs = *last_vs;
+    const d9sh::Program &ps = *last_ps;
     d.vs_key = pl.vs_key;
     d.ps_key = pl.ps_key;
     d.vs = pl.vs.data();

@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- In the browser the scheduler's import checkpoint reads the clock on every
+  256th import call, counted with a plain integer, instead of the adaptive
+  8-1024 stride with thread-local counters; a pinned clock keeps the adaptive
+  stride. The import dispatcher reads the log level once. Both have in-run A/B
+  switches (`RECOMP_AB_SWITCHES=stride,imports`) that take the earlier
+  behaviour during the A/B's earlier phase.
+- The translator emits LOCK XADD, LOCK CMPXCHG and XCHG with a memory operand
+  as host atomics (`runtime/x86.h` `recomp_lock_*`; a plain read and write at an
+  unaligned address, which WebAssembly cannot do atomically), and the
+  Interlocked* imports use the same atomics. Code decoded from bytes rather
+  than read from a listing keeps its LOCK prefix. Regenerate to pick it up.
+- Baton-free imports: a guest thread running free calls EnterCriticalSection,
+  TryEnterCriticalSection, LeaveCriticalSection, TlsGetValue/TlsSetValue,
+  GetCurrentThreadId, InterlockedIncrement/Decrement/Exchange,
+  QueryPerformanceCounter/Frequency, timeGetTime, Sleep and DirectSound
+  buffers' GetCurrentPosition, Lock and Unlock without taking the baton
+  (`imports_register_baton_free`). Critical sections take their owner word with
+  a compare-exchange, so an uncontended Enter or Leave no longer takes the
+  scheduler's mutex on any thread. A host whose time source services the host
+  installs a quiet version with `host_set_quiet_time_source`; until it does, a
+  free thread's clock reads take the baton.
+- Free run: a guest thread inside a function listed in `game.toml` `[hooks]
+  free_run` runs that function's guest code without the scheduler's baton,
+  beside the thread that holds it, as a sound mixer ran on its own core on
+  Windows. Imports take the baton back for their shims, mod hooks and guest
+  exceptions are dispatched holding it, and the baton-free imports run
+  without it. On by default in the browser; `RECOMP_FREE_RUN=1` enables it on
+  a native host, `RECOMP_FREE_RUN=0` turns it off, and
+  `RECOMP_FREE_RUN=<hex>,...` names the functions instead of the game's list.
+  Off with a pinned clock and in the in-run A/B's earlier phase
+  (`RECOMP_AB_SWITCHES=free`). `RECOMP_SCHED=parallel` (test only) runs every
+  worker free for its whole body.
+- The Direct3D 9 and WebGPU changes in the next six entries have in-run A/B
+  switches (`RECOMP_AB_SWITCHES=mirrors,webgpu`, `platform/ab_phase.h`) that
+  take the earlier behaviour during the A/B's earlier phase (the ring's
+  touched-span write and whole chunk allocation have none). Test only; a
+  normal run is unaffected.
+- The WebGPU renderer sets a draw's bind group through a small library
+  function (`web/player/webgpu-bind-group.js`) that passes the four dynamic
+  offsets as an array of their own instead of a view of the whole Wasm heap,
+  which Firefox rejects once the memory can grow past 2 GiB.
+- The WebGPU renderer sets the blend constant only when it changes within a
+  render pass, and a draw with the previous draw's shaders, vertex
+  declaration, strides and stream frequencies reuses its decoded programs and
+  vertex layout without a lookup.
+- The WebGPU renderer writes a texture level straight from the game's bytes
+  when they are already in WebGPU's layout (block-compressed rows without
+  padding, or an uncompressed level that needs no conversion or resizing),
+  instead of copying them into a scratch buffer first.
+- The Direct3D 9 WebGPU renderer reuses each of a draw's four uniform blocks
+  (vertex constants, vertex parameters, pixel constants, pixel parameters) on
+  its own when its bytes repeat the previous draw's, where it used to reuse
+  them only when all four did. At submit each ring chunk writes only the span
+  its draws touched, and a chunk's CPU copy is allocated whole once.
+- A Direct3D 9 draw finds each resource's GPU mirror through a pointer kept
+  with the object instead of the mirror table, and reuses the decoded vertex
+  and pixel programs of the previous draw when its shaders are the same.
+- Unlocking a Direct3D 9 vertex or index buffer sends on only the bytes the
+  game changed, found by comparing the locked copy with the buffer (eight
+  bytes a step, widened to whole 4-byte words). A dynamic buffer is locked to
+  append a few vertices at a time, and the whole buffer used to go to the GPU
+  each time. A buffer not yet on the GPU still goes whole.
+- A D3DX effect pool holds the value of each shared parameter, and each
+  effect's copy of a shared texture holds its own reference; `SetValue` on a
+  texture parameter now takes one as `SetTexture` does, so destroying effects
+  no longer releases a texture more often than it was referenced. A write is
+  still copied into every effect of the pool at once: taking it lazily, when
+  an effect next reads the parameter, broke Need for Speed: Most Wanted's
+  shadows and left blurry textures in races.
+- A D3DX effect keeps the records of the last two programs it bound, so a
+  `CommitChanges` finds the vertex and pixel shader's constant table without
+  a lookup by key; a preshader's inputs were already kept with it. A
+  sampler's texture parameter is resolved again only when the effect's
+  parameter count or the sampler's own value changes.
+- The D3DX changes above and the incremental effect constant binding each
+  have an in-run A/B switch (`RECOMP_AB_SWITCHES=consts,sampler,preshader`,
+  `platform/ab_phase.h`) that runs the earlier behaviour during
+  the A/B's earlier phase. Test only; a normal run is unaffected.
 - The Direct3D 9 WebGPU renderer binds only what changed within a render
   pass: a draw with the same vertex buffers, index buffer or bind group and
   offsets as the one before makes no call for them, and identical shader

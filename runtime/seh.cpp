@@ -7,6 +7,8 @@
 #include "profile.h"
 // kernel32.cpp: a guest exception unwinding past an atomic stretch ends it.
 void sched_atomic_unwind_to_esp(uint32_t esp);
+// kernel32.cpp (win32.h): a guest exception is dispatched holding the baton.
+uint32_t sched_free_run_leave();
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -438,6 +440,10 @@ void recomp_seh_reset(X86 *c) {
 }
 
 int recomp_seh_raise(X86 *c, uint32_t code, uint32_t flags, uint32_t nargs, uint32_t args) {
+    // The dispatch keeps runtime state and calls handlers that may reach any of it, so a guest
+    // thread running free (win32.h) takes the baton first, and keeps it for the rest of its
+    // free-run function. A no-op on any other thread.
+    sched_free_run_leave();
     recomp_seh_validate_chain(c, "raise", "");
     X86 saved = *c;
     if (nargs > 15)

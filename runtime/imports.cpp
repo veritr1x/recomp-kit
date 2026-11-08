@@ -11,8 +11,13 @@
 // Defined in kernel32.cpp with the scheduler.
 void sched_checkpoint();
 #include "memory.h"
+#include "win32.h"
+#include "../platform/ab_phase.h"
+#include "../platform/os.h"
 
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <cctype>
 #include <vector>
@@ -31,6 +36,8 @@ struct Tramp {
     uint32_t calls = 0;
     // Entered without a scheduling checkpoint (see atomic_import).
     bool atomic = false;
+    // Held around the shim as well as the baton (imports_serialize_dll).
+    std::recursive_mutex *serial = nullptr;
 };
 
 // Imports whose callers have just set up state the call reads back, with no
@@ -74,6 +81,29 @@ std::map<std::string, DataImport> &data_imports() {
     return *m;
 }
 
+// Baton-free shims (imports_register_baton_free), by key: the free version and the shim it
+// stands for, so a trampoline whose shim has since been replaced does not use it.
+struct FreeEntry {
+    bool (*fn)(X86 *) = nullptr;
+    void (*shim)(X86 *) = nullptr;
+};
+std::map<std::string, FreeEntry> &free_registry() {
+    static auto *m = new std::map<std::string, FreeEntry>();
+    return *m;
+}
+std::map<std::string, std::recursive_mutex *> &serialized_dlls() {
+    static auto *m = new std::map<std::string, std::recursive_mutex *>();
+    return *m;
+}
+// The same, per trampoline, for the dispatcher. A thread running free reads these while the
+// baton holder may be allocating trampolines, which moves tramps(); this table never moves.
+// A slot's argument count is stored before its function, which is published with release.
+struct FreeSlot {
+    std::atomic<bool (*)(X86 *)> fn{nullptr};
+    std::atomic<uint8_t> argc{0};
+};
+FreeSlot g_free_slots[TRAMP_MAX];
+
 std::string lower_dll(const char *dll) {
     std::string k(dll ? dll : "");
     std::transform(k.begin(), k.end(), k.begin(),
@@ -108,6 +138,22 @@ uint8_t decorated_stdcall_args(const char *name) {
     return bytes % 4 ? ARGC_UNKNOWN : uint8_t(bytes / 4);
 }
 
+// Publishes (or withdraws) trampoline `idx`'s baton-free version. Called holding the baton,
+// wherever its shim or the registry may have changed.
+void free_slot_update(uint32_t idx, const std::string &key) {
+    if (idx >= TRAMP_MAX || idx >= tramps().size())
+        return;
+    const Tramp &t = tramps()[idx];
+    auto fi = free_registry().find(key);
+    if (fi == free_registry().end() || !t.fn || t.fn != fi->second.shim ||
+        t.argc == ARGC_UNKNOWN) {
+        g_free_slots[idx].fn.store(nullptr, std::memory_order_release);
+        return;
+    }
+    g_free_slots[idx].argc.store(t.argc, std::memory_order_relaxed);
+    g_free_slots[idx].fn.store(fi->second.fn, std::memory_order_release);
+}
+
 } // namespace
 
 void imports_register(const ImportShim *shims, size_t count) {
@@ -127,8 +173,39 @@ void imports_register(const ImportShim *shims, size_t count) {
             if (s.fn)
                 t.fn = s.fn;
             t.argc = s.argc_stdcall;
+            free_slot_update(ti->second, k);
         }
     }
+}
+
+void imports_register_baton_free(const ImportFreeShim *shims, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const std::string k = key_of(shims[i].dll, shims[i].name);
+        auto ri = registry().find(k);
+        if (!shims[i].fn || ri == registry().end() || !ri->second.fn)
+            continue; // stands for no shim
+        free_registry()[k] = FreeEntry{shims[i].fn, ri->second.fn};
+        auto ti = index().find(k);
+        if (ti != index().end())
+            free_slot_update(ti->second, k);
+    }
+}
+
+void imports_register_baton_free_method(const char *dll, const char *name, bool (*fn)(X86 *),
+                                        void (*shim)(X86 *)) {
+    const std::string k = key_of(dll, name);
+    free_registry()[k] = FreeEntry{fn, shim};
+    auto ti = index().find(k);
+    if (ti != index().end())
+        free_slot_update(ti->second, k);
+}
+
+void imports_serialize_dll(const char *dll, std::recursive_mutex *m) {
+    const std::string d = lower_dll(dll);
+    serialized_dlls()[d] = m;
+    for (Tramp &t : tramps())
+        if (lower_dll(t.dll.c_str()) == d)
+            t.serial = m;
 }
 
 bool imports_has_dll(const char *dll_lower) {
@@ -144,12 +221,18 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
         if (fn) {
             t.fn = fn;
             t.argc = argc_stdcall;
+            free_slot_update(it->second, k);
         }
         return TRAMP_BASE + TRAMP_STRIDE * it->second;
     }
 
     Tramp t;
     t.atomic = atomic_import(k);
+    {
+        auto si = serialized_dlls().find(lower_dll(dll));
+        if (si != serialized_dlls().end())
+            t.serial = si->second;
+    }
     t.dll = dll ? dll : "?";
     t.name = name ? name : "?";
     t.desc = t.dll + "!" + t.name;
@@ -180,6 +263,7 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
     }
     tramps().push_back(t);
     index()[k] = idx;
+    free_slot_update(idx, k);
     return TRAMP_BASE + TRAMP_STRIDE * idx;
 }
 
@@ -434,7 +518,88 @@ void imports_call_leaves_surfaces() {
     --g_import_calls;
 }
 
+static bool imports_dispatch_holding(X86 *c, uint32_t target);
+
+// RECOMP_FREE_RUN_STATS=1: every 5 s, the imports a thread running free made holding the
+// baton, most frequent first - what is left to make baton-free (imports_register_baton_free).
+// Called holding the baton (just before the call it counts).
+static void free_fallback_note(uint32_t target) {
+    static const bool on = recomp_env("FREE_RUN_STATS") != nullptr;
+    if (!on)
+        return;
+    static std::map<uint32_t, uint32_t> counts;
+    static uint64_t from = 0;
+    ++counts[target];
+    const uint64_t now = os_monotonic_ns();
+    if (!from)
+        from = now;
+    if (now - from < 5000000000ull)
+        return;
+    std::vector<std::pair<uint32_t, uint32_t>> v(counts.begin(), counts.end());
+    std::sort(v.begin(), v.end(),
+              [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b) {
+                  return a.second > b.second;
+              });
+    char line[768];
+    int n = snprintf(line, sizeof line, "free run: imports taking the baton, last %.1f s:",
+                     (now - from) * 1e-9);
+    for (size_t i = 0; i < v.size() && i < 8 && n > 0 && n < (int)sizeof line - 96; ++i) {
+        const char *name = imports_describe(v[i].first);
+        n += snprintf(line + n, sizeof line - n, " %s %u;", name ? name : "?", v[i].second);
+    }
+    LOGW("%s", line);
+    counts.clear();
+    from = now;
+}
+
+// A thread running free calls a baton-free shim directly (imports_register_baton_free): no
+// baton, no scheduling checkpoint (a free thread has nothing to yield) and no per-import
+// counts (they are the baton holder's). Not while a call observer watches: it expects to see
+// every call. The return observer is not told: it reports the DirectX layer's failures
+// (dx.cpp), and no baton-free shim returns one. False when the import has none, or its shim
+// needs the baton for this call.
+static bool imports_dispatch_free(X86 *c, uint32_t target) {
+    const uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
+    if (idx >= TRAMP_MAX || g_call_observer)
+        return false;
+    bool (*fn)(X86 *) = g_free_slots[idx].fn.load(std::memory_order_acquire);
+    if (!fn)
+        return false;
+    const uint32_t ret_addr = rd32(c->r[R_ESP]);
+    if (!fn(c))
+        return false;
+    const uint8_t argc = g_free_slots[idx].argc.load(std::memory_order_relaxed);
+    c->r[R_ESP] += argc == ARGC_CDECL ? 4u : 4u + 4u * argc;
+    c->eip = ret_addr;
+    return true;
+}
+
+// Every shim assumes the baton, and a guest thread running free (win32.h free run) holds
+// none: unless the import has a baton-free version, it takes the baton for the call and,
+// while the stack is still inside the free-run function (below its entry ESP), runs free
+// again afterwards.
 bool imports_dispatch(X86 *c, uint32_t target) {
+    if (RECOMP_UNLIKELY(sched_free_running()) && imports_is_trampoline(target)) {
+        if (imports_dispatch_free(c, target))
+            return true;
+        const uint32_t entry_esp = sched_free_run_leave();
+        free_fallback_note(target);
+        const bool done = imports_dispatch_holding(c, target);
+        if (entry_esp && c->r[R_ESP] < entry_esp)
+            sched_free_run_enter(entry_esp);
+        sched_parallel_rejoin();
+        return done;
+    }
+    const bool done = imports_dispatch_holding(c, target);
+    // RECOMP_SCHED=parallel: a worker that held the baton runs free again. The mode is fixed
+    // at start, so the call is made only when it is on.
+    static const bool parallel = sched_parallel();
+    if (RECOMP_UNLIKELY(parallel))
+        sched_parallel_rejoin();
+    return done;
+}
+
+static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     if (!imports_is_trampoline(target))
         return false;
     // A bounded scheduling checkpoint. Cooperative threads must not depend on
@@ -448,9 +613,10 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // The table object stays put; only its elements move when a shim adds a
     // trampoline, so it is indexed afresh after the call rather than held.
     std::vector<Tramp> &table = tramps();
-    // Tracing and chain validation only run at log level 2; asking once
-    // saves three calls on every import.
-    const bool verbose = log_level() >= 2;
+    // Tracing and chain validation only run at log level 2. The level is read once
+    // (memory.cpp caches it at first use and it never changes), so no call is made for it
+    // on each of the tens of thousands of imports a frame.
+    static const bool verbose = log_level() >= 2;
     if (idx >= table.size() || !table[idx].atomic)
         sched_checkpoint();
     if (idx >= table.size()) {
@@ -483,6 +649,18 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         log_msg(2, "-> %s (esp=%08x ret=%08x)", desc_now(), c->r[R_ESP], ret_addr);
         recomp_seh_validate_chain(c, "import enter", desc_now());
     }
+    // TEST ONLY: the earlier phase of an in-run A/B (RECOMP_AB_PERIOD, platform/ab_phase.h)
+    // repeats the per-call work this replaced - a copy of the name, the level reads and the
+    // chain-check calls - so the two can be compared on the same scene.
+    char ab_desc[512];
+    const bool ab_old = recomp_ab::old(recomp_ab::IMPORTS);
+    if (RECOMP_UNLIKELY(ab_old)) {
+        const size_t n = std::min(table[idx].desc.size(), sizeof ab_desc - 1);
+        memcpy(ab_desc, table[idx].desc.data(), n);
+        ab_desc[n] = '\0';
+        LOGV("-> %s (esp=%08x ret=%08x)", ab_desc, c->r[R_ESP], ret_addr);
+        recomp_seh_validate_chain(c, "import enter", ab_desc);
+    }
 
     // The arguments as they are NOW, before the shim runs: a stdcall shim pops
     // them, so after the call they are gone and this is the only point they
@@ -509,7 +687,22 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     if (skip) {
         // The observer refused the call and has set the result itself.
     } else if (fn) {
+        // No lock_guard: a guest exception may longjmp across fn(c) (above). A serialized
+        // DLL's shims check their pointers and raise none. Under RECOMP_SCHED=parallel the
+        // nest says that host code holding the baton is on this stack (win32.h
+        // sched_nest_enter); an exception that skips its leave lands above this ESP and
+        // closes it there.
+        static const bool parallel = sched_parallel();
+        std::recursive_mutex *serial = table[idx].serial;
+        if (serial)
+            serial->lock();
+        if (RECOMP_UNLIKELY(parallel))
+            sched_nest_enter(c->r[R_ESP]);
         fn(c);
+        if (RECOMP_UNLIKELY(parallel))
+            sched_nest_leave();
+        if (serial)
+            serial->unlock();
     } else {
         log_once(desc_now(), "unimplemented import %s: returning 0", desc_now());
         set_eax(c, 0);
@@ -521,6 +714,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         g_return_observer(desc_now(), c->r[R_EAX]);
     if (verbose)
         log_msg(2, "<- %s (eax=%08x)", desc_now(), c->r[R_EAX]);
+    if (RECOMP_UNLIKELY(ab_old))
+        LOGV("<- %s (eax=%08x)", ab_desc, c->r[R_EAX]);
     current_import_target = previous_import;
 
     uint32_t pop = 4;
@@ -541,6 +736,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     c->eip = ret_addr;
     if (verbose)
         recomp_seh_validate_chain(c, "import leave", desc_now());
+    if (RECOMP_UNLIKELY(ab_old))
+        recomp_seh_validate_chain(c, "import leave", ab_desc);
     return true;
 }
 
@@ -657,4 +854,7 @@ void imports_init() {
     gdi::register_text();
     extern void msimg32_register();
     msimg32_register();
+    // Last: each stands for the shim registered by then.
+    imports_register_baton_free(g_kernel32_free_shims, g_kernel32_free_shim_count);
+    imports_register_baton_free(g_misc_free_shims, g_misc_free_shim_count);
 }

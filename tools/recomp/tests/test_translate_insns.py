@@ -554,6 +554,30 @@ CASES = [
     Case("EMMS changes no integer registers or flags", 0x0D028000,
          [(0x0, "CMP ESI,EBP"), (0x2, "EMMS"), (0x4, "RET")],
          "39 EE  0F 77  C3", lambda rng: {"regs": rand_regs(rng)}),
+    # Locked forms are host atomics (x86.h recomp_lock_*); an unaligned address keeps the
+    # plain read and write, since WebAssembly has no unaligned atomics.
+    Case("LOCK XADD on a byte, an unaligned word and an unaligned dword", 0x0D02E400,
+         [(0x0, "XADD.LOCK byte ptr [ECX],DL"), (0x4, "XADD.LOCK word ptr [ECX + 0x3],DX"),
+          (0xa, "XADD.LOCK dword ptr [ECX + 0x5],EBX"), (0xf, "RET")],
+         "F0 0F C0 11  66 F0 0F C1 51 03  F0 0F C1 59 05  C3",
+         lambda rng: {"regs": rand_regs(rng, ECX=SCRATCH + 0x40),
+                      "mem": [(SCRATCH + 0x40, rng.getrandbits(128).to_bytes(16, "little"))]}),
+    Case("LOCK XADD on an aligned dword", 0x0D02E500,
+         [(0x0, "XADD.LOCK dword ptr [ECX + 0x8],EDX"), (0x5, "RET")],
+         "F0 0F C1 51 08  C3",
+         lambda rng: {"regs": rand_regs(rng, ECX=SCRATCH + 0x40),
+                      "mem": [(SCRATCH + 0x40, rng.getrandbits(128).to_bytes(16, "little"))]}),
+    Case("XCHG with memory on a byte and an unaligned dword", 0x0D02E600,
+         [(0x0, "XCHG byte ptr [ECX],DL"), (0x2, "XCHG dword ptr [ECX + 0x6],EBX"), (0x5, "RET")],
+         "86 11  87 59 06  C3",
+         lambda rng: {"regs": rand_regs(rng, ECX=SCRATCH + 0x40),
+                      "mem": [(SCRATCH + 0x40, rng.getrandbits(128).to_bytes(16, "little"))]}),
+    Case("LOCK CMPXCHG on a word stores on a match and loads AX otherwise", 0x0D02E800,
+         [(0x0, "CMPXCHG.LOCK word ptr [ECX],DX"), (0x5, "SETZ BL"), (0x8, "RET")],
+         "66 F0 0F B1 11  0F 94 C3  C3",
+         lambda rng: (lambda mem: {"regs": rand_regs(rng, ECX=SCRATCH + 0x40,
+                                                   EAX=mem if rng.random() < 0.5 else rng.getrandbits(32)),
+                                   "mem": [(SCRATCH + 0x40, struct.pack("<I", mem))]})(rng.getrandbits(32))),
 ]
 
 

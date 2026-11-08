@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -205,6 +206,10 @@ void recomp_shim_call(X86 *c, uint32_t target) {
 void recomp_unknown_call(X86 *c, uint32_t target) {
     if (recomp_run_thunk(c, target))
         return;
+    // Everything below - the interpreter, the discovery report, a raised fault, the logs -
+    // keeps runtime state that belongs to the baton holder: a thread running free (win32.h)
+    // takes the baton for the rest of its free-run function.
+    sched_free_run_leave();
     // Code no translation covers runs in the interpreter when every
     // instruction in it decodes: code the guest built or copied into its heap
     // at run time, and code inside the image that discovery missed. The
@@ -351,14 +356,32 @@ void recomp_breakpoint(X86 *c, uint32_t addr) {
 
 // A monotonically increasing cycle counter derived from the millisecond clock,
 // so repeated runs see the same ordering.
+//
+// A guest thread running free (win32.h free run) reads it without the baton, and a host's
+// time source may service the host on a read, which belongs to the baton holder: such a
+// thread reads the same clock quietly (host_millis_quiet), or, on a host that has no quiet
+// version of its clock, the monotonic clock counted from the first such read. The counter is
+// shared by every guest thread, so it moves with a compare-and-swap, and never backwards
+// whichever clock a read took.
 void recomp_rdtsc(X86 *c) {
-    static uint64_t tsc = 0;
-    uint64_t from_ms = (uint64_t)host_millis() * 1000000ull;
-    if (from_ms > tsc)
-        tsc = from_ms;
-    tsc += 1000;
-    c->r[R_EAX] = (uint32_t)tsc;
-    c->r[R_EDX] = (uint32_t)(tsc >> 32);
+    static std::atomic<uint64_t> tsc{0};
+    uint64_t from_ms;
+    if (RECOMP_UNLIKELY(sched_free_running())) {
+        uint32_t ms;
+        if (!host_millis_quiet(&ms)) {
+            static const uint64_t start_ns = os_monotonic_ns();
+            ms = (uint32_t)((os_monotonic_ns() - start_ns) / 1000000ull);
+        }
+        from_ms = (uint64_t)ms * 1000000ull;
+    } else {
+        from_ms = (uint64_t)host_millis() * 1000000ull;
+    }
+    uint64_t now = tsc.load(std::memory_order_relaxed), next;
+    do {
+        next = (from_ms > now ? from_ms : now) + 1000;
+    } while (!tsc.compare_exchange_weak(now, next, std::memory_order_relaxed));
+    c->r[R_EAX] = (uint32_t)next;
+    c->r[R_EDX] = (uint32_t)(next >> 32);
 }
 
 // Deterministic CPUID per the plan: GenuineIntel, family 6, model 3, and only

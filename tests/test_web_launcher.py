@@ -96,7 +96,8 @@ class WebLauncherTests(unittest.TestCase):
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not installed")
-        run = subprocess.run([node, "--test", *map(str, sorted((ROOT / "web/launcher/tests").glob("*.test.mjs")))],
+        suites = [ROOT / "web/launcher/tests", ROOT / "web/player/tests"]
+        run = subprocess.run([node, "--test", *map(str, sorted(p for d in suites for p in d.glob("*.test.mjs")))],
                              capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 

@@ -126,6 +126,19 @@ polls, the 4096-edge budget, atomic protection, host-thread exclusion, a
 handoffs. `test_translate_backedge.py` checks branch/dispatch emission and
 that generated local gotos share one helper.
 
+`lock_tests` (`nogame`) checks the host atomics behind LOCK XADD, LOCK
+CMPXCHG, XCHG with memory and Interlocked* (`runtime/x86.h` `recomp_lock_*`)
+at every width, the plain fallback at an unaligned address, and that threads
+contending on them lose no update; and critical-section ownership by
+compare-exchange (`runtime/critsec.h`) under contention.
+`test_translate_locked.py` checks that the translator emits those atomics for
+the locked forms only, and that capstone-decoded code keeps the LOCK prefix.
+`runtime_tests` checks free run (`runtime/win32.h`): a worker running free
+regains the baton whether the main thread is runnable or blocked, and makes
+the baton-free imports (critical sections, TLS, Interlocked, the clock, Sleep)
+while the main thread holds the baton, with a critical section passing
+between the two in both directions.
+
 `return_jump_tests` compiles a synthetic variadic helper with the production
 translator. It checks that argument cleanup returns to a callable continuation
 exactly once, even with an interior entry that has a different stack contract;

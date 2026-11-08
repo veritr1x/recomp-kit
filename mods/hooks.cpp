@@ -24,9 +24,13 @@
 #include "../runtime/mods_seam.h"
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
+#include "../platform/os.h"
+#include "game_config.h"
 
 #include <deque>
+#include <map>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 #include <algorithm>
@@ -103,6 +107,22 @@ Entry &entry_for(int32_t index) {
     if (entries().size() < (size_t)recomp_func_count)
         entries().resize(recomp_func_count);
     return entries()[index];
+}
+
+// Free-run functions (game.toml [hooks] free_run): their call sites dispatch through
+// free_run_dispatch, which a reset does not take away. mod_hooked says whether a mod has
+// hooks on the function too, read by that dispatcher without the registry lock. Both are
+// sized once, before guest entry (install_free_run_locked), so a reader never sees them move.
+std::vector<uint8_t> &free_run_flags() {
+    static std::vector<uint8_t> v;
+    return v;
+}
+std::vector<uint8_t> &mod_hooked_flags() {
+    static std::vector<uint8_t> v;
+    return v;
+}
+bool is_free_run(int32_t index) {
+    return index >= 0 && (size_t)index < free_run_flags().size() && free_run_flags()[index];
 }
 
 } // namespace
@@ -396,9 +416,68 @@ bool inv_is_live(const PopHookInvocation *inv) {
 }
 } // namespace
 
+static void mods_hook_dispatch_holding(X86 *c, uint32_t index);
+
+// RECOMP_FREE_RUN_STATS=1: every 5 s, the hooked functions a thread running free called, most
+// frequent first (each one takes the baton for its dispatch). Called holding the baton.
+static void free_hook_note(uint32_t index) {
+    static const bool on = recomp_env("FREE_RUN_STATS") != nullptr;
+    if (!on)
+        return;
+    static std::map<uint32_t, uint32_t> counts;
+    static uint64_t from = 0;
+    ++counts[recomp_func_addrs[index]];
+    const uint64_t now = os_monotonic_ns();
+    if (!from)
+        from = now;
+    if (now - from < 5000000000ull)
+        return;
+    std::vector<std::pair<uint32_t, uint32_t>> v(counts.begin(), counts.end());
+    std::sort(v.begin(), v.end(),
+              [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b) {
+                  return a.second > b.second;
+              });
+    char line[512];
+    int n = snprintf(line, sizeof line, "free run: hooked functions taking the baton, last %.1f s:",
+                     (now - from) * 1e-9);
+    for (size_t i = 0; i < v.size() && i < 10 && n > 0 && n < (int)sizeof line - 32; ++i)
+        n += snprintf(line + n, sizeof line - n, " %08x %u;", v[i].first, v[i].second);
+    LOGW("%s", line);
+    counts.clear();
+    from = now;
+}
+
+// Mod callbacks may touch anything, so they always run holding the baton: a guest thread
+// running free (a free-run function, or any worker under RECOMP_SCHED=parallel) takes it for
+// the whole dispatch, and runs free again after while its stack is still inside the free-run
+// function. Under RECOMP_SCHED=parallel the dispatch is a nest (win32.h sched_nest_enter): a
+// callback that calls guest code back must find the baton held when that code returns.
+static void mods_hook_dispatch(X86 *c, uint32_t index) {
+    static const bool parallel = sched_parallel();
+    if (RECOMP_UNLIKELY(sched_free_running())) {
+        const uint32_t entry_esp = sched_free_run_leave();
+        free_hook_note(index);
+        if (parallel)
+            sched_nest_enter(c->r[R_ESP]);
+        mods_hook_dispatch_holding(c, index);
+        if (parallel)
+            sched_nest_leave();
+        if (entry_esp && c->r[R_ESP] < entry_esp)
+            sched_free_run_enter(entry_esp);
+    } else if (RECOMP_UNLIKELY(parallel)) {
+        sched_nest_enter(c->r[R_ESP]);
+        mods_hook_dispatch_holding(c, index);
+        sched_nest_leave();
+    } else {
+        mods_hook_dispatch_holding(c, index);
+    }
+    if (RECOMP_UNLIKELY(parallel))
+        sched_parallel_rejoin();
+}
+
 // Dispatch one guest function through a stable snapshot of its hook chain.
 // Unwind abandoned invocations first; edits made by callbacks affect later calls, not this snapshot.
-static void mods_hook_dispatch(X86 *c, uint32_t index) {
+static void mods_hook_dispatch_holding(X86 *c, uint32_t index) {
     // A guest longjmp may have jumped over invocations left on this thread.
     mods_hooks_unwind_to_esp(c->r[R_ESP]);
     if (t_stack.depth >= MODS_MAX_DEPTH) {
@@ -506,6 +585,22 @@ static void mods_hook_dispatch(X86 *c, uint32_t index) {
     }
 }
 
+// Free run: the thread runs the original without the baton (win32.h sched_free_run_enter),
+// beside whichever guest thread holds it. Imports made inside take the baton back for the
+// shim's duration (imports_dispatch). A mod hooking the same function is dispatched as any
+// hook is, holding the baton, because a callback may touch anything.
+static void free_run_dispatch(X86 *c, uint32_t index) {
+    if (index < mod_hooked_flags().size() &&
+        __atomic_load_n(&mod_hooked_flags()[index], __ATOMIC_ACQUIRE)) {
+        mods_hook_dispatch(c, index);
+        return;
+    }
+    const bool free = sched_free_run_enter(c->r[R_ESP]);
+    recomp_base_ptrs[index](c);
+    if (free)
+        sched_free_run_leave();
+}
+
 // ---------------------------------------------------------------- registry
 
 namespace {
@@ -532,12 +627,16 @@ void apply_pending_locked();
 namespace {
 
 void publish(int32_t index) {
-    Entry &e = entries()[index];
+    Entry &e = entry_for(index);
     bool any = !e.before.empty() || !e.after.empty() || !e.replace.empty();
-    if (any) {
+    if ((size_t)index < mod_hooked_flags().size())
+        __atomic_store_n(&mod_hooked_flags()[index], (uint8_t)any, __ATOMIC_RELEASE);
+    if (any || is_free_run(index)) {
         // Pointer first, then the flag, both with release: a call site that
         // sees the flag is guaranteed to see the pointer.
-        __atomic_store_n(&recomp_hook_ptrs[index], (RecompHookFn)mods_hook_dispatch,
+        __atomic_store_n(&recomp_hook_ptrs[index],
+                         is_free_run(index) ? (RecompHookFn)free_run_dispatch
+                                            : (RecompHookFn)mods_hook_dispatch,
                          __ATOMIC_RELEASE);
         __atomic_store_n(&recomp_hooked[index], (uint8_t)1, __ATOMIC_RELEASE);
     } else {
@@ -716,7 +815,13 @@ void apply_reset_tables() {
         entries()[i] = Entry();
         if (i < (size_t)recomp_func_count)
             __atomic_store_n(&recomp_hooked[i], (uint8_t)0, __ATOMIC_RELEASE);
+        if (i < mod_hooked_flags().size())
+            __atomic_store_n(&mod_hooked_flags()[i], (uint8_t)0, __ATOMIC_RELEASE);
     }
+    // A reset takes the mods' hooks away, not the game's free-run functions.
+    for (size_t i = 0; i < free_run_flags().size(); ++i)
+        if (free_run_flags()[i])
+            publish((int32_t)i);
     pending().clear();
     order_of_owner().clear();
     cpu_size_of_owner().clear();
@@ -913,6 +1018,60 @@ void apply_pending_locked() {
 }
 } // namespace
 
+// Publishes the game's free-run functions (game.toml [hooks] free_run, win32.h). Under the
+// registry lock, before guest entry, like the queued installs beside it, so the flag tables are
+// sized before any thread reads them. RECOMP_FREE_RUN=0 leaves them as plain calls, and
+// RECOMP_FREE_RUN=<hex>[,<hex>...] names the functions instead of the game's list, to try one
+// without editing it. Measured in the browser build only so far: elsewhere the game's list
+// applies when RECOMP_FREE_RUN=1 asks for it.
+static void install_free_run_locked() {
+    if (!free_run_flags().empty())
+        return; // once: the tables never move after guest entry
+    const char *env = recomp_env("FREE_RUN");
+    if (env && !strcmp(env, "0"))
+        return;
+    if (!os_monotonic_is_costly() && (!env || !*env))
+        return;
+    if (env && !strcmp(env, "1"))
+        env = nullptr; // the game's own list
+    std::vector<uint32_t> addrs;
+    if (env && *env) {
+        for (const char *p = env; *p;) {
+            char *end = nullptr;
+            const unsigned long v = strtoul(p, &end, 16);
+            if (end == p)
+                break;
+            addrs.push_back((uint32_t)v);
+            p = *end ? end + 1 : end;
+        }
+    } else {
+#if defined(RECOMP_HOOK_FREE_RUN_COUNT) && RECOMP_HOOK_FREE_RUN_COUNT > 0
+        static const uint32_t config[] = RECOMP_HOOK_FREE_RUN;
+        addrs.assign(config, config + sizeof config / sizeof config[0]);
+#endif
+    }
+    if (addrs.empty())
+        return;
+    free_run_flags().assign(recomp_func_count, 0);
+    if (mod_hooked_flags().size() < (size_t)recomp_func_count)
+        mod_hooked_flags().resize(recomp_func_count);
+    for (size_t i = 0; i < entries().size() && i < mod_hooked_flags().size(); ++i) {
+        const Entry &e = entries()[i];
+        mod_hooked_flags()[i] = !e.before.empty() || !e.after.empty() || !e.replace.empty();
+    }
+    for (uint32_t addr : addrs) {
+        const int32_t index = recomp_index_of(addr);
+        if (index < 0) {
+            LOGW("mods: free-run function %08x is not a translated function; it keeps the baton",
+                 addr);
+            continue;
+        }
+        free_run_flags()[index] = 1;
+        publish(index);
+        LOGW("mods: %08x runs without the guest baton (free run)", addr);
+    }
+}
+
 // Applies the queue once, before the guest entry point runs.
 //
 // A hook installed during pop_mod_init is queued, because the thread running
@@ -941,8 +1100,10 @@ void mods_registry_pump_preentry(void) {
     // monotone, which is what makes this one-shot in the way that matters -
     // once the guest is running, no later call can ever be granted.
     bool safe = !sched_guest_entry_begun_locked() && sched_guest_threads_stopped_locked();
-    if (safe)
+    if (safe) {
         apply_pending_locked();
+        install_free_run_locked();
+    }
     sched_registry_unlock();
     if (!safe)
         LOGW("mods: pre-entry pump asked for after guest entry or while a guest "

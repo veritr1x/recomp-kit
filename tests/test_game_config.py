@@ -483,6 +483,31 @@ class LoadTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     game_config.load(game)
 
+    def test_free_run_functions(self):
+        """[hooks] free_run lists the functions that run without the baton (runtime/win32.h)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text(encoding="utf-8")
+            (game / "globals.toml").write_text("", encoding="utf-8")
+
+            def load(value):
+                (game / "game.toml").write_text(stub.replace("[hooks]\n", "[hooks]\nfree_run = %s\n" % value),
+                                                encoding="utf-8")
+                return game_config.load(game)
+
+            cfg = load("[0x00401100, 0x00401200]")
+            self.assertEqual(cfg["hooks"]["free_run"], [0x00401100, 0x00401200])
+            header = gen_game_config.render_header(cfg)
+            self.assertIn("#define RECOMP_HOOK_FREE_RUN_COUNT 2", header)
+            self.assertIn("#define RECOMP_HOOK_FREE_RUN {0x00401100u, 0x00401200u}", header)
+            self.assertIn("#define RECOMP_HOOK_FREE_RUN_COUNT 0", gen_game_config.render_header(load("[]")))
+            for bad in ("0x00401100", "[0]", "[0x100000000]", '["0x401100"]', "[0x00401100, 0x00401100]"):
+                with self.assertRaises(ValueError, msg=bad) as caught:
+                    load(bad)
+                self.assertIn("free_run", str(caught.exception))
+        # Absent, nothing is rendered: the kit's hooks.cpp then lists no function.
+        self.assertNotIn("RECOMP_HOOK_FREE_RUN", gen_game_config.render_header(game_config.load(ROOT / "games/stub")))
+
     def test_missing_key_is_an_error_naming_the_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)

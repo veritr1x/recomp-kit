@@ -1655,10 +1655,16 @@ class Image(object):
         if words[0] in self.REP_PREFIX:
             rep = self.REP_PREFIX[words[0]]
             words = words[1:]
+        elif words[0] == "lock":
+            # Kept as the listing spells it (XADD.LOCK), with its operands:
+            # the locked forms become host atomics (x86.h recomp_lock_*).
+            rep = "LOCK"
+            words = words[1:]
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
         ops = [self._op_text(ci, o, mnem) for o in ci.operands]
-        if rep or (mnem in Translator.STRING_MNEM and not any(XMM_RE.match(o) for o in ops)):
+        if (rep and rep != "LOCK") or (mnem in Translator.STRING_MNEM
+                                       and not any(XMM_RE.match(o) for o in ops)):
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (ci.address, mnem, "." + rep if rep else "",
                                  (" " + ",".join(ops)) if ops else "")
@@ -3837,6 +3843,18 @@ class Translator(object):
             L.append(write_op(dst, dst.size, val))
             return L
 
+        if m == "XCHG" and (ops[0].kind == "mem" or ops[1].kind == "mem"):
+            # x86 locks every XCHG with memory: a host atomic exchange (x86.h
+            # recomp_lock_xchg), so a guest thread running free beside the baton
+            # holder (win32.h free run) sees it whole.
+            size = operand_size(ops)
+            mem, reg = (ops[0], ops[1]) if ops[0].kind == "mem" else (ops[1], ops[0])
+            L.append("uint32_t ad_ = %s;" % addr_expr(mem))
+            L.append("uint32_t t_ = recomp_lock_xchg%d(ad_, (%s)(%s));"
+                     % (size, utype(size), read_op(reg, size)))
+            L.append(write_op(reg, size, "t_"))
+            return L
+
         if m == "XCHG":
             size = operand_size(ops)
             a, b = ops
@@ -3846,9 +3864,28 @@ class Translator(object):
             L.append(write_op(b, size, "t_"))
             return L
 
+        if m == "CMPXCHG" and ins.rep == "LOCK" and ops[0].kind == "mem":
+            # A host compare-exchange (x86.h recomp_lock_cmpxchg): threads running
+            # free beside the baton holder rely on it. Flags come from
+            # accumulator - old value, as on the plain path.
+            size = operand_size(ops)
+            dst, src = ops
+            L.append("uint32_t ad_ = %s;" % addr_expr(dst))
+            L.append("uint32_t a_ = c->r[0] & %s, s_ = %s;"
+                     % (hexlit(mask_of(size)), read_op(src, size)))
+            L.append("uint32_t b_ = recomp_lock_cmpxchg%d(ad_, (%s)a_, (%s)s_);"
+                     % (size, utype(size), utype(size)))
+            L.append("uint64_t rf_ = (uint64_t)a_ - b_;")
+            L.append("uint32_t r_ = (uint32_t)rf_ & %s;" % hexlit(mask_of(size)))
+            L.append("if (a_ != b_) { %s }"
+                     % write_op(Op("reg", reg=0, size=size, part=None), size, "b_"))
+            L.extend(self.flags_arith("sub", size, live))
+            return L
+
         if m == "CMPXCHG":
-            # The guest is single-threaded, so LOCK needs no host atomic.
-            # Flags come from accumulator - destination on either path.
+            # Without LOCK no other processor is promised anything: the plain
+            # read and write. Flags come from accumulator - destination on
+            # either path.
             size = operand_size(ops)
             dst, src = ops
             dst = self.rmw(dst, size, L)
@@ -3870,6 +3907,21 @@ class Translator(object):
             L.append("c->eflags_zf = (expected_ == dst_);")
             L.append("if (c->eflags_zf) { wr64(ad_, ((uint64_t)c->r[1] << 32) | c->r[3]); }")
             L.append("else { c->r[0] = (uint32_t)dst_; c->r[2] = (uint32_t)(dst_ >> 32); }")
+            return L
+
+        if m == "XADD" and ins.rep == "LOCK" and ops[0].kind == "mem":
+            # A host fetch-and-add (x86.h recomp_lock_xadd): reference counts and
+            # queues the game shares between threads stay whole when one of them
+            # runs free beside the baton holder.
+            size = operand_size(ops)
+            dst, src = ops
+            L.append("uint32_t ad_ = %s;" % addr_expr(dst))
+            L.append("uint32_t b_ = %s;" % read_op(src, size))
+            L.append("uint32_t a_ = recomp_lock_xadd%d(ad_, (%s)b_);" % (size, utype(size)))
+            L.append("uint64_t rf_ = (uint64_t)a_ + b_;")
+            L.append("uint32_t r_ = (uint32_t)rf_ & %s;" % hexlit(mask_of(size)))
+            L.append(write_op(src, size, "a_"))
+            L.extend(self.flags_arith("add", size, live))
             return L
 
         if m == "XADD":

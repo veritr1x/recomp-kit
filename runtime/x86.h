@@ -244,6 +244,63 @@ RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
         recomp_dirty(a, 8);
 }
 
+/* Locked read-modify-writes: LOCK XADD, LOCK CMPXCHG, XCHG with a memory operand (which
+ * x86 always locks) and the Interlocked* imports. While guest threads took turns on the
+ * baton a plain read and write was enough; a thread running free (win32.h free run) runs
+ * beside the baton holder, and a game written for Windows threads on several cores counts
+ * on these being atomic. A naturally aligned address gets a host atomic (sequentially
+ * consistent, as LOCK is a full barrier); an unaligned one keeps the plain read and write,
+ * because WebAssembly has no unaligned atomics (they trap). Guest memory is reached through
+ * RECOMP_GUEST_BASE like every accessor above, so the web build's static arena (shared
+ * memory under -pthread) and the native mapped arena both take the same path. Each returns
+ * the old value. */
+#define RECOMP_LOCK_OPS(N, T)                                                                      \
+    RECOMP_HOT_INLINE T recomp_lock_xadd##N(uint32_t a, T v) {                                     \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old;                                                                                     \
+        if ((a & (sizeof(T) - 1)) == 0)                                                            \
+            old = __atomic_fetch_add((T *)(void *)(RECOMP_GUEST_BASE + a), v, __ATOMIC_SEQ_CST);   \
+        else {                                                                                     \
+            memcpy(&old, RECOMP_GUEST_BASE + a, sizeof(T));                                        \
+            T sum = (T)(old + v);                                                                  \
+            memcpy(RECOMP_GUEST_BASE + a, &sum, sizeof(T));                                        \
+        }                                                                                          \
+        recomp_watch(a, sizeof(T), (T)(old + v));                                                  \
+        return old;                                                                                \
+    }                                                                                              \
+    RECOMP_HOT_INLINE T recomp_lock_xchg##N(uint32_t a, T v) {                                     \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old;                                                                                     \
+        if ((a & (sizeof(T) - 1)) == 0)                                                            \
+            old = __atomic_exchange_n((T *)(void *)(RECOMP_GUEST_BASE + a), v, __ATOMIC_SEQ_CST);  \
+        else {                                                                                     \
+            memcpy(&old, RECOMP_GUEST_BASE + a, sizeof(T));                                        \
+            memcpy(RECOMP_GUEST_BASE + a, &v, sizeof(T));                                          \
+        }                                                                                          \
+        recomp_watch(a, sizeof(T), v);                                                             \
+        return old;                                                                                \
+    }                                                                                              \
+    /* Stores `desired` only if the memory held `expected`; the old value either way. */          \
+    RECOMP_HOT_INLINE T recomp_lock_cmpxchg##N(uint32_t a, T expected, T desired) {                \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old = expected;                                                                          \
+        if ((a & (sizeof(T) - 1)) == 0)                                                            \
+            __atomic_compare_exchange_n((T *)(void *)(RECOMP_GUEST_BASE + a), &old, desired, 0,    \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                       \
+        else {                                                                                     \
+            memcpy(&old, RECOMP_GUEST_BASE + a, sizeof(T));                                        \
+            if (old == expected)                                                                   \
+                memcpy(RECOMP_GUEST_BASE + a, &desired, sizeof(T));                                \
+        }                                                                                          \
+        if (old == expected)                                                                       \
+            recomp_watch(a, sizeof(T), desired);                                                   \
+        return old;                                                                                \
+    }
+RECOMP_LOCK_OPS(8, uint8_t)
+RECOMP_LOCK_OPS(16, uint16_t)
+RECOMP_LOCK_OPS(32, uint32_t)
+#undef RECOMP_LOCK_OPS
+
 /* 80-bit x87 extended precision.  x87 registers are `double` here (plan
  * ruling), so a tbyte load rounds to 64-bit and a store re-expands. */
 static inline double rdf80(uint32_t a) {
