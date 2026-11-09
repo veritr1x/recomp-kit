@@ -2525,10 +2525,18 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
 static void gpu_draw(ComObj *dev, HostD9Draw &d) {
     D9Pipeline &pl = d9_pipeline(dev->id);
     if (pl.vs.empty() || pl.ps.empty()) {
-        if (dev->d3d_version != 8) {
+        // RECOMP_D3D9_FFP=0 skips these draws, as the shim did before it had a
+        // fixed-function pipeline.
+        static const bool ffp = [] {
+            const char *e = recomp_env("D3D9_FFP");
+            return !(e && !strcmp(e, "0"));
+        }();
+        if (dev->d3d_version != 8 && ffp) {
             gpu_draw_fixed(dev, d);
             return;
         }
+        if (dev->d3d_version != 8)
+            return;
         log_once("d3d9.gpu.ffp", "d3d9: a version 8 draw with no programs bound is skipped");
         return;
     }

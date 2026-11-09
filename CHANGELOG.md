@@ -7,6 +7,7 @@
     programs generated from the fixed-function state (`dx/d3d9_ffp.cpp`,
     adapted from the HommaRe kit, cached per state) instead of being skipped;
     SetFVF, SetMaterial, SetLight and LightEnable are implemented for it.
+    `RECOMP_D3D9_FFP=0` skips those draws again, for comparing images.
   - CreateDevice masks FPU exceptions unless D3DCREATE_FPU_PRESERVE is passed
     (precision control is left as the guest set it).
   - Shader `exp`/`expp` are base 2 (vs_1_1 `expp` returns its partial split),
