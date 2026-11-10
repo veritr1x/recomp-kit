@@ -13,6 +13,7 @@
 #include "com.h"
 #include "dx.h"
 #include "host_api.h"
+#include "../runtime/imports_cs.h"
 #include "../runtime/memory.h"
 #include "../runtime/win32.h"
 
@@ -1891,4 +1892,20 @@ void dsound_register() {
     com_register_iid(IF_DSOUND8, IID_IDirectSound8_);
     com_register_class(CLSID_DirectSound8_, "DirectSound8", IF_DSOUND8, dsound_create);
     imports_register(g_dsound_exports, std::size(g_dsound_exports));
+    // A sound buffer's own state is no business of the import command stream's Direct3D work
+    // (imports_cs.h), so its everyday calls do not wait for the queue to empty. Creating and
+    // releasing buffers still does: those change the COM object table the worker reads.
+    static const char *const buffer_calls[] = {
+        "IDirectSoundBuffer::GetStatus",
+        "IDirectSoundBuffer::GetCurrentPosition",
+        "IDirectSoundBuffer::SetCurrentPosition",
+        "IDirectSoundBuffer::Lock",
+        "IDirectSoundBuffer::Unlock",
+        "IDirectSoundBuffer::Play",
+        "IDirectSoundBuffer::Stop",
+        "IDirectSoundBuffer::SetVolume",
+        "IDirectSoundBuffer::SetPan",
+        "IDirectSoundBuffer::SetFrequency",
+    };
+    imports_cs_register_independent(buffer_calls, std::size(buffer_calls));
 }

@@ -434,6 +434,9 @@ struct FxEffect {
     std::vector<FxParam> annotations;
     std::map<uint32_t, FxObject> objects;
     uint32_t technique = 0, pass = 0xffffffffu, device = 0;
+    // The technique as the game thread last set it: what a queued Begin reports the passes of
+    // (fx_begin_pre) while a queued SetTechnique has not reached `technique` yet.
+    uint32_t guest_technique = 0;
     uint32_t pool = 0; // the ID3DXEffectPool object it was created with
     uint32_t self = 0; // its COM object id
     // Lookups the per-draw path makes, built on first use: parameter index by
@@ -2059,7 +2062,18 @@ void Fx_SetTechnique(X86 *c) {
         return;
     }
     fx->technique = (uint32_t)t;
+    fx->guest_technique = (uint32_t)t;
     com_ret(c, D3D_OKX);
+}
+// The command stream's SetTechnique (imports_cs.h): the handle is checked here, so a bad one
+// still fails at once, and the game thread's copy changes for the Begin that follows.
+static bool fx_set_technique_pre(X86 *c) {
+    FxEffect *fx = this_fx(c);
+    const int32_t t = fx ? tech_of(*fx, arg(c, 1)) : -1;
+    if (t < 0)
+        return false;
+    fx->guest_technique = (uint32_t)t;
+    return true;
 }
 void Fx_GetCurrentTechnique(X86 *c) {
     FxEffect *fx = this_fx(c);
@@ -2103,16 +2117,16 @@ void Fx_Begin(X86 *c) {
     com_ret(c, D3D_OKX);
 }
 // The command stream's Begin (imports_cs.h): the caller reads the pass count at once, so the
-// guest thread writes it (only SetTechnique, a synchronous call, changes what it reads), and the
-// worker resets the pass in order with the effect's other calls.
+// guest thread writes it from its own copy of the technique (guest_technique), and the worker
+// resets the pass in order with the effect's other calls.
 static bool fx_begin_pre(X86 *c) {
     FxEffect *fx = this_fx(c);
     if (!fx)
         return false;
     const uint32_t out = arg(c, 1);
     if (out)
-        wr32(out, fx->technique < fx->techniques.size()
-                      ? (uint32_t)fx->techniques[fx->technique].passes.size()
+        wr32(out, fx->guest_technique < fx->techniques.size()
+                      ? (uint32_t)fx->techniques[fx->guest_technique].passes.size()
                       : 0);
     return true;
 }
@@ -2505,6 +2519,8 @@ void d3dx9_register() {
         {"ID3DXEffect::EndPass", -1, 0, -1, -1},
         {"ID3DXEffect::End", -1, 0, -1, -1},
         {"ID3DXEffect::Begin", -1, 0, -1, -1, nullptr, fx_begin_pre, fx_begin_deferred},
+        // By encoded handle only: a name would be read on the worker, after the game moved on.
+        {"ID3DXEffect::SetTechnique", -1, 0, -1, 1, nullptr, fx_set_technique_pre, nullptr},
     };
     imports_cs_register(deferred, std::size(deferred));
     // Math that reads and writes only its arguments: no wait for the queue.

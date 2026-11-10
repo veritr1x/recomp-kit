@@ -43,6 +43,12 @@ void host_display_present_window(const uint32_t *argb, int w, int h);
 // on - when a Present with a sync interval returns. Zero on a headless
 // presenter. The caller waits in the scheduler, never in the host.
 double host_present_refresh_delay(int intervals);
+// For a game that paces its own frames to the display. Where the presenter is driven once a
+// refresh by the display itself (a browser's animation frame), returns 1 with the measured
+// refresh period in seconds, how long before its refresh the newest displayed frame was
+// ready (close to a whole period: it only just missed the refresh before), and how many
+// new frames have been displayed. 0: no such display, nothing is written.
+int host_present_display_sync(double *period, double *age, uint64_t *shown);
 bool ddraw_gdi_primary_active(void);
 #ifdef __cplusplus
 }

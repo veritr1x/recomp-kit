@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Presenter: `host_present_display_sync` (runtime/display_seam.h) reports, where
+  the display itself drives the presenter (a browser's animation frame), the
+  measured refresh period and how long the newest frame waited for the refresh
+  that took it, so a game that paces its own frames can lock them to the
+  display. `RECOMP_PACING_LOG=1` prints the performance overlay's numbers once
+  a second on stderr.
+- Import command stream: `ID3DXEffect::SetTechnique` with an encoded handle is
+  queued (the technique the game thread selected is kept beside the worker's),
+  and the IDirectSoundBuffer calls of a streaming mixer no longer wait for the
+  queue.
+- Indirect-call recording: `RECOMP_ICALL_PROFILE_SECS=<n>` logs the table to
+  stderr n seconds after the first call, for a run that never exits (a browser
+  page).
 - Import command stream (on by default, `RECOMP_CS=0` turns it off;
   `runtime/imports_cs.cpp`): Direct3D 9 state setters, draws, scene and
   target calls and ID3DXEffect setters and passes are queued with copies of

@@ -7738,7 +7738,10 @@ def main():
         # it. Only the image carries these: an auxiliary module has no config.
         if AUX_MODULE is None and speedup("icall_profile_record"):
             fh.write("RecompIcallSlot recomp_icall_slots[RECOMP_ICALL_SLOTS];\n"
-                     "uint32_t recomp_icall_armed;\n")
+                     "uint32_t recomp_icall_armed;\n"
+                     "uint32_t recomp_icall_notes;\n"
+                     "int64_t recomp_icall_start;\n"
+                     "uint32_t recomp_icall_logged;\n")
         if AUX_MODULE is None:
             pairs = sorted(set(OPERAND_REDIRECTS.values()))
             fh.write("const uint32_t recomp_operand_redirect_pairs[] = {%s};\n" %

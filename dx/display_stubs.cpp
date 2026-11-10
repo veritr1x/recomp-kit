@@ -28,6 +28,9 @@ extern "C" {
 __attribute__((weak)) double host_present_refresh_delay(int) {
     return 0.0;
 }
+__attribute__((weak)) int host_present_display_sync(double *, double *, uint64_t *) {
+    return 0;
+}
 
 // Without a host GPU the Direct3D 11 shim rasterizes everything itself.
 __attribute__((weak)) int host_gpu2d_available(void) {

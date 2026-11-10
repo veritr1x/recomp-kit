@@ -26,6 +26,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -63,6 +64,12 @@ extern "C" __attribute__((weak)) void host_present_mode(int *w, int *h, int *bpp
 }
 
 static std::atomic<bool> g_present_suspended{false};
+// For host_present_display_sync: the refresh period the pump measured (seconds; 0 until it
+// has), how long the last new frame waited, sealed, for the refresh that took it, and new
+// frames taken.
+static std::atomic<double> g_sync_period{0.0}, g_sync_age{0.0};
+static std::atomic<uint64_t> g_sync_shown{0};
+static void sync_note_refresh(double ts);
 static std::mutex g_present_controls_mutex;
 static controls::ControlsView g_present_controls; // wanted = false until the host publishes
 
@@ -815,6 +822,11 @@ struct Service : std::enable_shared_from_this<Service> {
             flights.push_back(f);
             seal_pending = !mailbox.empty();
             f->submitted_ts = ts;
+            if (!f->repeat && !offscreen) {
+                // For host_present_display_sync: how long the frame waited for this refresh.
+                g_sync_age.store(ts - f->sealed_ts, std::memory_order_relaxed);
+                g_sync_shown.fetch_add(1, std::memory_order_release);
+            }
             f->acknowledgement_deadline = ts + acknowledgement_grace();
             f->input.drawable_w = rect.w;
             f->input.drawable_h = rect.h;
@@ -931,6 +943,22 @@ struct Service : std::enable_shared_from_this<Service> {
                 {
                     std::lock_guard lock(mutex);
                     snapshot = pacing.snapshot(ts, drops);
+                }
+                // RECOMP_PACING_LOG=1: the overlay's numbers once a second on stderr, for
+                // a benchmark that cannot read the screen.
+                static const bool pacing_log = [] {
+                    const char *e = getenv("RECOMP_PACING_LOG");
+                    return e && *e && *e != '0';
+                }();
+                static double pacing_logged = 0;
+                if (pacing_log && ts - pacing_logged >= 1.0) {
+                    pacing_logged = ts;
+                    fprintf(stderr,
+                            "pacing new=%.1f dsp=%.1f frame=%.1f p95=%.1f gpu=%.1f age=%.1f "
+                            "rpt=%.0f drop=%llu\n",
+                            snapshot.new_fps, snapshot.display_fps, snapshot.median_ms,
+                            snapshot.p95_ms, snapshot.gpu_ms, snapshot.age_ms,
+                            snapshot.repeat_percent, (unsigned long long)snapshot.drops);
                 }
                 performance_overlay.draw(device, cb, drawable, drawable_desc.width,
                                          drawable_desc.height, snapshot, ts, mods_display_overlay(),
@@ -1158,7 +1186,40 @@ void host_present_pump(void) {
         s->last_link_tick = s->timestamp = ts;
         s->tick_pending = false;
     }
+    sync_note_refresh(ts);
     s->tick(ts);
+}
+// The display's own cadence for a game that paces itself (host_present_display_sync): the
+// refresh period smoothed over the pump's calls, one a refresh. An interval far from the
+// running value is a skipped or doubled animation frame and is left out; several in a row
+// (the window moved to another display) start the measurement again.
+static void sync_note_refresh(double ts) {
+    static double last = 0, period = 0;
+    static int odd = 0;
+    const double dt = ts - last;
+    last = ts;
+    if (!(dt > 0.002 && dt < 0.1))
+        return;
+    if (period <= 0 || odd >= 8) {
+        period = dt;
+        odd = 0;
+    } else if (dt > period * 0.8 && dt < period * 1.2) {
+        period += (dt - period) * 0.02;
+        odd = 0;
+    } else {
+        ++odd;
+        return;
+    }
+    g_sync_period.store(period, std::memory_order_relaxed);
+}
+extern "C" int host_present_display_sync(double *period, double *age, uint64_t *shown) {
+    const double p = g_sync_period.load(std::memory_order_relaxed);
+    if (!(p > 0))
+        return 0;
+    *shown = g_sync_shown.load(std::memory_order_acquire);
+    *age = g_sync_age.load(std::memory_order_relaxed);
+    *period = p;
+    return 1;
 }
 void host_present_start_offscreen(int w, int h) {
     auto s = begin(false, true, true);
@@ -1425,8 +1486,8 @@ void *host_present_stage_defer() {
 }
 // Stages `src` into the deferred frame (or, with `src` null, gives up on it: the frame is
 // dropped) and lets the worker compose it. Main thread; `cb` is committed by the caller.
-bool host_present_stage_into(void *handle, gpu::Texture src, int w, int h, int guest_w,
-                             int guest_h, gpu::CommandBuffer cb) {
+bool host_present_stage_into(void *handle, gpu::Texture src, int w, int h, int guest_w, int guest_h,
+                             gpu::CommandBuffer cb) {
     std::unique_ptr<StageHandle> sh(static_cast<StageHandle *>(handle));
     if (!sh)
         return false;
