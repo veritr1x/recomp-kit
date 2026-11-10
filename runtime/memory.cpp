@@ -531,7 +531,21 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
         ++g_total_allocs;
         return user;
     }
-    LOGW("heap_alloc: out of guest heap (%u bytes requested)", size);
+    // Full or fragmented: the totals tell which.
+    uint64_t used = 0, free_bytes = 0;
+    uint32_t largest = 0, used_blocks = 0;
+    for (const auto &b : *g_blocks) {
+        if (b.second.used) {
+            used += b.second.size;
+            ++used_blocks;
+        } else {
+            free_bytes += b.second.size;
+            largest = std::max(largest, b.second.size);
+        }
+    }
+    LOGW("heap_alloc: out of guest heap (%u bytes requested; %llu used in %u blocks, %llu free, "
+         "largest free %u)",
+         size, (unsigned long long)used, used_blocks, (unsigned long long)free_bytes, largest);
     return 0;
 }
 

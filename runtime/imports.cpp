@@ -1,4 +1,5 @@
 #include "imports.h"
+#include "imports_cs.h"
 #include "msvc_eh.h"
 #include "crt_internal.h"
 #include "gdi32_internal.h"
@@ -106,6 +107,25 @@ struct FreeSlot {
 };
 FreeSlot g_free_slots[TRAMP_MAX];
 
+// Leaf imports (imports_mark_leaf), by trampoline: the shim and its stdcall argument count,
+// or none. Read and written holding the baton only (a thread running free takes the full
+// path), so plain values.
+struct LeafSlot {
+    void (*fn)(X86 *) = nullptr;
+    uint8_t argc = 0;
+};
+LeafSlot g_leaf_slots[TRAMP_MAX];
+std::set<std::string> &leaf_names() {
+    static auto *v = new std::set<std::string>();
+    return *v;
+}
+
+// Per trampoline: calls that waited for the command stream's queue since the last report.
+std::vector<uint32_t> &cs_drains() {
+    static auto *v = new std::vector<uint32_t>();
+    return *v;
+}
+
 std::string lower_dll(const char *dll) {
     std::string k(dll ? dll : "");
     std::transform(k.begin(), k.end(), k.begin(),
@@ -147,8 +167,7 @@ void free_slot_update(uint32_t idx, const std::string &key) {
         return;
     const Tramp &t = tramps()[idx];
     auto fi = free_registry().find(key);
-    if (fi == free_registry().end() || !t.fn || t.fn != fi->second.shim ||
-        t.argc == ARGC_UNKNOWN) {
+    if (fi == free_registry().end() || !t.fn || t.fn != fi->second.shim || t.argc == ARGC_UNKNOWN) {
         g_free_slots[idx].fn.store(nullptr, std::memory_order_release);
         return;
     }
@@ -156,7 +175,26 @@ void free_slot_update(uint32_t idx, const std::string &key) {
     g_free_slots[idx].fn.store(fi->second.fn, std::memory_order_release);
 }
 
+// Publishes (or withdraws) trampoline `idx` as a leaf: one whose name was marked and whose
+// shim takes a known stdcall argument count or is cdecl.
+void leaf_slot_update(uint32_t idx) {
+    if (idx >= TRAMP_MAX || idx >= tramps().size())
+        return;
+    const Tramp &t = tramps()[idx];
+    const bool leaf =
+        t.fn && t.argc != ARGC_UNKNOWN && !t.serial && !t.atomic && leaf_names().count(t.name) != 0;
+    g_leaf_slots[idx].argc = t.argc;
+    g_leaf_slots[idx].fn = leaf ? t.fn : nullptr;
+}
+
 } // namespace
+
+void imports_mark_leaf(const char *const *names, size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        leaf_names().insert(names[i]);
+    for (uint32_t i = 0; i < tramps().size(); ++i)
+        leaf_slot_update(i);
+}
 
 void imports_register(const ImportShim *shims, size_t count) {
     for (size_t i = 0; i < count; ++i) {
@@ -176,6 +214,7 @@ void imports_register(const ImportShim *shims, size_t count) {
                 t.fn = s.fn;
             t.argc = s.argc_stdcall;
             free_slot_update(ti->second, k);
+            leaf_slot_update(ti->second);
         }
     }
 }
@@ -190,6 +229,7 @@ void imports_register_baton_free(const ImportFreeShim *shims, size_t count) {
         auto ti = index().find(k);
         if (ti != index().end())
             free_slot_update(ti->second, k);
+        leaf_slot_update(ti->second);
     }
 }
 
@@ -198,8 +238,10 @@ void imports_register_baton_free_method(const char *dll, const char *name, bool 
     const std::string k = key_of(dll, name);
     free_registry()[k] = FreeEntry{fn, shim};
     auto ti = index().find(k);
-    if (ti != index().end())
+    if (ti != index().end()) {
         free_slot_update(ti->second, k);
+        leaf_slot_update(ti->second);
+    }
 }
 
 void imports_serialize_dll(const char *dll, std::recursive_mutex *m) {
@@ -224,6 +266,7 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
             t.fn = fn;
             t.argc = argc_stdcall;
             free_slot_update(it->second, k);
+            leaf_slot_update(it->second);
         }
         return TRAMP_BASE + TRAMP_STRIDE * it->second;
     }
@@ -266,6 +309,7 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
     tramps().push_back(t);
     index()[k] = idx;
     free_slot_update(idx, k);
+    leaf_slot_update(idx);
     return TRAMP_BASE + TRAMP_STRIDE * idx;
 }
 
@@ -406,6 +450,49 @@ void imports_dump_stats(FILE *out) {
         fprintf(out, "  %8u  %-40s %s\n", t->calls, t->desc.c_str(), t->fn ? "" : "(logging only)");
 }
 
+// RECOMP_IMPORT_TOP=1: every ten seconds, the imports called most since the last report, so a
+// run that never exits (the browser) can still say which shims are hot. Checked every 65536th
+// import call, holding the baton (the counts are the baton holder's).
+static void imports_top_report() {
+    static const bool on = recomp_env("IMPORT_TOP") != nullptr;
+    if (!on)
+        return;
+    static std::vector<uint32_t> last;
+    static uint64_t from = 0;
+    const uint64_t now = os_monotonic_ns();
+    if (!from)
+        from = now;
+    if (now - from < 10000000000ull)
+        return;
+    const std::vector<Tramp> &table = tramps();
+    last.resize(table.size());
+    std::vector<std::pair<uint32_t, uint32_t>> v; // calls since, index
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < table.size(); ++i) {
+        const uint32_t d = table[i].calls - last[i];
+        last[i] = table[i].calls;
+        total += d;
+        if (d)
+            v.push_back({d, i});
+    }
+    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    const double secs = (now - from) * 1e-9;
+    LOGW("imports: %.0f calls a second over %.1f s; most called:", total / secs, secs);
+    for (size_t k = 0; k < v.size() && k < 20; ++k)
+        LOGW("  %9.0f/s  %s", v[k].first / secs, table[v[k].second].desc.c_str());
+    // With the command stream on: the imports that waited for its queue most.
+    std::vector<std::pair<uint32_t, uint32_t>> w;
+    for (uint32_t i = 0; i < cs_drains().size(); ++i)
+        if (cs_drains()[i])
+            w.push_back({cs_drains()[i], i});
+    std::sort(w.begin(), w.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    for (size_t k = 0; k < w.size() && k < 12; ++k)
+        LOGW("  waited %9.0f/s  %s", w[k].first / secs,
+             w[k].second < table.size() ? table[w[k].second].desc.c_str() : "?");
+    cs_drains().assign(cs_drains().size(), 0);
+    from = now;
+}
+
 void imports_coverage(uint32_t *implemented, uint32_t *logging_only, uint32_t *unknown_argc) {
     uint32_t impl = 0, log_only = 0, unknown = 0;
     for (const Tramp &t : tramps()) {
@@ -543,8 +630,8 @@ static void free_fallback_note(uint32_t target) {
                   return a.second > b.second;
               });
     char line[768];
-    int n = snprintf(line, sizeof line, "free run: imports taking the baton, last %.1f s:",
-                     (now - from) * 1e-9);
+    int n = snprintf(line, sizeof line,
+                     "free run: imports taking the baton, last %.1f s:", (now - from) * 1e-9);
     for (size_t i = 0; i < v.size() && i < 8 && n > 0 && n < (int)sizeof line - 96; ++i) {
         const char *name = imports_describe(v[i].first);
         n += snprintf(line + n, sizeof line - n, " %s %u;", name ? name : "?", v[i].second);
@@ -576,6 +663,72 @@ static bool imports_dispatch_free(X86 *c, uint32_t target) {
     return true;
 }
 
+// The import command stream (imports_cs.h): a deferrable call is queued for the worker and
+// returns S_OK; any other import of a DLL that is not independent first waits for the queue to
+// empty. Per trampoline, the spec (-1: none) and whether its DLL is independent, found on first
+// use. A deferred call still passes the scheduling checkpoint: skipping it kept the baton from the
+// other guest threads and host signals, and the browser showed far fewer frames.
+namespace {
+struct CsSlot {
+    bool known = false;
+    bool independent = false;
+    int spec = -1;
+};
+std::vector<CsSlot> &cs_slots() {
+    static auto *v = new std::vector<CsSlot>();
+    return *v;
+}
+bool independent_dll(const std::string &dll) {
+    std::string d = lower_dll(dll.c_str());
+    static const char *const names[] = {
+        "kernel32.dll", "ntdll.dll",   "user32.dll", "gdi32.dll",   "winmm.dll", "advapi32.dll",
+        "shell32.dll",  "version.dll", "ws2_32.dll", "wsock32.dll", "imm32.dll", "shlwapi.dll"};
+    for (const char *n : names)
+        if (d == n)
+            return true;
+    return d.rfind("msvcr", 0) == 0 || d.rfind("msvcp", 0) == 0;
+}
+} // namespace
+
+static bool imports_command_stream(X86 *c, uint32_t target) {
+    const uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
+    std::vector<Tramp> &table = tramps();
+    if (idx >= table.size())
+        return false;
+    std::vector<CsSlot> &slots = cs_slots();
+    if (slots.size() <= idx)
+        slots.resize(table.size());
+    CsSlot &slot = slots[idx];
+    if (!slot.known) {
+        slot.known = true;
+        slot.independent =
+            independent_dll(table[idx].dll) || imports_cs_independent(table[idx].name.c_str());
+        slot.spec = imports_cs_spec_of(table[idx].name.c_str());
+    }
+    static const bool verbose = log_level() >= 2;
+    const Tramp &t = table[idx];
+    if (slot.spec >= 0 && t.fn && t.argc != ARGC_CDECL && t.argc != ARGC_UNKNOWN &&
+        !g_call_observer && !verbose && imports_cs_active()) {
+        const uint32_t ret_addr = rd32(c->r[R_ESP]);
+        sched_checkpoint();
+        if (imports_cs_defer(c, slot.spec, t.fn, t.argc)) {
+            ++tramps()[idx].calls;
+            if (RECOMP_UNLIKELY((++g_import_calls & 0xffffu) == 0))
+                imports_top_report();
+            set_eax(c, 0);
+            c->r[R_ESP] += 4u + 4u * t.argc;
+            c->eip = ret_addr;
+            return true;
+        }
+    }
+    if (!slot.independent && imports_cs_drain()) {
+        if (cs_drains().size() <= idx)
+            cs_drains().resize(idx + 1);
+        ++cs_drains()[idx];
+    }
+    return false;
+}
+
 // Every shim assumes the baton, and a guest thread running free (win32.h free run) holds
 // none: unless the import has a baton-free version, it takes the baton for the call and,
 // while the stack is still inside the free-run function (below its entry ESP), runs free
@@ -591,6 +744,30 @@ bool imports_dispatch(X86 *c, uint32_t target) {
             sched_free_run_enter(entry_esp);
         sched_parallel_rejoin();
         return done;
+    }
+    if (imports_is_trampoline(target) && imports_command_stream(c, target))
+        return true;
+    // A leaf import (imports_mark_leaf) skips the observers and per-call bookkeeping beyond its
+    // count, and still passes the scheduling checkpoint (without it the game thread kept the
+    // baton from the other guest threads and host signals, and the browser showed far fewer
+    // frames). Not while a call observer or verbose tracing watches, and not in the earlier
+    // phase of an in-run A/B (LEAF).
+    if (imports_is_trampoline(target)) {
+        const uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
+        static const bool verbose = log_level() >= 2;
+        if (idx < TRAMP_MAX && g_leaf_slots[idx].fn && !g_call_observer && !verbose &&
+            !recomp_ab::old(recomp_ab::LEAF)) {
+            const LeafSlot leaf = g_leaf_slots[idx];
+            const uint32_t ret_addr = rd32(c->r[R_ESP]);
+            ++tramps()[idx].calls;
+            if (RECOMP_UNLIKELY((++g_import_calls & 0xffffu) == 0))
+                imports_top_report();
+            sched_checkpoint();
+            leaf.fn(c);
+            c->r[R_ESP] += leaf.argc == ARGC_CDECL ? 4u : 4u + 4u * leaf.argc;
+            c->eip = ret_addr;
+            return true;
+        }
     }
     const bool done = imports_dispatch_holding(c, target);
     // RECOMP_SCHED=parallel: a worker that held the baton runs free again. The mode is fixed
@@ -644,7 +821,8 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     // copied unless an observer (which may itself reallocate) is installed.
     auto desc_now = [&table, idx]() -> const char * { return table[idx].desc.c_str(); };
     ++table[idx].calls;
-    ++g_import_calls;
+    if (RECOMP_UNLIKELY((++g_import_calls & 0xffffu) == 0))
+        imports_top_report();
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
     if (verbose) {

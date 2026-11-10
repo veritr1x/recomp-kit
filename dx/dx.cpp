@@ -4,6 +4,7 @@
 #include "d3d11.h"
 #include "../runtime/win32.h"
 #include "com.h"
+#include "../runtime/imports_cs.h"
 #include "host_api.h"
 
 #include <stdio.h>
@@ -577,6 +578,7 @@ void dx_register_shims() {
     // Installed before the tables so a failure during registration itself,
     // and every failure afterwards, is named rather than silent.
     imports_set_return_observer(dx_report_failure);
+    imports_cs_set_drain_hook(com_cs_flush);
 
     // Order matters only in that ddraw_register installs the QueryInterface
     // hook that hands out Direct3D, and d3d_register must have defined the

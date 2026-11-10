@@ -1,9 +1,13 @@
 // com.cpp - guest COM objects, vtables and the three IUnknown slots.
 #include "com.h"
 #include "../runtime/memory.h"
+#include "../runtime/imports_cs.h"
 
 #include <string.h>
 #include <deque>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 std::deque<std::unique_ptr<ComObj>> *g_com_objects = nullptr;
 
@@ -134,8 +138,20 @@ ComObj *com_this(uint32_t addr, ComIface want) {
         return nullptr;
     }
     ComObj *o = com_get(rd32(addr + COM_OFF_obj));
-    if (!o)
+    if (!o) {
+        // A call through a view whose object our reference counts already
+        // destroyed: on Windows the object would still be alive, so the count
+        // is off somewhere. Rare, so name each one (a few) for the trace.
+        static int reported = 0;
+        const uint32_t id = rd32(addr + COM_OFF_obj);
+        if (reported < 16 && id && g_com_objects && id <= g_com_objects->size()) {
+            ++reported;
+            const ComObj *dead = (*g_com_objects)[id - 1].get();
+            LOGW("dx: COM call on %08x, object #%u (kind %d) already destroyed", addr, id,
+                 dead ? (int)dead->kind : -1);
+        }
         return nullptr;
+    }
     if (want != IF_NONE && rd32(addr + COM_OFF_iface) != want)
         return nullptr;
     return o;
@@ -285,9 +301,37 @@ void com_set_ref_hook(ComKind kind, void (*fn)(ComObj *, int32_t, int32_t)) {
         g_ref_hook[kind] = fn;
 }
 
+// Last releases made on the import command-stream worker (imports_cs.h): destroying an object
+// frees guest memory, whose heap belongs to the baton holder, so they are made on the guest
+// thread after its next drain (com_cs_flush).
+namespace {
+std::mutex g_cs_release_m;
+std::vector<uint32_t> g_cs_releases;
+std::atomic<bool> g_cs_release_pending{false};
+} // namespace
+void com_cs_flush() {
+    if (!g_cs_release_pending.load(std::memory_order_acquire))
+        return;
+    std::vector<uint32_t> ids;
+    {
+        std::lock_guard<std::mutex> lock(g_cs_release_m);
+        ids.swap(g_cs_releases);
+        g_cs_release_pending.store(false, std::memory_order_release);
+    }
+    for (uint32_t id : ids)
+        if (ComObj *o = com_get(id))
+            com_release(o);
+}
+
 int32_t com_release(ComObj *o) {
     if (!o || !o->alive)
         return 0;
+    if (o->refs == 1 && imports_cs_on_worker()) {
+        std::lock_guard<std::mutex> lock(g_cs_release_m);
+        g_cs_releases.push_back(o->id);
+        g_cs_release_pending.store(true, std::memory_order_release);
+        return 0;
+    }
     if (--o->refs > 0) {
         if ((size_t)o->kind < 64 && g_ref_hook[o->kind])
             g_ref_hook[o->kind](o, o->refs + 1, o->refs);

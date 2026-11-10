@@ -320,13 +320,34 @@ uint64_t code_key(const uint8_t *code, size_t size) {
 }
 
 const Program &program_for_key(uint64_t key, const uint8_t *code, size_t size) {
+    // Every draw asks twice (its vertex and pixel programs), mostly for the two it asked for
+    // last: those are answered from this thread's own pair without the lock. Entries are never
+    // erased and map nodes do not move, so the pointers stay valid.
+    static thread_local uint64_t recent_key[2] = {0, 0};
+    static thread_local const Program *recent[2] = {nullptr, nullptr};
+    if (key) {
+        if (key == recent_key[0])
+            return *recent[0];
+        if (key == recent_key[1])
+            return *recent[1];
+    }
     static std::mutex mutex;
     static auto *cache = new std::unordered_map<uint64_t, Program>();
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache->find(key);
-    if (it != cache->end())
-        return it->second;
-    return (*cache)[key] = load(std::vector<uint8_t>(code, code + size));
+    const Program *found;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache->find(key);
+        found = it != cache->end()
+                    ? &it->second
+                    : &((*cache)[key] = load(std::vector<uint8_t>(code, code + size)));
+    }
+    if (key) {
+        recent_key[1] = recent_key[0];
+        recent[1] = recent[0];
+        recent_key[0] = key;
+        recent[0] = found;
+    }
+    return *found;
 }
 
 const Program &program_for(const std::vector<uint8_t> &code) {

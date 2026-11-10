@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Import command stream (on by default, `RECOMP_CS=0` turns it off;
+  `runtime/imports_cs.cpp`): Direct3D 9 state setters, draws, scene and
+  target calls and ID3DXEffect setters and passes are queued with copies of
+  their pointer data and run in order on a worker thread, while the game
+  thread goes on; every other import of a DLL that is not independent first
+  waits for the queue, and pure D3DX math and fixed descriptions do not. A
+  last release made on the worker is done on the game thread. NFSMW parked
+  downtown: 83-85 new frames a second against 66-69, game thread 12 ms against
+  15 (A/B switch `cs`). The worker pool is 12 threads (was 8).
+- WebGPU: the device clock is read on the calling thread; it was proxied to the
+  browser's main thread and held the game thread about 10% of a race frame.
+- Shim overhead (NFSMW race: the game's own code was 37% of the game thread,
+  D3DX and Direct3D 9 shims and import dispatch most of the rest):
+  - Leaf imports (`imports_mark_leaf`): D3DX math, ID3DXEffect setters and
+    passes, and Direct3D 9 state setters and draws skip the dispatcher's
+    observers and bookkeeping but keep its scheduling checkpoint (switch
+    `leaf`).
+  - A draw's constants with a fresh serial are copied for the render host
+    without first comparing up to 4 KiB with the last copy (switch
+    `constcmp`); this adds main-thread uploads.
+  - D3DX shared parameters are taken by each effect when it next draws or
+    reads them, not copied into every effect of the pool at each write
+    (3% of game-thread time, switch `pool`).
+  - An effect pass and a program's samplers re-apply only their
+    preshader-computed and texture stage states while the device's render and
+    sampler states are unchanged since they were last applied (2% of
+    game-thread time, switch `fxstates`); a pass's texture binding is resolved
+    by name once.
+  - Shader programs are found from a per-thread pair of the last two before
+    the locked cache; a bound texture with no changed level is not scanned
+    level by level; the render host is handed work every 128 commands (was 48).
+  - `RECOMP_IMPORT_TOP=1` prints the most called imports every 10 s, for runs
+    that never exit; A/B switch `ffp` sends fixed-function draws back to the
+    earlier path.
+  - A COM call on an object the shims already destroyed is logged (up to 16).
+- Guest heap: running out reports the bytes in use, free and the largest free
+  block, telling a full heap from a fragmented one.
+- Web player: `RECOMP_D3D9_FFP` and `RECOMP_D3D9_FRAMES_AHEAD` may be set from
+  the page URL, so a tester can narrow a rendering fault; no other switch can.
 - Direct3D 9, DirectSound and D3DX shims:
   - Draws with no vertex or pixel shader bound are drawn with vs_2_0/ps_2_0
     programs generated from the fixed-function state (`dx/d3d9_ffp.cpp`,

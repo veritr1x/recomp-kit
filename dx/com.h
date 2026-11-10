@@ -455,6 +455,9 @@ uint32_t com_view(ComObj *o, ComIface iface);
 void com_addref(ComObj *o);
 // Drops one reference and destroys at zero. Returns the new count.
 int32_t com_release(ComObj *o);
+// Makes the last releases the import command-stream worker handed back (imports_cs.h); run on
+// the guest thread after each drain.
+void com_cs_flush();
 // Final teardown regardless of references, for an implicitly owned object
 // whose parent's destruction ends its lifetime (DirectDraw flip-chain children).
 void com_destroy(ComObj *o);

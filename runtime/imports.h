@@ -43,6 +43,10 @@ struct ImportFreeShim {
     bool (*fn)(X86 *);
 };
 void imports_register_baton_free(const ImportFreeShim *shims, size_t count);
+// Leaf imports, by function name in any DLL ("D3DXMatrixMultiply", "ID3DXEffect::SetMatrix"):
+// shims that never block, yield the baton or call guest code. They skip the dispatcher's
+// observers and bookkeeping (imports_dispatch). Known stdcall or cdecl ones only.
+void imports_mark_leaf(const char *const *names, size_t count);
 // The same for an import with no shim table entry (a COM method: dx/com.cpp allocates its
 // trampoline with the method's function): `fn` stands for `shim`.
 void imports_register_baton_free_method(const char *dll, const char *name, bool (*fn)(X86 *),

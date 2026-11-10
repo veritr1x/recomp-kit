@@ -306,7 +306,7 @@ if(TARGET recomp_gen)
       $<$<NOT:$<CONFIG:Debug>>:-g0>
       # Each prewarmed worker instantiates the module. Keep startup bounded;
       # additional guest threads are created while the host loop runs.
-      -pthread -sPTHREAD_POOL_SIZE=8 -sWASMFS
+      -pthread -sPTHREAD_POOL_SIZE=12 -sWASMFS
       -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
       -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=16777216
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0

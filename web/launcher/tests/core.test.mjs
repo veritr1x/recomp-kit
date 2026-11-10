@@ -15,6 +15,8 @@ test("player URLs cannot inject runtime environment switches", () => {
   assert.deepEqual(Object.entries(queryEnvironment(query)), []);
   assert.deepEqual(Object.entries(queryEnvironment(query, ["RECOMP_LOG"])), [["RECOMP_LOG", "2"]]);
   assert.deepEqual(Object.entries(queryEnvironment("?RECOMP_LOG_SUFFIX=3", ["RECOMP_LOG"])), []);
+  assert.deepEqual(Object.entries(queryEnvironment("?RECOMP_D3D9_FFP=0&RECOMP_D3D9_FRAMES_AHEAD=0")),
+                   [["RECOMP_D3D9_FFP", "0"], ["RECOMP_D3D9_FRAMES_AHEAD", "0"]]);
   assert.equal(executablePath({ executable: "GAME.EXE" }), "GAME.EXE");
   assert.equal(executablePath({ exeDir: "Binaries/Win32", executable: "GAME.EXE" }), "Binaries/Win32/GAME.EXE");
 });

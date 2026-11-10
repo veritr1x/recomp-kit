@@ -1382,8 +1382,9 @@ void WebGpuDevice::destroy(Swapchain s) {
 }
 
 double WebGpuDevice::now_seconds() {
-    if (off_main())
-        return on_main([&] { return now_seconds(); });
+    // Read on the calling thread: Emscripten keeps a worker's emscripten_get_now() on the main
+    // thread's time origin, and the synchronous hop to the main thread this used to make held the
+    // game thread until the browser's main thread was free (about 10% of an NFSMW race frame).
     return emscripten_get_now() / 1000.0;
 }
 

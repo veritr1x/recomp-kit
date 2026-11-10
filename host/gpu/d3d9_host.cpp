@@ -240,7 +240,7 @@ class RenderThread {
             return;
         }
         // Hand work over often enough that the worker keeps pace with the game.
-        if (filling_->commands.size() >= 48 || filling_->bytes.size() >= (1u << 20))
+        if (filling_->commands.size() >= 128 || filling_->bytes.size() >= (1u << 20))
             hand_over();
     }
     // Everything queued has been encoded; the caller may use the backend.
@@ -320,7 +320,12 @@ class RenderThread {
                 ++stats_.const_reuses;
                 return last.at;
             }
-            if (memcmp(b.bytes.data() + last.at, regs, bytes) == 0) {
+            // A fresh serial means the registers were written since (the effect framework
+            // keeps its serial when a bind writes nothing), so the compare - up to 4 KiB, and
+            // nearly always failing - is left to draws that carry none (fixed-function ones).
+            // The earlier phase of an in-run A/B (CONSTCMP) compares every draw.
+            const bool compare = !serial || recomp_ab::old(recomp_ab::CONSTCMP);
+            if (compare && memcmp(b.bytes.data() + last.at, regs, bytes) == 0) {
                 // Only a whole match may take the serial: registers past `count` may differ.
                 if (count == last.count)
                     last.serial = serial;

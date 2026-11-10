@@ -16,6 +16,7 @@
 // itself once, which turns a crash into the list of what this game's
 // rendering actually asks for.
 #include "com.h"
+#include "../runtime/imports_cs.h"
 #include "dx.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
@@ -344,6 +345,10 @@ struct FxState {
     // The effect's parameter indices for this preshader (a node in
     // fx.ctab_params, which never moves): checked on every pass.
     mutable const std::vector<int32_t> *pres_params = nullptr;
+    // A pass's SAMPLER_TEXTURE state: the parameter its object names, resolved
+    // once for an effect with tex_param_count parameters (-2: not yet).
+    mutable int32_t tex_param = -2;
+    mutable size_t tex_param_count = 0;
     uint32_t object() const {
         return value.size() >= 4 ? (uint32_t)(value[0] | value[1] << 8 | value[2] << 16 |
                                               (uint32_t)value[3] << 24)
@@ -398,6 +403,13 @@ struct FxPass {
     uint32_t guest_name = 0, guest_vs = 0, guest_ps = 0;
     std::vector<uint32_t> annotations;
     std::string label; // effect/technique/pass, for diagnostics
+    // The device's state version when this pass was last applied (apply_pass), and the
+    // states that may differ while it is unchanged: those a preshader computes, and
+    // texture stage states, which do not move the version. Built on first apply.
+    uint64_t applied_version = 0;
+    uint32_t applied_device = 0;
+    std::vector<uint32_t> dynamic;
+    bool dynamic_built = false;
 };
 struct FxTechnique {
     std::string name;
@@ -440,6 +452,9 @@ struct FxEffect {
         // stay valid, and every later bind is one lookup instead of three.
         const std::vector<struct CtabConst> *table = nullptr;
         std::vector<int32_t> *resolved = nullptr;
+        // The device's state version after this program's last bind: while it is unchanged,
+        // its samplers' fixed states are still in place (bind_constants).
+        uint64_t state_version = 0;
     };
     std::unordered_map<uint64_t, ConstBind> const_binds;
     // The last two programs bound (normally the pass's vertex and pixel
@@ -1076,6 +1091,10 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
     // The earlier phase of an in-run A/B (CONSTS) writes every constant.
     const bool intact =
         last.serial != 0 && last.serial == serial && !recomp_ab::old(recomp_ab::CONSTS);
+    // No render or sampler state has changed since this program's last bind: its samplers'
+    // fixed states hold, and only those a preshader computes are evaluated again.
+    const bool states_held = last.state_version != 0 && last.state_version == pl.state_version &&
+                             !recomp_ab::old(recomp_ab::FXSTATES);
     const uint64_t since = intact ? last.stamp : 0;
     if (!last.table) {
         last.table = &ctab_of(code, key);
@@ -1095,7 +1114,8 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
             if (p && c.index < 16) {
                 pl.sampler_tex[c.index] = sampler_texture(fx, *p);
                 for (const FxState &s : p->sampler)
-                    apply_state(fx, pl, s, c.index);
+                    if (!states_held || !s.preshader.empty())
+                        apply_state(fx, pl, s, c.index);
                 ++bound;
             } else {
                 ++*missing;
@@ -1184,6 +1204,7 @@ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, f
         serial = d9_const_serial();
     last.serial = serial;
     last.stamp = g_param_stamp;
+    last.state_version = pl.state_version;
     return bound;
 }
 
@@ -1480,21 +1501,45 @@ static void apply_pass(FxEffect &fx) {
     if (pass.label.empty())
         pass.label = fx.resource + "/" + tech.name + "/" + pass.name;
     pl.label = pass.label.c_str();
-    for (const FxState &s : pass.states)
-        apply_state(fx, pl, s, 0xffffffffu);
+    if (!pass.dynamic_built) {
+        pass.dynamic_built = true;
+        for (uint32_t i = 0; i < pass.states.size(); ++i) {
+            const FxState &s = pass.states[i];
+            if (!s.preshader.empty() || (s.op >= 103 && s.op < 121))
+                pass.dynamic.push_back(i);
+        }
+    }
+    // Unchanged device states since this pass was last applied: the fixed ones still hold.
+    // The earlier phase of an in-run A/B (FXSTATES) applies every state.
+    if (pass.applied_version && pass.applied_version == pl.state_version &&
+        pass.applied_device == fx.device && !recomp_ab::old(recomp_ab::FXSTATES)) {
+        for (uint32_t i : pass.dynamic)
+            apply_state(fx, pl, pass.states[i], 0xffffffffu);
+    } else {
+        for (const FxState &s : pass.states)
+            apply_state(fx, pl, s, 0xffffffffu);
+    }
     // A pass may also bind a texture to a stage directly.
+    // The parameter is found by name once per state, not on every CommitChanges.
     for (const FxState &s : pass.states)
         if (s.op == FXS_SAMPLER_TEXTURE && s.index < 16) {
-            auto it = fx.objects.find(s.object());
-            if (it != fx.objects.end() && !it->second.param.empty())
-                if (FxParam *tex = param_named(fx, it->second.param))
-                    pl.sampler_tex[s.index] = tex->texture;
+            if (s.tex_param == -2 || s.tex_param_count != fx.params.size()) {
+                s.tex_param = -1;
+                s.tex_param_count = fx.params.size();
+                auto it = fx.objects.find(s.object());
+                if (it != fx.objects.end() && !it->second.param.empty())
+                    s.tex_param = param_index_of(fx, it->second.param);
+            }
+            if (s.tex_param >= 0)
+                pl.sampler_tex[s.index] = fx.params[(size_t)s.tex_param].texture;
         }
     uint32_t missing = 0;
     uint32_t bound =
         bind_constants(fx, pl.vs.vec(), pl.vconst, 256, pl, &missing, pl.vs_key, pl.vconst_serial);
     bound +=
         bind_constants(fx, pl.ps.vec(), pl.pconst, 32, pl, &missing, pl.ps_key, pl.pconst_serial);
+    pass.applied_version = pl.state_version;
+    pass.applied_device = fx.device;
     static uint32_t reported = 0;
     if (++reported <= 16) {
         char samplers[160] = "";
@@ -2057,6 +2102,26 @@ void Fx_Begin(X86 *c) {
     fx->pass = 0xffffffffu;
     com_ret(c, D3D_OKX);
 }
+// The command stream's Begin (imports_cs.h): the caller reads the pass count at once, so the
+// guest thread writes it (only SetTechnique, a synchronous call, changes what it reads), and the
+// worker resets the pass in order with the effect's other calls.
+static bool fx_begin_pre(X86 *c) {
+    FxEffect *fx = this_fx(c);
+    if (!fx)
+        return false;
+    const uint32_t out = arg(c, 1);
+    if (out)
+        wr32(out, fx->technique < fx->techniques.size()
+                      ? (uint32_t)fx->techniques[fx->technique].passes.size()
+                      : 0);
+    return true;
+}
+static void fx_begin_deferred(X86 *c) {
+    if (FxEffect *fx = this_fx(c))
+        fx->pass = 0xffffffffu;
+    com_ret(c, D3D_OKX);
+}
+
 void Fx_BeginPass(X86 *c) {
     FxEffect *fx = this_fx(c);
     if (!fx) {
@@ -2211,9 +2276,13 @@ template <void (*F)(X86 *)> void shared_setter(X86 *c) {
     hold_texture(slot.texture, p->texture);
     slot.stamp = ++g_pool_writes;
     r.pulled = slot.stamp;
-    // Copied into every other effect of the pool at once. Taking it lazily (when an effect
-    // next reads the parameter) broke NFSMW's shadows and left blurry textures in races.
-    push_to_users(slot, fx);
+    // The pool's other effects take it when they next draw (apply_pass, pull_pool) or read the
+    // parameter (pull_shared): a value the game rewrites per draw - a world matrix - reached
+    // every effect of the pool, with a compare each, many times a frame. (NFSMW's broken
+    // shadows and blurry race textures once blamed on this came from free run.) The earlier
+    // phase of an in-run A/B (POOL) copies it into every other effect at once.
+    if (recomp_ab::old(recomp_ab::POOL))
+        push_to_users(slot, fx);
 }
 
 static const ComMethod g_effect_pool[] = {
@@ -2413,4 +2482,80 @@ void d3dx9_register() {
     com_bind(IF_D3DXEFFECT, K_D3DXEFFECT);
     com_set_destructor(K_D3DXEFFECT, fx_destroy);
     imports_register(g_d3dx9_exports, std::size(g_d3dx9_exports));
+    // Effect calls the import command stream may run on its worker (imports_cs.h):
+    // they change the effect's own state and return S_OK. Arguments: 0 this, 1 the parameter
+    // handle (deferred only when it is one of ours, not a name), 2 a pointer, 3 a count.
+    static const ImportDeferSpec deferred[] = {
+        {"ID3DXEffect::SetMatrix", 2, 64, -1, 1},
+        {"ID3DXEffect::SetMatrixTranspose", 2, 64, -1, 1},
+        {"ID3DXEffect::SetMatrixArray", 2, 64, 3, 1},
+        {"ID3DXEffect::SetMatrixTransposeArray", 2, 64, 3, 1},
+        {"ID3DXEffect::SetVector", 2, 16, -1, 1},
+        {"ID3DXEffect::SetVectorArray", 2, 16, 3, 1},
+        {"ID3DXEffect::SetFloat", -1, 0, -1, 1},
+        {"ID3DXEffect::SetFloatArray", 2, 4, 3, 1},
+        {"ID3DXEffect::SetInt", -1, 0, -1, 1},
+        {"ID3DXEffect::SetIntArray", 2, 4, 3, 1},
+        {"ID3DXEffect::SetBool", -1, 0, -1, 1},
+        {"ID3DXEffect::SetBoolArray", 2, 4, 3, 1},
+        {"ID3DXEffect::SetValue", 2, 1, 3, 1},
+        {"ID3DXEffect::SetTexture", -1, 0, -1, 1},
+        {"ID3DXEffect::CommitChanges", -1, 0, -1, -1},
+        {"ID3DXEffect::BeginPass", -1, 0, -1, -1},
+        {"ID3DXEffect::EndPass", -1, 0, -1, -1},
+        {"ID3DXEffect::End", -1, 0, -1, -1},
+        {"ID3DXEffect::Begin", -1, 0, -1, -1, nullptr, fx_begin_pre, fx_begin_deferred},
+    };
+    imports_cs_register(deferred, std::size(deferred));
+    // Math that reads and writes only its arguments: no wait for the queue.
+    static const char *const math[] = {
+        "D3DXMatrixMultiply",
+        "D3DXMatrixInverse",
+        "D3DXMatrixTranspose",
+        "D3DXMatrixOrthoLH",
+        "D3DXMatrixPerspectiveLH",
+        "D3DXMatrixTranslation",
+        "D3DXVec4Transform",
+        "D3DXVec3Transform",
+        "D3DXVec3TransformNormal",
+        "D3DXVec3TransformCoordArray",
+        "D3DXVec3Normalize",
+        // Handles by index: arithmetic on the effect's fixed technique and parameter counts.
+        "ID3DXEffect::GetTechnique",
+        "ID3DXEffect::GetParameter",
+    };
+    imports_cs_register_independent(math, std::size(math));
+    // Math and effect calls that only compute or record state: called without the
+    // dispatcher's observers and bookkeeping (imports_mark_leaf).
+    static const char *const leaves[] = {
+        "D3DXMatrixMultiply",
+        "D3DXMatrixInverse",
+        "D3DXMatrixTranspose",
+        "D3DXMatrixTranslation",
+        "D3DXVec4Transform",
+        "D3DXVec3Transform",
+        "D3DXVec3TransformNormal",
+        "D3DXVec3TransformCoordArray",
+        "D3DXVec3Normalize",
+        "ID3DXEffect::SetMatrix",
+        "ID3DXEffect::SetMatrixArray",
+        "ID3DXEffect::SetMatrixTranspose",
+        "ID3DXEffect::SetVector",
+        "ID3DXEffect::SetVectorArray",
+        "ID3DXEffect::SetFloat",
+        "ID3DXEffect::SetFloatArray",
+        "ID3DXEffect::SetInt",
+        "ID3DXEffect::SetIntArray",
+        "ID3DXEffect::SetBool",
+        "ID3DXEffect::SetBoolArray",
+        "ID3DXEffect::SetValue",
+        "ID3DXEffect::SetTexture",
+        "ID3DXEffect::CommitChanges",
+        "ID3DXEffect::BeginPass",
+        "ID3DXEffect::EndPass",
+        "ID3DXEffect::Begin",
+        "ID3DXEffect::End",
+        "ID3DXEffect::SetTechnique",
+    };
+    imports_mark_leaf(leaves, std::size(leaves));
 }

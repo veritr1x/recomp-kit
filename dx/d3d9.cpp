@@ -9,6 +9,7 @@
 // rasterizer or GPU host seam. Vtable order is the guest ABI. Remaining stubs
 // report their method names so unsupported calls remain visible.
 #include "com.h"
+#include "../runtime/imports_cs.h"
 #include "dx.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
@@ -676,8 +677,7 @@ void Dev_SetFVF(X86 *c) {
         std::vector<uint8_t> elements;
         if (!d9ffp::fvf_declaration(fvf, &elements)) {
             if (fvf)
-                log_once("d3d9.fvf.noposition", "d3d9: SetFVF(0x%x) has no position; ignored",
-                         fvf);
+                log_once("d3d9.fvf.noposition", "d3d9: SetFVF(0x%x) has no position; ignored", fvf);
             com_ret(c, fvf ? D3DERR_INVALIDCALL : D3D_OK9);
             return;
         }
@@ -1428,6 +1428,7 @@ static const uint32_t USAGE_RENDERTARGET = 1, USAGE_DEPTHSTENCIL = 2;
 struct GpuMirror {
     bool defined = false;
     std::vector<uint8_t> cpu_dirty;      // by slot
+    bool any_dirty = false;              // some cpu_dirty slot may be set (gpu_sync's test)
     std::vector<uint8_t> gpu_newer;      // by slot
     uint32_t dirty_lo = 0, dirty_hi = 0; // buffers: the changed byte range
 };
@@ -1555,6 +1556,7 @@ static GpuMirror &gpu_define(ComObj *o) {
     // A target's first contents are whatever is drawn; a texture's are what
     // the game wrote, so every slot starts out needing an upload.
     m.cpu_dirty.assign(n, d.usage ? 0 : 1);
+    m.any_dirty = !d.usage && n;
     m.gpu_newer.assign(n, 0);
     return m;
 }
@@ -1564,6 +1566,10 @@ static void gpu_sync(ComObj *o) {
     if (!o)
         return;
     GpuMirror &m = gpu_define(o);
+    // Every draw syncs each bound texture; nearly always none of its slots changed.
+    if (!m.any_dirty)
+        return;
+    m.any_dirty = false;
     for (uint32_t slot = 0; slot < m.cpu_dirty.size(); ++slot) {
         if (!m.cpu_dirty[slot])
             continue;
@@ -1619,8 +1625,10 @@ static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi) {
     GpuMirror *it = gpu_mirrors().find(id);
     if (!it)
         return; // not mirrored yet: its first use uploads everything
-    if (slot < it->cpu_dirty.size())
+    if (slot < it->cpu_dirty.size()) {
         it->cpu_dirty[slot] = 1;
+        it->any_dirty = true;
+    }
 }
 static void gpu_drawn_into(ComObj *s) {
     if (!s)
@@ -2445,9 +2453,9 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
         d.vconst = &pl.vconst[0][0];
         d.vconst_count = std::min<uint32_t>(vs.max_const, 256);
     } else {
-        d9ffp::Program &ffp = d9ffp::vertex_program(
-            pl, fs, decl->blob.data(), (uint32_t)decl->blob.size(), d.viewport, d.depth_range,
-            !pl.ps.empty(), g_ffp_vconst);
+        d9ffp::Program &ffp =
+            d9ffp::vertex_program(pl, fs, decl->blob.data(), (uint32_t)decl->blob.size(),
+                                  d.viewport, d.depth_range, !pl.ps.empty(), g_ffp_vconst);
         ffp_announce(ffp, false);
         d.vs_key = ffp.key;
         d.vs = ffp.bytes.data();
@@ -2531,7 +2539,7 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
             const char *e = recomp_env("D3D9_FFP");
             return !(e && !strcmp(e, "0"));
         }();
-        if (dev->d3d_version != 8 && ffp) {
+        if (dev->d3d_version != 8 && ffp && !recomp_ab::old(recomp_ab::FFP)) {
             gpu_draw_fixed(dev, d);
             return;
         }
@@ -3662,6 +3670,34 @@ void d3d9_reset() {
     fixed_states().clear();
 }
 
+// The command stream's copy of a DrawPrimitiveUP's vertices (imports_cs.h): (this, type,
+// primitive count, data, stride).
+static uint32_t up_draw_bytes(const uint32_t *a) {
+    uint64_t n = a[2], v;
+    switch (a[1]) {
+    case 1:
+        v = n;
+        break; // point list
+    case 2:
+        v = 2 * n;
+        break; // line list
+    case 3:
+        v = n + 1;
+        break; // line strip
+    case 4:
+        v = 3 * n;
+        break; // triangle list
+    case 5:
+    case 6:
+        v = n + 2;
+        break; // strip, fan
+    default:
+        return 0xffffffffu; // too large to copy: the call runs in step
+    }
+    const uint64_t bytes = v * a[4];
+    return bytes > 0xffffffffu ? 0xffffffffu : (uint32_t)bytes;
+}
+
 void d3d9_register() {
     static bool done = false;
     if (done)
@@ -3672,6 +3708,67 @@ void d3d9_register() {
         com_set_view_filter(kind, d9_view_allowed);
     com_define(IF_D3D9, "d3d9.dll", "IDirect3D9", g_d3d9, std::size(g_d3d9));
     com_define(IF_D3DDEVICE9, "d3d9.dll", "IDirect3DDevice9", g_device9, std::size(g_device9));
+    // Device calls the import command stream may run on its worker (imports_cs.h):
+    // they record state or queue a draw for the render host, and return S_OK. Arguments: 0 this;
+    // the pointer and count positions are each method's own.
+    static const ImportDeferSpec deferred[] = {
+        {"IDirect3DDevice9::SetRenderState"},
+        {"IDirect3DDevice9::SetSamplerState"},
+        {"IDirect3DDevice9::SetTextureStageState"},
+        {"IDirect3DDevice9::SetTexture"},
+        {"IDirect3DDevice9::SetStreamSource"},
+        {"IDirect3DDevice9::SetStreamSourceFreq"},
+        {"IDirect3DDevice9::SetIndices"},
+        {"IDirect3DDevice9::SetVertexDeclaration"},
+        {"IDirect3DDevice9::SetFVF"},
+        {"IDirect3DDevice9::SetVertexShader"},
+        {"IDirect3DDevice9::SetPixelShader"},
+        {"IDirect3DDevice9::SetTransform", 2, 64},
+        {"IDirect3DDevice9::SetVertexShaderConstantF", 2, 16, 3},
+        {"IDirect3DDevice9::SetPixelShaderConstantF", 2, 16, 3},
+        {"IDirect3DDevice9::SetViewport", 1, 24},
+        {"IDirect3DDevice9::SetScissorRect", 1, 16},
+        {"IDirect3DDevice9::DrawPrimitive"},
+        {"IDirect3DDevice9::DrawIndexedPrimitive"},
+        {"IDirect3DDevice9::DrawPrimitiveUP", 3, 1, -1, -1, up_draw_bytes},
+        {"IDirect3DDevice9::SetRenderTarget"},
+        {"IDirect3DDevice9::SetDepthStencilSurface"},
+        {"IDirect3DDevice9::BeginScene"},
+        {"IDirect3DDevice9::EndScene"},
+        {"IDirect3DDevice9::Clear", 2, 16, 1},
+    };
+    imports_cs_register(deferred, std::size(deferred));
+    // Descriptions fixed when the object was made: read without waiting for the queue.
+    static const char *const fixed[] = {
+        "IDirect3DSurface9::GetDesc",
+        "IDirect3DTexture9::GetLevelDesc",
+    };
+    imports_cs_register_independent(fixed, std::size(fixed));
+    // The same calls, when they run in step: no dispatcher observers or bookkeeping
+    // (imports_mark_leaf). Present, Reset, locks and anything that waits stay on the full path.
+    static const char *const leaves[] = {
+        "IDirect3DDevice9::SetRenderState",
+        "IDirect3DDevice9::SetSamplerState",
+        "IDirect3DDevice9::SetTextureStageState",
+        "IDirect3DDevice9::SetTexture",
+        "IDirect3DDevice9::SetStreamSource",
+        "IDirect3DDevice9::SetStreamSourceFreq",
+        "IDirect3DDevice9::SetIndices",
+        "IDirect3DDevice9::SetVertexDeclaration",
+        "IDirect3DDevice9::SetFVF",
+        "IDirect3DDevice9::SetTransform",
+        "IDirect3DDevice9::SetVertexShader",
+        "IDirect3DDevice9::SetPixelShader",
+        "IDirect3DDevice9::SetVertexShaderConstantF",
+        "IDirect3DDevice9::SetPixelShaderConstantF",
+        "IDirect3DDevice9::SetViewport",
+        "IDirect3DDevice9::SetScissorRect",
+        "IDirect3DDevice9::DrawPrimitive",
+        "IDirect3DDevice9::DrawIndexedPrimitive",
+        "IDirect3DDevice9::DrawPrimitiveUP",
+        "IDirect3DDevice9::DrawIndexedPrimitiveUP",
+    };
+    imports_mark_leaf(leaves, std::size(leaves));
     com_bind(IF_D3D9, K_D3D9);
     com_bind(IF_D3DDEVICE9, K_D3D9DEVICE);
     com_register_iid(IF_D3D9, IID_IDirect3D9_);

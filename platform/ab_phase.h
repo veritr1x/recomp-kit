@@ -21,22 +21,28 @@
 
 namespace recomp_ab {
 enum : uint32_t {
-    STRIDE = 1u,     // the scheduler's clock read on every import call (runtime/kernel32.cpp)
-    SAMPLER = 2u,    // D3DX sampler texture lookup per CommitChanges (dx/d3dx9.cpp)
-    IMPORTS = 4u,    // import dispatch bookkeeping (runtime/imports.cpp)
-    PRESHADER = 16u, // D3DX preshader input lookup (dx/d3dx9.cpp)
-    CONSTS = 64u,    // incremental effect constant binding (dx/d3dx9.cpp bind_constants)
-    MIRRORS = 128u,  // per-draw lookups (dx/d3d9.cpp resource mirrors, decoded programs)
-    WEBGPU = 512u,   // the WebGPU renderer's skipped repeat bindings and reused uniform blocks
-    FREE_RUN = 2048u,   // guest threads running beside the baton holder (game.toml free_run)
-    REPS = 4096u,       // bulk REP MOVS/STOS (runtime/x86.h)
-    LOCKS = 8192u,      // persistent vertex/index buffer lock staging (dx/d3d9.cpp)
-    CONSTBANK = 16384u, // shader constants copied into a draw only when they changed
-    PRESENT = 32768u,   // pipelined browser Present (host/gpu/d3d9_host.cpp)
-    SUBMIT = 65536u,    // buffer rewrites without a mid-frame WebGPU submit
-    GROUPS = 131072u,   // dropping only the bind groups of a retired texture
-    DIRECT = 262144u,   // direct COM/devirtualized calls from translated code
-    PACING = 524288u    // NFSMW frame pacing at Present (game mod)
+    STRIDE = 1u,         // the scheduler's clock read on every import call (runtime/kernel32.cpp)
+    SAMPLER = 2u,        // D3DX sampler texture lookup per CommitChanges (dx/d3dx9.cpp)
+    IMPORTS = 4u,        // import dispatch bookkeeping (runtime/imports.cpp)
+    PRESHADER = 16u,     // D3DX preshader input lookup (dx/d3dx9.cpp)
+    CONSTS = 64u,        // incremental effect constant binding (dx/d3dx9.cpp bind_constants)
+    MIRRORS = 128u,      // per-draw lookups (dx/d3d9.cpp resource mirrors, decoded programs)
+    WEBGPU = 512u,       // the WebGPU renderer's skipped repeat bindings and reused uniform blocks
+    FREE_RUN = 2048u,    // guest threads running beside the baton holder (game.toml free_run)
+    REPS = 4096u,        // bulk REP MOVS/STOS (runtime/x86.h)
+    LOCKS = 8192u,       // persistent vertex/index buffer lock staging (dx/d3d9.cpp)
+    CONSTBANK = 16384u,  // shader constants copied into a draw only when they changed
+    PRESENT = 32768u,    // pipelined browser Present (host/gpu/d3d9_host.cpp)
+    SUBMIT = 65536u,     // buffer rewrites without a mid-frame WebGPU submit
+    GROUPS = 131072u,    // dropping only the bind groups of a retired texture
+    DIRECT = 262144u,    // direct COM/devirtualized calls from translated code
+    PACING = 524288u,    // NFSMW frame pacing at Present (game mod)
+    FFP = 1048576u,      // draws with no shaders drawn through the fixed-function pipeline
+    POOL = 2097152u,     // D3DX shared parameters taken by each effect when it next draws
+    FXSTATES = 8388608u, // D3DX pass and sampler states re-applied only when the device's changed
+    CS = 16777216u,  // deferrable shims run on the command-stream thread (on unless RECOMP_CS=0)
+    LEAF = 4194304u, // leaf imports called without the dispatcher's observers and bookkeeping
+    CONSTCMP = 33554432u, // draw constants with a fresh serial copied without a byte compare
 };
 
 inline std::atomic<int> old_phase{0};
@@ -58,12 +64,28 @@ inline uint32_t switches() {
         static const struct {
             const char *name;
             uint32_t bit;
-        } names[] = {{"stride", STRIDE}, {"sampler", SAMPLER}, {"imports", IMPORTS},
-                     {"preshader", PRESHADER}, {"consts", CONSTS}, {"mirrors", MIRRORS},
-                     {"webgpu", WEBGPU}, {"free", FREE_RUN},
-                     {"reps", REPS}, {"locks", LOCKS}, {"constbank", CONSTBANK},
-                     {"present", PRESENT}, {"submit", SUBMIT}, {"groups", GROUPS},
-                     {"direct", DIRECT}, {"pacing", PACING}};
+        } names[] = {{"stride", STRIDE},
+                     {"sampler", SAMPLER},
+                     {"imports", IMPORTS},
+                     {"preshader", PRESHADER},
+                     {"consts", CONSTS},
+                     {"mirrors", MIRRORS},
+                     {"webgpu", WEBGPU},
+                     {"free", FREE_RUN},
+                     {"reps", REPS},
+                     {"locks", LOCKS},
+                     {"constbank", CONSTBANK},
+                     {"present", PRESENT},
+                     {"submit", SUBMIT},
+                     {"groups", GROUPS},
+                     {"direct", DIRECT},
+                     {"pacing", PACING},
+                     {"ffp", FFP},
+                     {"pool", POOL},
+                     {"fxstates", FXSTATES},
+                     {"cs", CS},
+                     {"leaf", LEAF},
+                     {"constcmp", CONSTCMP}};
         uint32_t bits = 0;
         for (const auto &n : names)
             if (strstr(e, n.name))
